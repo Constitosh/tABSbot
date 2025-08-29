@@ -1,9 +1,9 @@
 import { Telegraf } from 'telegraf';
 import { getJSON, setJSON } from './cache.js';
-import { queue, refreshToken } from './refreshWorker.js';
+import './configEnv.js';
+import { queue, refreshToken } from './queueCore.js';
 import { renderTop20Holders, renderFirst20Buyers } from './services/compute.js';
 import { isAddress, num, pct } from './util.js';
-import './configEnv.js';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
