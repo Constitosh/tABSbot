@@ -1,4 +1,4 @@
-// renderers.js
+// src/renderers.js
 import { escapeMd, pct, money, num, shortAddr, trendBadge } from './ui.js';
 
 export function renderOverview(data) {
@@ -9,16 +9,17 @@ export function renderOverview(data) {
   const creator = data.creator?.address ? escapeMd(shortAddr(data.creator.address)) : 'unknown';
   const t24 = trendBadge(m.priceChange?.h24);
 
-  const text = [
-    `🪙 Token Overview — *${name}* (${sym})`,
+  // NOTE: Escape any literal parentheses in static text with \\( and \\)
+  const lines = [
+    `🪙 Token Overview — *${name}*${sym ? ` \\(${sym}\\)` : ''}`,
     `CA: \`${ca}\``,
     ``,
     `Price: *${escapeMd(money(m.priceUsd, 8))}*   ${t24}`,
     `24h Volume: *${escapeMd(money(m.volume24h))}*`,
     `Change: 1h *${escapeMd(pct(m.priceChange?.h1))}*  •  6h *${escapeMd(pct(m.priceChange?.h6))}*  •  24h *${escapeMd(pct(m.priceChange?.h24))}*`,
-    `FDV (MCap): *${escapeMd(money(m.marketCap))}*`,
+    `FDV \\(MCap\\): *${escapeMd(money(m.marketCap))}*`,
     ``,
-    `Creator: \`${escapeMd(creator)}\` — *${escapeMd(pct(data.creator?.percent))}*`,
+    `Creator: \`${creator}\` — *${escapeMd(pct(data.creator?.percent))}*`,
     `Top 10 combined: *${escapeMd(pct(data.top10CombinedPct))}*`,
     `Burned: *${escapeMd(pct(data.burnedPct))}*`,
     ``,
@@ -27,8 +28,10 @@ export function renderOverview(data) {
     `• *Holders* — top 20 holder percentages`,
     ``,
     `_Updated: ${escapeMd(new Date(data.updatedAt).toLocaleString())}_`,
-    `_Source: Dexscreener · Abscan (Abstract)_`
-  ].join('\n');
+    `_Source: Dexscreener · Abscan \\(Abstract\\)_`
+  ];
+
+  const text = lines.join('\n');
 
   const kb = {
     reply_markup: {
@@ -47,6 +50,7 @@ export function renderOverview(data) {
 
   return { text, extra: kb };
 }
+
 
 export function renderBuyers(data, page=1, pageSize=10) {
   const start = (page-1)*pageSize;
