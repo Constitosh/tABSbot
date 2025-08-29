@@ -1,118 +1,134 @@
+// src/bot.js
+import './configEnv.js';
 import { Telegraf } from 'telegraf';
 import { getJSON, setJSON } from './cache.js';
-import './configEnv.js';
 import { queue, refreshToken } from './queueCore.js';
-import { renderTop20Holders, renderFirst20Buyers } from './services/compute.js';
-import { isAddress, num, pct } from './util.js';
+import { renderOverview, renderBuyers, renderHolders } from './renderers.js';
+import { isAddress } from './util.js';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
+// --- Helpers ---
 
-// inside bot.js
-import { renderOverview, renderBuyers, renderHolders } from './renderers.js';
-import { ensureData } from './yourExistingFetchFlow.js'; // the function that returns the cached payload
+// Fetch from cache or do a synchronous first refresh (cold start)
+async function ensureData(ca) {
+  const key = `token:${ca}:summary`;
+  const cache = await getJSON(key);
+  if (cache) return cache;
+
+  try {
+    // Try a synchronous refresh once on cold start
+    return await refreshToken(ca);
+  } catch (e) {
+    // Fallback: enqueue an async refresh and tell caller to retry soon
+    await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
+    return null;
+  }
+}
+
+// Cooldown + enqueue a refresh job
+async function requestRefresh(ca) {
+  const last = await getJSON(`token:${ca}:last_refresh`);
+  const age = last ? (Date.now() - last.ts) / 1000 : Infinity;
+  if (age < 30) {
+    return { ok: false, age };
+  }
+  await setJSON(`token:${ca}:last_refresh`, { ts: Date.now() }, 600);
+  await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
+  return { ok: true, age };
+}
+
+// --- Commands ---
+
+bot.start((ctx) =>
+  ctx.reply(
+    [
+      'tABS Tools ready.',
+      'Use /stats <contract>  •  /refresh <contract>',
+      'Example: /stats 0x1234567890abcdef1234567890abcdef12345678'
+    ].join('\n')
+  )
+);
+
+// /stats <ca> — Overview screen
+bot.command('stats', async (ctx) => {
+  const [, caRaw] = ctx.message.text.trim().split(/\s+/);
+  if (!isAddress(caRaw)) return ctx.reply('Send: /stats <contractAddress>');
+
+  const ca = caRaw.toLowerCase();
+  const data = await ensureData(ca);
+  if (!data) return ctx.reply('Initializing… try again in a few seconds.');
+
+  const { text, extra } = renderOverview(data);
+  return ctx.replyWithMarkdownV2(text, { ...extra, disable_web_page_preview: true });
+});
+
+// /refresh <ca> — Manual refresh with cooldown
+bot.command('refresh', async (ctx) => {
+  const [, caRaw] = ctx.message.text.trim().split(/\s+/);
+  if (!isAddress(caRaw)) return ctx.reply('Send: /refresh <contractAddress>');
+
+  const ca = caRaw.toLowerCase();
+  const res = await requestRefresh(ca);
+  if (!res.ok) {
+    return ctx.reply(`Recently refreshed (${res.age.toFixed(0)}s ago). Try again shortly.`);
+  }
+  return ctx.reply(`Refreshing ${ca}…`);
+});
+
+// --- Callback actions (inline keyboard navigation) ---
 
 bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
   try {
     const [kind, ca, maybePage] = ctx.callbackQuery.data.split(':');
+
     if (kind === 'refresh') {
-      // existing refresh logic + small confirmation message
-      await requestRefresh(ca); // your function
-      return ctx.answerCbQuery('Refreshing…', { show_alert: false });
+      const res = await requestRefresh(ca);
+      const msg = res.ok
+        ? 'Refreshing…'
+        : `Recently refreshed (${res.age.toFixed(0)}s ago). Try again shortly.`;
+      return ctx.answerCbQuery(msg, { show_alert: false });
     }
 
-    const data = await ensureData(ca); // get cached payload
-    if (!data) return ctx.answerCbQuery('Initializing… try again shortly.', { show_alert: true });
+    const data = await ensureData(ca);
+    if (!data) {
+      return ctx.answerCbQuery('Initializing… try again shortly.', { show_alert: true });
+    }
 
     if (kind === 'stats') {
       const { text, extra } = renderOverview(data);
-      return ctx.editMessageText(text, { ...extra, parse_mode: 'MarkdownV2', disable_web_page_preview: true });
+      return ctx.editMessageText(text, {
+        ...extra,
+        parse_mode: 'MarkdownV2',
+        disable_web_page_preview: true
+      });
     }
 
     if (kind === 'buyers') {
       const page = Number(maybePage || 1);
       const { text, extra } = renderBuyers(data, page);
-      return ctx.editMessageText(text, { ...extra, parse_mode: 'MarkdownV2', disable_web_page_preview: true });
+      return ctx.editMessageText(text, {
+        ...extra,
+        parse_mode: 'MarkdownV2',
+        disable_web_page_preview: true
+      });
     }
 
     if (kind === 'holders') {
       const page = Number(maybePage || 1);
       const { text, extra } = renderHolders(data, page);
-      return ctx.editMessageText(text, { ...extra, parse_mode: 'MarkdownV2', disable_web_page_preview: true });
+      return ctx.editMessageText(text, {
+        ...extra,
+        parse_mode: 'MarkdownV2',
+        disable_web_page_preview: true
+      });
     }
   } catch (e) {
     return ctx.answerCbQuery('Error — try again', { show_alert: true });
   }
 });
 
-
-// Helper to fetch or init
-async function ensureData(ca) {
-  const cache = await getJSON(`token:${ca}:summary`);
-  if (cache) return cache;
-  // cold start: do a synchronous refresh (first time) to reduce the "try later" effect
-  try { return await refreshToken(ca); }
-  catch {
-    // fallback: enqueue
-    await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
-    return null;
-  }
-}
-
-// /start
-bot.start(ctx => ctx.reply(
-  `tABS Tools ready.\n` +
-  `Use /stats <contract>  •  /refresh <contract>\n` +
-  `Example: /stats 0x1234...`
-));
-
-// /stats <ca>
-bot.command('stats', async (ctx) => {
-  const [, ca] = ctx.message.text.trim().split(/\s+/);
-  if (!isAddress(ca)) return ctx.reply('Send: /stats <contractAddress>');
-
-  const data = await ensureData(ca);
-  if (!data) return ctx.reply('Initializing… try again in a few seconds.');
-
-  const m = data.market || {};
-  const t1 = [
-    `*${m.name || 'Token'}* (${m.symbol || ''})`,
-    `CA: \`${ca}\``,
-    ``,
-    `Price: *$${num(m.priceUsd, 8)}*`,
-    `24h Vol: *$${num(m.volume24h)}*`,
-    `Change: 1h *${pct(m.priceChange?.h1)}*  •  6h *${pct(m.priceChange?.h6)}*  •  24h *${pct(m.priceChange?.h24)}*`,
-    `Market Cap (FDV): *$${num(m.marketCap)}*`,
-    ``,
-    `Creator: \`${data.creator.address || 'unknown'}\`  —  *${pct(data.creator.percent)}*`,
-    `Top 10 combined: *${pct(data.top10CombinedPct)}*`,
-    `Burned: *${pct(data.burnedPct)}*`,
-    ``,
-    `*First 20 buyers (status)*`,
-    renderFirst20Buyers(data.first20Buyers),
-    ``,
-    `*Top 20 holders (%)*`,
-    renderTop20Holders(data.holdersTop20),
-    ``,
-    `_Updated: ${new Date(data.updatedAt).toLocaleString()}_`
-  ].join('\n');
-
-  await ctx.replyWithMarkdownV2(t1.replace(/([_*[\]()~`>#+\-=|{}.!])/g, '\\$1'), { disable_web_page_preview: true });
-});
-
-// /refresh <ca>
-bot.command('refresh', async (ctx) => {
-  const [, ca] = ctx.message.text.trim().split(/\s+/);
-  if (!isAddress(ca)) return ctx.reply('Send: /refresh <contractAddress>');
-
-  const last = await getJSON(`token:${ca}:last_refresh`);
-  const age = last ? (Date.now() - last.ts)/1000 : 9999;
-  if (age < 30) return ctx.reply(`Recently refreshed (${age.toFixed(0)}s ago). Try again shortly.`);
-
-  await setJSON(`token:${ca}:last_refresh`, { ts: Date.now() }, 600);
-  await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
-  return ctx.reply(`Refreshing ${ca}…`);
-});
+// --- Boot ---
 
 bot.launch().then(() => console.log('tABS Tools bot up.'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
