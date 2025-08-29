@@ -73,13 +73,16 @@ export function renderBuyers(data, page = 1, pageSize = 10) {
     `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>  ·  <i>Page ${page}/${totalPages}</i>`
   ].join('\n');
 
+  const prevCb = page > 1 ? `buyers:${data.tokenAddress}:${prev}` : 'noop';
+  const nextCb = page < totalPages ? `buyers:${data.tokenAddress}:${next}` : 'noop';
+
   const kb = {
     reply_markup: {
       inline_keyboard: [
         [
-          { text:'◀️', callback_data:`buyers:${data.tokenAddress}:${prev}` },
+          { text:'◀️', callback_data: prevCb },
           { text:`${page}/${totalPages}`, callback_data:'noop' },
-          { text:'▶️', callback_data:`buyers:${data.tokenAddress}:${next}` }
+          { text:'▶️', callback_data: nextCb }
         ],
         [
           { text:'🏠 Overview', callback_data:`stats:${data.tokenAddress}` },
@@ -117,13 +120,16 @@ export function renderHolders(data, page = 1, pageSize = 10) {
     `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>  ·  <i>Page ${page}/${totalPages}</i>`
   ].join('\n');
 
+  const prevCb = page > 1 ? `holders:${data.tokenAddress}:${prev}` : 'noop';
+  const nextCb = page < totalPages ? `holders:${data.tokenAddress}:${next}` : 'noop';
+
   const kb = {
     reply_markup: {
       inline_keyboard: [
         [
-          { text:'◀️', callback_data:`holders:${data.tokenAddress}:${prev}` },
+          { text:'◀️', callback_data: prevCb },
           { text:`${page}/${totalPages}`, callback_data:'noop' },
-          { text:'▶️', callback_data:`holders:${data.tokenAddress}:${next}` }
+          { text:'▶️', callback_data: nextCb }
         ],
         [
           { text:'🏠 Overview',    callback_data:`stats:${data.tokenAddress}` },
