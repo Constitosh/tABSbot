@@ -7,6 +7,45 @@ import { isAddress, num, pct } from './util.js';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
+
+// inside bot.js
+import { renderOverview, renderBuyers, renderHolders } from './renderers.js';
+import { ensureData } from './yourExistingFetchFlow.js'; // the function that returns the cached payload
+
+bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
+  try {
+    const [kind, ca, maybePage] = ctx.callbackQuery.data.split(':');
+    if (kind === 'refresh') {
+      // existing refresh logic + small confirmation message
+      await requestRefresh(ca); // your function
+      return ctx.answerCbQuery('Refreshing…', { show_alert: false });
+    }
+
+    const data = await ensureData(ca); // get cached payload
+    if (!data) return ctx.answerCbQuery('Initializing… try again shortly.', { show_alert: true });
+
+    if (kind === 'stats') {
+      const { text, extra } = renderOverview(data);
+      return ctx.editMessageText(text, { ...extra, parse_mode: 'MarkdownV2', disable_web_page_preview: true });
+    }
+
+    if (kind === 'buyers') {
+      const page = Number(maybePage || 1);
+      const { text, extra } = renderBuyers(data, page);
+      return ctx.editMessageText(text, { ...extra, parse_mode: 'MarkdownV2', disable_web_page_preview: true });
+    }
+
+    if (kind === 'holders') {
+      const page = Number(maybePage || 1);
+      const { text, extra } = renderHolders(data, page);
+      return ctx.editMessageText(text, { ...extra, parse_mode: 'MarkdownV2', disable_web_page_preview: true });
+    }
+  } catch (e) {
+    return ctx.answerCbQuery('Error — try again', { show_alert: true });
+  }
+});
+
+
 // Helper to fetch or init
 async function ensureData(ca) {
   const cache = await getJSON(`token:${ca}:summary`);
