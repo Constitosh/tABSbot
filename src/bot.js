@@ -3,7 +3,7 @@ import { getJSON, setJSON } from './cache.js';
 import { queue, refreshToken } from './refreshWorker.js';
 import { renderTop20Holders, renderFirst20Buyers } from './services/compute.js';
 import { isAddress, num, pct } from './util.js';
-import 'dotenv/config';
+import './configEnv.js';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
