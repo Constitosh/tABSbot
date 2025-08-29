@@ -5,7 +5,7 @@ import { getDexscreenerTokenStats } from './services/dexscreener.js';
 import { getContractCreator, getTokenHolders, getTokenTransfers } from './services/abscan.js';
 import { summarizeHolders, buildCurrentBalanceMap, first20BuyersStatus } from './services/compute.js';
 import Redis from 'ioredis';
-import 'dotenv/config';
+import './configEnv.js';
 
 const bullRedis = new Redis(process.env.REDIS_URL, {
   maxRetriesPerRequest: null,
