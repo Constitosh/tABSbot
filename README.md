@@ -1,5 +1,3 @@
-4) Run (dev)
-
 In one terminal:
 
 npm run worker
