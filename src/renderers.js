@@ -1,34 +1,33 @@
 // src/renderers.js
-import { escapeMd, pct, money, num, shortAddr, trendBadge } from './ui.js';
+import { esc, pct, money, num, shortAddr, trendBadge } from './ui_html.js';
 
 export function renderOverview(data) {
   const m = data.market || {};
-  const name = escapeMd(m.name || 'Token');
-  const sym  = escapeMd(m.symbol || '');
-  const ca   = escapeMd(data.tokenAddress);
-  const creator = data.creator?.address ? escapeMd(shortAddr(data.creator.address)) : 'unknown';
+  const name = esc(m.name || 'Token');
+  const sym  = esc(m.symbol || '');
+  const ca   = esc(data.tokenAddress);
+  const creator = data.creator?.address ? esc(shortAddr(data.creator.address)) : 'unknown';
   const t24 = trendBadge(m.priceChange?.h24);
 
-  // NOTE: Escape any literal parentheses in static text with \\( and \\)
   const lines = [
-    `🪙 Token Overview — *${name}*${sym ? ` \\(${sym}\\)` : ''}`,
-    `CA: \`${ca}\``,
+    `🪙 <b>Token Overview — ${name}${sym ? ` (${sym})` : ''}</b>`,
+    `CA: <code>${ca}</code>`,
     ``,
-    `Price: *${escapeMd(money(m.priceUsd, 8))}*   ${t24}`,
-    `24h Volume: *${escapeMd(money(m.volume24h))}*`,
-    `Change: 1h *${escapeMd(pct(m.priceChange?.h1))}*  •  6h *${escapeMd(pct(m.priceChange?.h6))}*  •  24h *${escapeMd(pct(m.priceChange?.h24))}*`,
-    `FDV \\(MCap\\): *${escapeMd(money(m.marketCap))}*`,
+    `Price: <b>${esc(money(m.priceUsd, 8))}</b>   ${t24}`,
+    `24h Volume: <b>${esc(money(m.volume24h))}</b>`,
+    `Change: 1h <b>${esc(pct(m.priceChange?.h1))}</b>  •  6h <b>${esc(pct(m.priceChange?.h6))}</b>  •  24h <b>${esc(pct(m.priceChange?.h24))}</b>`,
+    `FDV (MCap): <b>${esc(money(m.marketCap))}</b>`,
     ``,
-    `Creator: \`${creator}\` — *${escapeMd(pct(data.creator?.percent))}*`,
-    `Top 10 combined: *${escapeMd(pct(data.top10CombinedPct))}*`,
-    `Burned: *${escapeMd(pct(data.burnedPct))}*`,
+    `Creator: <code>${creator}</code> — <b>${esc(pct(data.creator?.percent))}</b>`,
+    `Top 10 combined: <b>${esc(pct(data.top10CombinedPct))}</b>`,
+    `Burned: <b>${esc(pct(data.burnedPct))}</b>`,
     ``,
-    `Pick a section:`,
-    `• *Buyers* — first 20 buyers \\+ status`,
-    `• *Holders* — top 20 holder percentages`,
+    `<i>Pick a section:</i>`,
+    `• <b>Buyers</b> — first 20 buyers + status`,
+    `• <b>Holders</b> — top 20 holder percentages`,
     ``,
-    `_Updated: ${escapeMd(new Date(data.updatedAt).toLocaleString())}_`,
-    `_Source: Dexscreener · Abscan \\(Abstract\\)_`
+    `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>`,
+    `<i>Source: Dexscreener · Abscan (Abstract)</i>`
   ];
 
   const text = lines.join('\n');
@@ -51,35 +50,34 @@ export function renderOverview(data) {
   return { text, extra: kb };
 }
 
+export function renderBuyers(data, page = 1, pageSize = 10) {
+  const start = (page - 1) * pageSize;
+  const rows = (data.first20Buyers || []).slice(start, start + pageSize);
+  const name = esc(data.market?.name || 'Token');
+  const lines = rows.map((r, i) => {
+    const n = String(start + i + 1).padStart(2, '0');
+    return `${n}. <code>${esc(shortAddr(r.address))}</code> — ${esc(r.status)}`;
+  }).join('\n') || '<i>No buyers found yet</i>';
 
-export function renderBuyers(data, page=1, pageSize=10) {
-  const start = (page-1)*pageSize;
-  const rows = (data.first20Buyers || []).slice(start, start+pageSize);
-  const name = escapeMd(data.market?.name || 'Token');
-  const lines = rows.map((r,i)=>{
-    const n = String(start+i+1).padStart(2,'0');
-    return `${n}. ${escapeMd(shortAddr(r.address))} — ${escapeMd(r.status)}`;
-  }).join('\n') || '_No buyers found yet_';
   const totalPages = Math.ceil((data.first20Buyers || []).length / pageSize) || 1;
+  const prev = Math.max(1, page - 1);
+  const next = Math.min(totalPages, page + 1);
 
   const text = [
-    `🧑‍🤝‍🧑 First 20 Buyers — *${name}*`,
+    `🧑‍🤝‍🧑 <b>First 20 Buyers — ${name}</b>`,
     ``,
     lines,
     ``,
     `Tip: Status compares current balance vs their first received amount.`,
     ``,
-    `_Updated: ${escapeMd(new Date(data.updatedAt).toLocaleString())}_  ·  _Page ${page}/${totalPages}_`
+    `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>  ·  <i>Page ${page}/${totalPages}</i>`
   ].join('\n');
-
-  const prev = Math.max(1, page-1);
-  const next = Math.min(totalPages, page+1);
 
   const kb = {
     reply_markup: {
       inline_keyboard: [
         [
-          { text:'◀️', callback_data:`buyers:${data.tokenAddress}:${prev}`, disable_web_page_preview:true },
+          { text:'◀️', callback_data:`buyers:${data.tokenAddress}:${prev}` },
           { text:`${page}/${totalPages}`, callback_data:'noop' },
           { text:'▶️', callback_data:`buyers:${data.tokenAddress}:${next}` }
         ],
@@ -94,21 +92,21 @@ export function renderBuyers(data, page=1, pageSize=10) {
   return { text, extra: kb };
 }
 
-export function renderHolders(data, page=1, pageSize=10) {
-  const start = (page-1)*pageSize;
-  const rows = (data.holdersTop20 || []).slice(start, start+pageSize);
-  const name = escapeMd(data.market?.name || 'Token');
-  const lines = rows.map((h,i)=>{
-    const n = String(start+i+1).padStart(2,'0');
-    return `${n}. ${escapeMd(shortAddr(h.address))} — ${escapeMd(pct(h.percent))}`;
-  }).join('\n') || '_No holders found yet_';
+export function renderHolders(data, page = 1, pageSize = 10) {
+  const start = (page - 1) * pageSize;
+  const rows = (data.holdersTop20 || []).slice(start, start + pageSize);
+  const name = esc(data.market?.name || 'Token');
+  const lines = rows.map((h, i) => {
+    const n = String(start + i + 1).padStart(2, '0');
+    return `${n}. <code>${esc(shortAddr(h.address))}</code> — <b>${esc(pct(h.percent))}</b>`;
+  }).join('\n') || '<i>No holders found yet</i>';
 
   const totalPages = Math.ceil((data.holdersTop20 || []).length / pageSize) || 1;
-  const prev = Math.max(1, page-1);
-  const next = Math.min(totalPages, page+1);
+  const prev = Math.max(1, page - 1);
+  const next = Math.min(totalPages, page + 1);
 
   const text = [
-    `📊 Top Holders — *${name}*`,
+    `📊 <b>Top Holders — ${name}</b>`,
     ``,
     lines,
     ``,
@@ -116,7 +114,7 @@ export function renderHolders(data, page=1, pageSize=10) {
     `• Burn addresses (0x0 / 0xdead) are included in burned%.`,
     `• Top-10 combined is shown in the overview.`,
     ``,
-    `_Updated: ${escapeMd(new Date(data.updatedAt).toLocaleString())}_  ·  _Page ${page}/${totalPages}_`
+    `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>  ·  <i>Page ${page}/${totalPages}</i>`
   ].join('\n');
 
   const kb = {
