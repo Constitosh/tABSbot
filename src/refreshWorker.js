@@ -4,12 +4,18 @@ import { setJSON, withLock, redisClient } from './cache.js';
 import { getDexscreenerTokenStats } from './services/dexscreener.js';
 import { getContractCreator, getTokenHolders, getTokenTransfers } from './services/abscan.js';
 import { summarizeHolders, buildCurrentBalanceMap, first20BuyersStatus } from './services/compute.js';
+import Redis from 'ioredis';
 import 'dotenv/config';
 
-export const queueName = 'tabs_refresh';
+const bullRedis = new Redis(process.env.REDIS_URL, {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false
+});
 
-// Pass the existing ioredis client
-export const queue = new Queue(queueName, { connection: redisClient });
+export const queueName = 'tabs_refresh';
+export const queue = new Queue(queueName, { connection: bullRedis });
+
+new Worker(queueName, async (job) => {
 
 async function refreshToken(tokenAddress) {
   const lockKey = `lock:refresh:${tokenAddress.toLowerCase()}`;
@@ -55,3 +61,4 @@ new Worker(queueName, async job => {
 
 // optional cron block unchanged...
 export { refreshToken };
+}, { connection: bullRedis });
