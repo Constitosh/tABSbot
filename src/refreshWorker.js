@@ -5,7 +5,7 @@ import { getContractCreator, getTokenHolders, getTokenTransfers } from './servic
 import { summarizeHolders, buildCurrentBalanceMap, first20BuyersStatus } from './services/compute.js';
 import 'dotenv/config';
 
-export const queueName = 'tabs:refresh';
+export const queueName = 'tabs_refresh';
 export const queue = new Queue(queueName, { connection: redisClient.options });
 
 async function refreshToken(tokenAddress) {
