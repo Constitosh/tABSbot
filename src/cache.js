@@ -1,6 +1,11 @@
 import Redis from 'ioredis';
 import 'dotenv/config';
-const redis = new Redis(process.env.REDIS_URL);
+const redis = new Redis(process.env.REDIS_URL, {
+  // BullMQ requires this to be null for blocking ops
+ maxRetriesPerRequest: null,
+ // avoids an extra INFO/ROLE roundtrip that can stall in some setups
+ enableReadyCheck: false
+});
 
 export const getJSON = async (k) => {
   const v = await redis.get(k);
