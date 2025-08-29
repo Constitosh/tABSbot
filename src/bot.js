@@ -1,4 +1,4 @@
-// src/bot.js
+// src/bot.js  (showing only the changed/added parts)
 import './configEnv.js';
 import { Telegraf } from 'telegraf';
 import { getJSON, setJSON } from './cache.js';
@@ -8,12 +8,33 @@ import { isAddress } from './util.js';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// ----- HTML helpers (so we never forget parse_mode) -----
+// HTML helpers
 const sendHTML = (ctx, text, extra = {}) =>
   ctx.replyWithHTML(text, { disable_web_page_preview: true, ...extra });
 
-const editHTML = (ctx, text, extra = {}) =>
-  ctx.editMessageText(text, { parse_mode: 'HTML', disable_web_page_preview: true, ...extra });
+// Safe edit: ignore “message is not modified”
+const editHTML = async (ctx, text, extra = {}) => {
+  try {
+    return await ctx.editMessageText(text, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...extra,
+    });
+  } catch (err) {
+    const desc = err?.response?.description || '';
+    if (desc.includes('message is not modified')) {
+      // Just acknowledge the tap; no need to throw
+      return ctx.answerCbQuery('Already up to date');
+    }
+    throw err;
+  }
+};
+
+// Handle noop buttons (do nothing, just close the spinner)
+bot.action('noop', (ctx) => ctx.answerCbQuery(''));
+
+// ... rest of your code unchanged ...
+
 
 // ----- Data helpers -----
 async function ensureData(ca) {
