@@ -1,4 +1,4 @@
-#How it works (process overview)
+# How it works (process overview)
 
 Goal: deliver instant responses in TG without hammering APIs.
 1. Worker fetches → Cache + DB (optional)
@@ -37,7 +37,7 @@ current < first → SOLD SOME
 current == first → HOLD
 current > first → BOUGHT MORE
 
-#Data flow diagram
+# Data flow diagram
 User -> Telegram -> Telegraf Bot
                       |
                       | Redis GET (token:<ca>:summary)
@@ -58,7 +58,7 @@ User -> Telegram -> Telegraf Bot
                 |
               Redis SET (TTL)
 
-#Commands (bot)
+# Commands (bot)
 Command	Description
 /start	Short intro + usage
 /stats <contract>	Shows the full stats block for a token
