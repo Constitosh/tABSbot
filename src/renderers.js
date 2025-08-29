@@ -24,7 +24,7 @@ export function renderOverview(data) {
     `Burned: *${escapeMd(pct(data.burnedPct))}*`,
     ``,
     `Pick a section:`,
-    `• *Buyers* — first 20 buyers + status`,
+    `• *Buyers* — first 20 buyers \\+ status`,
     `• *Holders* — top 20 holder percentages`,
     ``,
     `_Updated: ${escapeMd(new Date(data.updatedAt).toLocaleString())}_`,
