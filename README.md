@@ -17,22 +17,22 @@ npm i
 
 Create .env in the project root:
 
-# Telegram
+Telegram
 BOT_TOKEN=123456:your-telegram-bot-token
 
-# Redis
+Redis
 REDIS_URL=redis://127.0.0.1:6379
 
-# Option A: Etherscan v2 multichain (uses chainid=2741 for Abstract)
+Option A: Etherscan v2 multichain (uses chainid=2741 for Abstract)
 ETHERSCAN_V2_BASE=https://api.etherscan.io/v2/api
 ETHERSCAN_API_KEY=your-etherscan-key
 
-# Option B: Abscan (Etherscan-compatible v1 style)
-# ABSCAN_BASE=https://api.abscan.org/api
-# ABSCAN_API_KEY=your-abscan-key
+Option B: Abscan (Etherscan-compatible v1 style)
+BSCAN_BASE=https://api.abscan.org/api
+ABSCAN_API_KEY=your-abscan-key
 
-# Optional: list of default tokens to auto-refresh every 120s
-# DEFAULT_TOKENS=0xabc...,0xdef...
+Optional: list of default tokens to auto-refresh every 120s
+DEFAULT_TOKENS=0xabc...,0xdef...
 
 
 Use one of Option A or B. If you provide ETHERSCAN_V2_BASE, the bot will pass chainid=2741 automatically.
