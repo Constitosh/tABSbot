@@ -60,7 +60,7 @@ bot.command('stats', async (ctx) => {
   if (!data) return ctx.reply('Initializing… try again in a few seconds.');
 
   const { text, extra } = renderOverview(data);
-  return ctx.replyWithMarkdownV2(text, { ...extra, disable_web_page_preview: true });
+  return ctx.replyWithHTML(text, { ...extra, disable_web_page_preview: true });
 });
 
 // /refresh <ca> — Manual refresh with cooldown
@@ -97,11 +97,11 @@ bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
 
     if (kind === 'stats') {
       const { text, extra } = renderOverview(data);
-      return ctx.editMessageText(text, {
-        ...extra,
-        parse_mode: 'MarkdownV2',
-        disable_web_page_preview: true
-      });
+return ctx.editMessageText(text, {
+...extra,
+parse_mode: 'HTML',
+disable_web_page_preview: true
+});
     }
 
     if (kind === 'buyers') {
