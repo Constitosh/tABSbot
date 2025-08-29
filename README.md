@@ -64,7 +64,7 @@ Command	Description
 /stats <contract>	Shows the full stats block for a token
 /refresh <contract>	Triggers a refresh (30s cooldown per token)
 
-#Functions & modules (what they do)
+# Functions & modules (what they do)
 src/services/dexscreener.js
 
 - getDexscreenerTokenStats(tokenAddress)
@@ -130,7 +130,7 @@ withLock(key, ttlSec, fn) — simple lock to prevent duplicate refresh.
 - src/util.js
 Helpers: sleep, isAddress, shortAddr, pct, num, now.
 
-#Environment variables (reference)
+# Environment variables (reference)
 Variable	Purpose
 BOT_TOKEN	Telegram bot token
 REDIS_URL	Redis connection string
@@ -142,7 +142,7 @@ DEFAULT_TOKENS	Comma-separated CAs to auto-refresh every 120s
 
 Provide either the Etherscan v2 variables or the Abscan variables.
 
-#Output format (Telegram)
+# Output format (Telegram)
 
 - The /stats response prints:
 Header with Name / Symbol and CA
@@ -158,7 +158,7 @@ Updated timestamp
 
 Long lists are neatly numbered; addresses are shortened.
 
-#Tips & caveats
+# Tips & caveats
 
 Market Cap from Dexscreener is generally FDV for new tokens. If you need circulating market cap, you’ll need a reliable circulating supply source.
 
@@ -166,7 +166,7 @@ Very fresh tokens may not have holder lists populated immediately on Abscan/Ethe
 
 “First buyers” logic is heuristic (first transfer recipients). You can refine: exclude router/LP addresses, known contracts, etc.
 
-#Troubleshooting
+# Troubleshooting
 
 “Initializing… try again”
 First request was a cold start and the synchronous refresh failed or timed out. Try /stats again; the job has been queued.
@@ -180,7 +180,7 @@ The creator may not appear in the top 100 holders retrieved. Increase offset in 
 Cooldown message on /refresh
 The bot enforces a 30s manual refresh cooldown per token to avoid API spam.
 
-#Extending
+# Extending
 
 Add inline buttons (e.g., “↻ Refresh”, “Next page holders”) via reply_markup.
 
@@ -188,7 +188,7 @@ Persist historical snapshots in Postgres if you want charts or time-series.
 
 Add more chains by parameterizing the chain slug for Dexscreener and the chainid for Etherscan v2.
 
-#License
+# License
 
 MIT (or align with your repo license).
 
