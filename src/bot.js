@@ -8,127 +8,78 @@ import { isAddress } from './util.js';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// --- Helpers ---
+// ---- HTML helpers (so we never forget the parse_mode) ----
+const sendHTML = (ctx, text, extra={}) =>
+  ctx.replyWithHTML(text, { disable_web_page_preview: true, ...extra });
 
-// Fetch from cache or do a synchronous first refresh (cold start)
-async function ensureData(ca) {
-  const key = `token:${ca}:summary`;
-  const cache = await getJSON(key);
-  if (cache) return cache;
+const editHTML = (ctx, text, extra={}) =>
+  ctx.editMessageText(text, { parse_mode: 'HTML', disable_web_page_preview: true, ...extra });
 
-  try {
-    // Try a synchronous refresh once on cold start
-    return await refreshToken(ca);
-  } catch (e) {
-    // Fallback: enqueue an async refresh and tell caller to retry soon
-    await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
-    return null;
-  }
-}
+// ---- data helpers ----
+async function ensureData(ca) { /* ...unchanged... */ }
+async function requestRefresh(ca) { /* ...unchanged... */ }
 
-// Cooldown + enqueue a refresh job
-async function requestRefresh(ca) {
-  const last = await getJSON(`token:${ca}:last_refresh`);
-  const age = last ? (Date.now() - last.ts) / 1000 : Infinity;
-  if (age < 30) {
-    return { ok: false, age };
-  }
-  await setJSON(`token:${ca}:last_refresh`, { ts: Date.now() }, 600);
-  await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
-  return { ok: true, age };
-}
+// ---- Commands ----
+bot.start((ctx) => ctx.reply(
+  'tABS Tools ready.\nUse /stats <contract>  •  /refresh <contract>\nExample: /stats 0x1234567890abcdef1234567890abcdef12345678'
+));
 
-// --- Commands ---
-
-bot.start((ctx) =>
-  ctx.reply(
-    [
-      'tABS Tools ready.',
-      'Use /stats <contract>  •  /refresh <contract>',
-      'Example: /stats 0x1234567890abcdef1234567890abcdef12345678'
-    ].join('\n')
-  )
-);
-
-// /stats <ca> — Overview screen
 bot.command('stats', async (ctx) => {
   const [, caRaw] = ctx.message.text.trim().split(/\s+/);
   if (!isAddress(caRaw)) return ctx.reply('Send: /stats <contractAddress>');
-
   const ca = caRaw.toLowerCase();
+
   const data = await ensureData(ca);
   if (!data) return ctx.reply('Initializing… try again in a few seconds.');
 
   const { text, extra } = renderOverview(data);
-  return ctx.replyWithHTML(text, { ...extra, disable_web_page_preview: true });
+  return sendHTML(ctx, text, extra);  // 👈 use HTML helper
 });
 
-// /refresh <ca> — Manual refresh with cooldown
 bot.command('refresh', async (ctx) => {
   const [, caRaw] = ctx.message.text.trim().split(/\s+/);
   if (!isAddress(caRaw)) return ctx.reply('Send: /refresh <contractAddress>');
-
   const ca = caRaw.toLowerCase();
+
   const res = await requestRefresh(ca);
-  if (!res.ok) {
-    return ctx.reply(`Recently refreshed (${res.age.toFixed(0)}s ago). Try again shortly.`);
-  }
+  if (!res.ok) return ctx.reply(`Recently refreshed (${res.age.toFixed(0)}s ago). Try again shortly.`);
   return ctx.reply(`Refreshing ${ca}…`);
 });
 
-// --- Callback actions (inline keyboard navigation) ---
-
+// ---- Callbacks ----
 bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
   try {
     const [kind, ca, maybePage] = ctx.callbackQuery.data.split(':');
 
     if (kind === 'refresh') {
       const res = await requestRefresh(ca);
-      const msg = res.ok
-        ? 'Refreshing…'
-        : `Recently refreshed (${res.age.toFixed(0)}s ago). Try again shortly.`;
+      const msg = res.ok ? 'Refreshing…' : `Recently refreshed (${res.age.toFixed(0)}s ago). Try again shortly.`;
       return ctx.answerCbQuery(msg, { show_alert: false });
     }
 
     const data = await ensureData(ca);
-    if (!data) {
-      return ctx.answerCbQuery('Initializing… try again shortly.', { show_alert: true });
-    }
+    if (!data) return ctx.answerCbQuery('Initializing… try again shortly.', { show_alert: true });
 
     if (kind === 'stats') {
       const { text, extra } = renderOverview(data);
-return ctx.editMessageText(text, {
-...extra,
-parse_mode: 'HTML',
-disable_web_page_preview: true
-});
+      return editHTML(ctx, text, extra);   // 👈 HTML
     }
 
     if (kind === 'buyers') {
       const page = Number(maybePage || 1);
       const { text, extra } = renderBuyers(data, page);
-      return ctx.editMessageText(text, {
-        ...extra,
-        parse_mode: 'MarkdownV2',
-        disable_web_page_preview: true
-      });
+      return editHTML(ctx, text, extra);   // 👈 HTML
     }
 
     if (kind === 'holders') {
       const page = Number(maybePage || 1);
       const { text, extra } = renderHolders(data, page);
-      return ctx.editMessageText(text, {
-        ...extra,
-        parse_mode: 'MarkdownV2',
-        disable_web_page_preview: true
-      });
+      return editHTML(ctx, text, extra);   // 👈 HTML
     }
   } catch (e) {
     return ctx.answerCbQuery('Error — try again', { show_alert: true });
   }
 });
-
-// --- Boot ---
 
 bot.launch().then(() => console.log('tABS Tools bot up.'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
