@@ -194,6 +194,14 @@ function safeTxn(obj) {
   return { buys, sells };
 }
 
+
+function pickUrl(x) {
+  if (!x) return null;
+  if (typeof x === 'string') return x;
+  if (typeof x === 'object' && typeof x.url === 'string') return x.url;
+  return null;
+}
+
 function normalizeSocials(socialsRaw, websitesRaw) {
   const socials = Array.isArray(socialsRaw) ? socialsRaw : [];
   const websites = Array.isArray(websitesRaw) ? websitesRaw : [];
@@ -204,28 +212,35 @@ function normalizeSocials(socialsRaw, websitesRaw) {
   const others = [];
 
   for (const s of socials) {
-    const url = s?.url || '';
+    const url = pickUrl(s?.url || s);
     const type = (s?.type || '').toLowerCase();
+    if (!url) continue;
 
-    // classify known types
     if (!twitter && (type === 'twitter' || /(^https?:\/\/)?(x\.com|twitter\.com)\//i.test(url))) {
-      twitter = url;
-      continue;
+      twitter = url; continue;
     }
     if (!telegram && (type === 'telegram' || /(^https?:\/\/)?(t\.me|telegram\.me)\//i.test(url))) {
-      telegram = url;
-      continue;
+      telegram = url; continue;
     }
-    // keep everything for completeness
-    if (url) others.push({ type: type || 'unknown', url });
+    others.push({ type: type || 'unknown', url });
   }
 
+  // websites can be strings or objects
   if (websites.length) {
-    website = websites[0];
+    website = pickUrl(websites[0]);
     for (let i = 1; i < websites.length; i++) {
-      others.push({ type: 'website', url: websites[i] });
+      const u = pickUrl(websites[i]);
+      if (u) others.push({ type: 'website', url: u });
     }
   }
+
+  // final sanitation: only keep strings
+  twitter = typeof twitter === 'string' ? twitter : null;
+  telegram = typeof telegram === 'string' ? telegram : null;
+  website = typeof website === 'string' ? website : null;
 
   return { twitter, telegram, website, others };
 }
+
+
+
