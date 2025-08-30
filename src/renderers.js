@@ -10,24 +10,24 @@ export function renderOverview(data) {
   const t24 = trendBadge(m.priceChange?.h24);
 
   const lines = [
-    `🪙 <b>Token Overview — ${name}${sym ? ` (${sym})` : ''}</b>`,
+    `🪙 <b>${name}${sym ? ` (${sym})` : ''}</b>`,
     `CA: <code>${ca}</code>`,
     ``,
+    `MCap (FDV): <b>${esc(money(m.marketCap))}</b>`,
     `Price: <b>${esc(money(m.priceUsd, 8))}</b>   ${t24}`,
     `24h Volume: <b>${esc(money(m.volume24h))}</b>`,
     `Change: 1h <b>${esc(pct(m.priceChange?.h1))}</b>  •  6h <b>${esc(pct(m.priceChange?.h6))}</b>  •  24h <b>${esc(pct(m.priceChange?.h24))}</b>`,
-    `FDV (MCap): <b>${esc(money(m.marketCap))}</b>`,
     ``,
     `Creator: <code>${creator}</code> — <b>${esc(pct(data.creator?.percent))}</b>`,
-    `Top 10 combined: <b>${esc(pct(data.top10CombinedPct))}</b>`,
     `Burned: <b>${esc(pct(data.burnedPct))}</b>`,
+    `Top 10 combined: <b>${esc(pct(data.top10CombinedPct))}</b>`,
     ``,
     `<i>Pick a section:</i>`,
     `• <b>Buyers</b> — first 20 buyers + status`,
     `• <b>Holders</b> — top 20 holder percentages`,
     ``,
     `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>`,
-    `<i>Source: Dexscreener · Abscan (Abstract)</i>`
+    `<i>Source: Dexscreener · Abscan</i>`
   ];
 
   const text = lines.join('\n');
