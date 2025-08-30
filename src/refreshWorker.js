@@ -5,6 +5,8 @@ import { setJSON, withLock } from './cache.js';
 import { getDexscreenerTokenStats } from './services/dexscreener.js';
 import { getContractCreator, getTokenHolders, getTokenTransfers } from './services/abscan.js';
 import { summarizeHolders, buildCurrentBalanceMap, first20BuyersStatus } from './services/compute.js';
+console.log('[WORKER BOOT] ABSCAN_API=', process.env.ABSCAN_API);
+
 
 const bullRedis = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null, enableReadyCheck: false });
 
