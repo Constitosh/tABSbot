@@ -1,14 +1,14 @@
-// src/bot.js  (showing only the changed/added parts)
+// src/bot.js
 import './configEnv.js';
 import { Telegraf } from 'telegraf';
 import { getJSON, setJSON } from './cache.js';
 import { queue, refreshToken } from './queueCore.js';
-import { renderOverview, renderBuyers, renderHolders } from './renderers.js';
+import { renderOverview, renderBuyers, renderHolders, renderAbout } from './renderers.js';
 import { isAddress } from './util.js';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// HTML helpers
+// ----- HTML helpers (ensure consistent parse_mode) -----
 const sendHTML = (ctx, text, extra = {}) =>
   ctx.replyWithHTML(text, { disable_web_page_preview: true, ...extra });
 
@@ -23,18 +23,11 @@ const editHTML = async (ctx, text, extra = {}) => {
   } catch (err) {
     const desc = err?.response?.description || '';
     if (desc.includes('message is not modified')) {
-      // Just acknowledge the tap; no need to throw
       return ctx.answerCbQuery('Already up to date');
     }
     throw err;
   }
 };
-
-// Handle noop buttons (do nothing, just close the spinner)
-bot.action('noop', (ctx) => ctx.answerCbQuery(''));
-
-// ... rest of your code unchanged ...
-
 
 // ----- Data helpers -----
 async function ensureData(ca) {
@@ -43,11 +36,11 @@ async function ensureData(ca) {
     const cache = await getJSON(key);
     if (cache) return cache;
 
-    // Try a synchronous refresh once on cold start
+    // cold start: try a synchronous refresh once
     const fresh = await refreshToken(ca);
     return fresh || null;
   } catch (e) {
-    // Fallback: enqueue and tell caller to retry soon
+    // enqueue and ask user to retry
     try {
       await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
     } catch (_) {}
@@ -55,7 +48,7 @@ async function ensureData(ca) {
   }
 }
 
-// Always return a shape { ok:boolean, age?:number, error?:string }
+// Always return { ok:boolean, age?:number, error?:string }
 async function requestRefresh(ca) {
   try {
     const last = await getJSON(`token:${ca}:last_refresh`);
@@ -85,7 +78,7 @@ bot.start((ctx) =>
   )
 );
 
-// /stats <ca> — Overview
+// /stats <ca>
 bot.command('stats', async (ctx) => {
   const [, caRaw] = ctx.message.text.trim().split(/\s+/);
   if (!isAddress(caRaw)) return ctx.reply('Send: /stats <contractAddress>');
@@ -98,7 +91,7 @@ bot.command('stats', async (ctx) => {
   return sendHTML(ctx, text, extra);
 });
 
-// /refresh <ca> — Manual refresh with cooldown
+// /refresh <ca>
 bot.command('refresh', async (ctx) => {
   const [, caRaw] = ctx.message.text.trim().split(/\s+/);
   if (!isAddress(caRaw)) return ctx.reply('Send: /refresh <contractAddress>');
@@ -115,7 +108,12 @@ bot.command('refresh', async (ctx) => {
   return ctx.reply(`Refreshing ${ca}…`);
 });
 
-// ----- Inline callbacks -----
+// ----- Callback handlers -----
+
+// noop buttons: just close the spinner
+bot.action('noop', (ctx) => ctx.answerCbQuery(''));
+
+// Main action router
 bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
   try {
     const [kind, ca, maybePage] = ctx.callbackQuery.data.split(':');
@@ -154,6 +152,12 @@ bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
   } catch (e) {
     return ctx.answerCbQuery('Error — try again', { show_alert: true });
   }
+});
+
+// About modal
+bot.action('about', async (ctx) => {
+  const { text, extra } = renderAbout();
+  return editHTML(ctx, text, extra);
 });
 
 // ----- Boot -----
