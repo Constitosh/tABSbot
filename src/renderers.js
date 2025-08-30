@@ -80,6 +80,19 @@ export function renderOverview(data) {
   return { text, extra: kb };
 }
 
+// ...inside renderOverview(data) after kb is created:
+
+const linkRow = [];
+const t = m.socials?.twitter;
+const g = m.socials?.telegram;
+const w = m.socials?.website;
+
+if (typeof t === 'string' && t.length) linkRow.push({ text: '𝕏 Twitter', url: t });
+if (typeof g === 'string' && g.length) linkRow.push({ text: 'Telegram',  url: g });
+if (typeof w === 'string' && w.length) linkRow.push({ text: 'Website',   url: w });
+
+if (linkRow.length) kb.reply_markup.inline_keyboard.unshift(linkRow);
+
 /**
  * Buyers screen with pagination
  * data.first20Buyers = [{ address, status }, ...] (already computed)
