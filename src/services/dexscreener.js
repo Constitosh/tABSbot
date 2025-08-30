@@ -1,5 +1,7 @@
 // src/services/dexscreener.js
 import axios from 'axios';
+import '../configEnv.js';
+
 
 /**
  * Fetch raw Dexscreener data for a token address (Abstract pairs only).
