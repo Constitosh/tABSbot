@@ -3,6 +3,8 @@
 // Reads base from env: ABSCAN_API (default https://abscan.org/api)
 // Optional: ABSCAN_API_KEY
 import axios from 'axios';
+import '../configEnv.js'; // ensure .env is loaded before we read process.env
+// ...rest of file
 
 const BASE = (process.env.ABSCAN_API || 'https://abscan.org/api').replace(/\/+$/, '');
 const KEY  = process.env.ABSCAN_API_KEY || null;
