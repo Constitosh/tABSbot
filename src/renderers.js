@@ -4,17 +4,6 @@ import { esc, pct, money, shortAddr, trendBadge } from './ui_html.js';
 
 /**
  * Overview screen
- * Expects `data` shape from cache:
- * {
- *   tokenAddress, updatedAt,
- *   market: {
- *     name, symbol, priceUsd, volume{m5,h1,h6,h24},
- *     priceChange{m5,h1,h6,h24}, marketCap, marketCapSource, imageUrl,
- *     socials{twitter, telegram, website}, url, dexId, ...
- *   },
- *   holdersCount, top10CombinedPct, burnedPct,
- *   creator: { address, percent }
- * }
  */
 export function renderOverview(data) {
   const m = data.market || {};
@@ -56,7 +45,7 @@ export function renderOverview(data) {
   const kb = {
     reply_markup: {
       inline_keyboard: [
-        // link row (inserted below if we have socials)
+        // socials row will be unshifted below if present
         [],
         [
           { text:'🧑‍🤝‍🧑 Buyers',  callback_data:`buyers:${data.tokenAddress}:1` },
@@ -70,32 +59,24 @@ export function renderOverview(data) {
     }
   };
 
-  // Add socials link row at the top if present
+  // Socials row (use only string URLs)
   const linkRow = [];
-  if (m.socials?.twitter)  linkRow.push({ text: '𝕏 Twitter', url: m.socials.twitter });
-  if (m.socials?.telegram) linkRow.push({ text: 'Telegram',  url: m.socials.telegram });
-  if (m.socials?.website)  linkRow.push({ text: 'Website',   url: m.socials.website });
+  const t = m.socials?.twitter;
+  const g = m.socials?.telegram;
+  const w = m.socials?.website;
+
+  if (typeof t === 'string' && t.length) linkRow.push({ text: '𝕏 Twitter', url: t });
+  if (typeof g === 'string' && g.length) linkRow.push({ text: 'Telegram',  url: g });
+  if (typeof w === 'string' && w.length) linkRow.push({ text: 'Website',   url: w });
+
   if (linkRow.length) kb.reply_markup.inline_keyboard.unshift(linkRow);
 
   return { text, extra: kb };
 }
 
-// ...inside renderOverview(data) after kb is created:
-
-const linkRow = [];
-const t = m.socials?.twitter;
-const g = m.socials?.telegram;
-const w = m.socials?.website;
-
-if (typeof t === 'string' && t.length) linkRow.push({ text: '𝕏 Twitter', url: t });
-if (typeof g === 'string' && g.length) linkRow.push({ text: 'Telegram',  url: g });
-if (typeof w === 'string' && w.length) linkRow.push({ text: 'Website',   url: w });
-
-if (linkRow.length) kb.reply_markup.inline_keyboard.unshift(linkRow);
-
 /**
  * Buyers screen with pagination
- * data.first20Buyers = [{ address, status }, ...] (already computed)
+ * data.first20Buyers = [{ address, status }, ...]
  */
 export function renderBuyers(data, page = 1, pageSize = 10) {
   const start = (page - 1) * pageSize;
