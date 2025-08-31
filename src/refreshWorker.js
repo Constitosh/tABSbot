@@ -89,6 +89,9 @@ export async function refreshToken(tokenAddress) {
     // 6) Cache
     await setJSON(`token:${ca}:summary`, payload, 180);
     await setJSON(`token:${ca}:last_refresh`, { ts: Date.now() }, 600);
+    const sanity = await getJSON(`token:${ca}:summary`);
+console.log('[WORKER] cached summary key token:%s:summary present=%s name=%s',
+  ca, Boolean(sanity), sanity?.market?.name || 'n/a');
     console.log(`[WORKER] refreshToken done ${ca}`);
 
     return payload;
