@@ -86,50 +86,6 @@ export async function refreshToken(tokenAddress) {
       first20Buyers: buyers,
     };
 
-    // 2) Etherscan v2 data
-    let transfers = [], creatorInfo = null, totalSupply = 0;
-    try {
-      const [t, c, s] = await Promise.all([
-        getAllTokenTransfers(ca, { maxPages: 50 }),
-        getContractCreator(ca),
-        getTokenTotalSupply(ca),
-      ]);
-      transfers = t || [];
-      creatorInfo = c || { contractAddress: ca, creatorAddress: null, txHash: null };
-      totalSupply = s || 0;
-      console.log(`[WORKER] ESV2 ok ${ca} transfers=${transfers.length} totalSupply=${totalSupply}`);
-    } catch (e) {
-      console.error('[WORKER] ESV2 failed:', e?.message || e);
-    }
-
-    // 3) Holders & buyers
-    const { balances, decimals } = buildBalanceMap(transfers);
-    const holdersSummary = summarizeHoldersFromBalances(balances, totalSupply, decimals);
-    const buyers = first20BuyersStatus(transfers, balances);
-
-    // 4) Creator %
-    let creatorPct = 0;
-    try {
-      if (creatorInfo?.creatorAddress) {
-        const bal = balances.get(creatorInfo.creatorAddress) || 0n;
-        const tot = BigInt(String(totalSupply || '0'));
-        creatorPct = tot > 0n ? Number((bal * 1000000n) / tot) / 10000 : 0;
-      }
-    } catch (_) {}
-
-    // 5) Payload
-    const payload = {
-      tokenAddress: ca,
-      updatedAt: Date.now(),
-      market,
-      holdersTop20: holdersSummary.holdersTop20,
-      top10CombinedPct: holdersSummary.top10CombinedPct,
-      burnedPct: holdersSummary.burnedPct,
-      holdersCount: holdersSummary.holdersCount,
-      creator: { address: creatorInfo?.creatorAddress || null, percent: creatorPct },
-      first20Buyers: buyers,
-    };
-
     // 6) Cache
     await setJSON(`token:${ca}:summary`, payload, 180);
     await setJSON(`token:${ca}:last_refresh`, { ts: Date.now() }, 600);
