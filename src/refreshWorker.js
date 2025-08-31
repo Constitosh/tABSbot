@@ -5,18 +5,14 @@ import { Worker, Queue } from 'bullmq';
 import { setJSON, withLock } from './cache.js';
 import { getDexscreenerTokenStats } from './services/dexscreener.js';
 
-// Etherscan-free helpers
 import {
-  getTokenTransfers as esTransfers,
-  getTokenTotalSupply as esSupply,
-  getContractCreator as esCreator,
-  getTokenBalance as esBalance,
-  computeFirst20BuyersStatus,
-  statusFromBalance
-} from './services/etherscanFree.js';
+  getAllTokenTransfers,
+  buildBalanceMap,
+  summarizeHoldersFromBalances,
+  first20BuyersStatus
+} from './services/absEtherscanV2.js';
 
-// If you still have Abscan code, we’ll only use it when ABSCAN_API is set and you want it
-const USE_ABSCAN = false; // ← force Etherscan-only mode for now
+import { getContractCreator } from './services/abscanFree.js'; // keep this (works fine)
 
 const bullRedis = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null, enableReadyCheck: false });
 export const queueName = 'tabs_refresh';
@@ -28,45 +24,52 @@ export async function refreshToken(tokenAddress) {
 
   const lockKey = `lock:refresh:${ca}`;
   return withLock(lockKey, 60, async () => {
-    // 1) Market (dexscreener)
+    // 1) Market
     const mkt = await getDexscreenerTokenStats(ca);
 
-    // 2) Etherscan-only path
-    const [transfers, totalSupply, creatorInfo] = await Promise.all([
-      esTransfers(ca, 0, 999999999, 1, 1000),   // ascending, up to 1000 txs
-      esSupply(ca),
-      esCreator(ca)
-    ]);
+    // 2) All transfers (Abstract via Etherscan v2 chainid=2741)
+    const transfers = await getAllTokenTransfers(ca);
 
-    // 3) First 20 buyers + status (we will fetch balances)
-    const { buyers, seeds } = computeFirst20BuyersStatus(transfers);
-    const buyersStatuses = [];
-    for (const addr of buyers) {
-      const seed = seeds.get(addr);
-      const currBal = await esBalance(ca, addr);
-      const status = statusFromBalance(seed.amountRaw, seed.decimals, String(currBal));
-      buyersStatuses.push({ address: addr, status });
+    // 3) Balance map -> holders/top10/burned
+    const { balances, decimals } = buildBalanceMap(transfers);
+
+    // Dexscreener often returns FDV; we don't know exact totalSupply on-chain from v2 free.
+    // We can estimate "supply" from largest mint (sum of incoming from ZERO) OR
+    // better: use Dexscreener marketCap / priceUsd if present to back-solve supply.
+    let estSupply = 0n;
+    if (Number(mkt?.priceUsd) > 0 && Number(mkt?.marketCap) > 0) {
+      const supply = Math.round(Number(mkt.marketCap) / Number(mkt.priceUsd));
+      estSupply = BigInt(supply) * (10n ** BigInt(decimals));
+    } else {
+      // fallback: infer from sum of positive balances
+      let sumRaw = 0n;
+      for (const v of balances.values()) if (v > 0n) sumRaw += v;
+      estSupply = sumRaw;
     }
 
-    // 4) Creator % (we can get creator’s current balance)
+    const holdersSummary = summarizeHoldersFromBalances(balances, estSupply, decimals);
+
+    // 4) First 20 buyers + status
+    const buyers = first20BuyersStatus(transfers, balances);
+
+    // 5) Creator address (from Abscan free)
+    const creator = await getContractCreator(ca);
     let creatorPct = 0;
-    const creatorAddr = creatorInfo?.creatorAddress || null;
-    if (creatorAddr && totalSupply > 0) {
-      const creatorBal = await esBalance(ca, creatorAddr);
-      creatorPct = (Number(creatorBal) / Number(totalSupply)) * 100;
+    if (creator?.creatorAddress && estSupply > 0n) {
+      const currRaw = balances.get(creator.creatorAddress.toLowerCase()) || 0n;
+      creatorPct = Number((currRaw * 1000000n) / estSupply) / 10000;
     }
 
-    // 5) We cannot get top holders / holdersCount on free API → mark as unavailable
     const payload = {
       tokenAddress: ca,
       updatedAt: Date.now(),
-      market: mkt,                         // from Dexscreener
-      holdersTop20: [],                    // not available on free API
-      holdersCount: null,                  // not available on free API
-      top10CombinedPct: null,              // not available on free API
-      burnedPct: null,                     // not available on free API
-      creator: { address: creatorAddr, percent: creatorPct },
-      first20Buyers: buyersStatuses
+      market: mkt,
+      holdersTop20: holdersSummary.holdersTop20,
+      holdersCount: holdersSummary.holdersCount,
+      top10CombinedPct: holdersSummary.top10CombinedPct,
+      burnedPct: holdersSummary.burnedPct,
+      creator: { address: creator?.creatorAddress || null, percent: creatorPct },
+      first20Buyers: buyers
     };
 
     await setJSON(`token:${ca}:summary`, payload, 180);
@@ -79,5 +82,3 @@ new Worker(queueName, async job => {
   const { tokenAddress } = job.data;
   return refreshToken(tokenAddress);
 }, { connection: bullRedis });
-
-// optional cron based on DEFAULT_TOKENS…
