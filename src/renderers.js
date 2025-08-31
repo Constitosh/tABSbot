@@ -6,37 +6,45 @@ import { esc, pct, money, shortAddr, trendBadge } from './ui_html.js';
  * Overview screen
  */
 export function renderOverview(data) {
-  const m = data.market || {};
-  const name = esc(m.name || 'Token');
-  const sym  = esc(m.symbol || '');
+  const m = data.market || null;
+  const name = esc(m?.name || 'Token');
+  const sym  = esc(m?.symbol || '');
   const ca   = esc(data.tokenAddress);
-  const creator = data.creator?.address ? esc(shortAddr(data.creator.address)) : 'unknown';
-  const t24 = trendBadge(m.priceChange?.h24);
+  const t24  = trendBadge(m?.priceChange?.h24);
 
-  const capLabel = (m.marketCapSource === 'fdv') ? 'FDV (as cap)' : 'Market Cap';
+  const vol = m?.volume || {};
+  const chg = m?.priceChange || {};
+  const capLabel = (m?.marketCapSource === 'fdv') ? 'FDV (as cap)' : 'Market Cap';
 
-  const holdersCountLine = (typeof data.holdersCount === 'number')
-    ? `Holders: <b>${data.holdersCount.toLocaleString()}</b>`
-    : `Holders: <i>N/A (Etherscan free API)</i>`;
+  const holdersLine =
+    typeof data.holdersCount === 'number'
+      ? `Holders: <b>${data.holdersCount.toLocaleString()}</b>`
+      : `Holders: <i>N/A (Etherscan free API)</i>`;
 
-  const top10Line = (data.top10CombinedPct != null)
-    ? `Top 10 combined: <b>${esc(pct(data.top10CombinedPct))}</b>`
-    : `Top 10 combined: <i>N/A (Etherscan free API)</i>`;
+  const top10Line =
+    data.top10CombinedPct != null
+      ? `Top 10 combined: <b>${esc(pct(data.top10CombinedPct))}</b>`
+      : `Top 10 combined: <i>N/A (Etherscan free API)</i>`;
 
-  const burnedLine = (data.burnedPct != null)
-    ? `Burned: <b>${esc(pct(data.burnedPct))}</b>`
-    : `Burned: <i>N/A</i>`;
+  const burnedLine =
+    data.burnedPct != null
+      ? `Burned: <b>${esc(pct(data.burnedPct))}</b>`
+      : `Burned: <i>N/A</i>`;
+
+  const creatorAddr = data.creator?.address ? esc(shortAddr(data.creator.address)) : 'unknown';
 
   const lines = [
     `🪙 <b>Token Overview — ${name}${sym ? ` (${sym})` : ''}</b>`,
     `CA: <code>${ca}</code>`,
     ``,
-    `Price: <b>${esc(money(m.priceUsd, 8))}</b>   ${t24}`,
-    `Volume: 5m <b>${esc(money(m.volume?.m5))}</b> • 1h <b>${esc(money(m.volume?.h1))}</b> • 6h <b>${esc(money(m.volume?.h6))}</b> • 24h <b>${esc(money(m.volume?.h24))}</b>`,
-    `Change: 5m <b>${esc(pct(m.priceChange?.m5))}</b> • 1h <b>${esc(pct(m.priceChange?.h1))}</b> • 6h <b>${esc(pct(m.priceChange?.h6))}</b> • 24h <b>${esc(pct(m.priceChange?.h24))}</b>`,
-    `${capLabel}: <b>${esc(money(m.marketCap))}</b>`,
-    holdersCountLine,
-    `Creator: <code>${creator}</code> — <b>${esc(pct(data.creator?.percent))}</b>`,
+    (m && typeof m.priceUsd === 'number')
+      ? `Price: <b>${esc(money(m.priceUsd, 8))}</b>   ${t24}`
+      : `<i>No market data yet (no Abstract pair indexed)</i>`,
+    (m ? `Volume: 5m <b>${esc(money(vol.m5))}</b> • 1h <b>${esc(money(vol.h1))}</b> • 6h <b>${esc(money(vol.h6))}</b> • 24h <b>${esc(money(vol.h24))}</b>` : undefined),
+    (m ? `Change: 5m <b>${esc(pct(chg.m5))}</b> • 1h <b>${esc(pct(chg.h1))}</b> • 6h <b>${esc(pct(chg.h6))}</b> • 24h <b>${esc(pct(chg.h24))}</b>` : undefined),
+    (m ? `${capLabel}: <b>${esc(money(m.marketCap))}</b>` : undefined),
+    holdersLine,
+    `Creator: <code>${creatorAddr}</code> — <b>${esc(pct(data.creator?.percent))}</b>`,
     top10Line,
     burnedLine,
     ``,
@@ -46,7 +54,7 @@ export function renderOverview(data) {
     ``,
     `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>`,
     `<i>Source: Dexscreener · Etherscan</i>`
-  ];
+  ].filter(Boolean);
 
   const text = lines.join('\n');
 
@@ -76,9 +84,9 @@ export function renderOverview(data) {
 
   // Socials row (use only string URLs)
   const linkRow = [];
-  const t = m.socials?.twitter;
-  const g = m.socials?.telegram;
-  const w = m.socials?.website;
+  const t = m?.socials?.twitter;
+  const g = m?.socials?.telegram;
+  const w = m?.socials?.website;
 
   if (typeof t === 'string' && t.length) linkRow.push({ text: '𝕏 Twitter', url: t });
   if (typeof g === 'string' && g.length) linkRow.push({ text: 'Telegram',  url: g });
