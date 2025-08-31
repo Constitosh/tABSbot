@@ -1,8 +1,8 @@
 // src/bot.js
 import './configEnv.js';
-import { Telegraf, Markup } from 'telegraf';
+import { Telegraf } from 'telegraf';
 import { queue } from './queueCore.js';
-import { getJSON } from './cache.js';
+import { getJSON, setJSON } from './cache.js';
 import { renderOverview, renderBuyers, renderHolders, renderAbout } from './renderers.js';
 import { isAddress } from './util.js';
 
@@ -30,35 +30,31 @@ const editHTML = async (ctx, text, extra = {}) => {
 };
 
 // ----- Data helpers -----
+// Only read cache; on miss, enqueue a refresh and return null.
 async function ensureData(ca) {
-  try {
-    const key = `token:${ca}:summary`;
-    const cache = await getJSON(key);
-    if (cache) return cache;
+  const key = `token:${ca}:summary`;
+  const cache = await getJSON(key);
+  if (cache) return cache;
 
-    // cold start: try a synchronous refresh once
-    const fresh = await refreshToken(ca);
-    return fresh || null;
-  } catch (e) {
-    // enqueue and ask user to retry
-    try {
-      await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
-    } catch (_) {}
-    return null;
-  }
+  // cache miss — enqueue refresh for the worker and tell caller to try again shortly
+  try {
+    await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
+  } catch (_) {}
+  return null;
 }
 
-// Always return { ok:boolean, age?:number, error?:string }
+// Throttle refresh to 30s per token; always return { ok, age? , error? }
 async function requestRefresh(ca) {
   try {
-    const last = await getJSON(`token:${ca}:last_refresh`);
+    const gateKey = `token:${ca}:last_refresh`;
+    const last = await getJSON(gateKey);
     const age = last ? (Date.now() - last.ts) / 1000 : Infinity;
 
     if (Number.isFinite(age) && age < 30) {
       return { ok: false, age };
     }
 
-    await setJSON(`token:${ca}:last_refresh`, { ts: Date.now() }, 600);
+    await setJSON(gateKey, { ts: Date.now() }, 600);
     await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
 
     return { ok: true, age: Number.isFinite(age) ? age : null };
