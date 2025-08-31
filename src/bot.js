@@ -30,10 +30,20 @@ const editHTML = async (ctx, text, extra = {}) => {
 
 // ----- Data helpers -----
 // Enqueue refresh if missing and poll Redis briefly for the summary
+// ----- Data helpers -----
 async function ensureData(ca) {
   const key = `token:${ca}:summary`;
-  const gateKey = `token:${ca}:last_refresh`;
+  const cache = await getJSON(key);
+  if (cache) return cache;
 
+  // cache miss → enqueue a refresh and return null
+  try {
+    // throttle: set last_refresh to now so requestRefresh sees it
+    await setJSON(`token:${ca}:last_refresh`, { ts: Date.now() }, 600);
+    await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
+  } catch (_) {}
+  return null;
+}
   // 1) fast path: cached
   const cached = await getJSON(key);
   if (cached) return cached;
