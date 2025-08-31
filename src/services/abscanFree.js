@@ -1,6 +1,4 @@
 // src/services/abscanFree.js
-// Abscan (Abstract) free endpoints with Etherscan-compatible shapes.
-// Requires ABSCAN_API in .env (e.g. https://api.abscan.org/api)
 import '../configEnv.js';
 import axios from 'axios';
 
@@ -15,16 +13,12 @@ const qs = (o) =>
 
 async function call(params, { timeout = 15000 } = {}) {
   const url = `${BASE}?${qs({ ...params, apikey: KEY || undefined })}`;
+  if (process.env.ABSCAN_DEBUG) console.log('[ABSCAN] GET', url);
   const { data } = await axios.get(url, { timeout });
+  if (process.env.ABSCAN_DEBUG) console.log('[ABSCAN] RESULT PREVIEW', JSON.stringify(data?.result ?? data)?.slice(0,120));
   if (!data) throw new Error('Abscan: empty');
-  if (data.status === '0' && /rate limit|NOTOK/i.test(`${data.message} ${data.result}`)) {
-    throw new Error('Abscan: rate limited');
-  }
-  // Some explorers return `{status,message,result}`; others return the array directly
   return data.result ?? data;
 }
-
-/* ---------------- supply & balances ---------------- */
 
 export async function getTokenTotalSupply(contractAddress) {
   const res = await call({ module:'token', action:'tokensupply', contractaddress: contractAddress });
@@ -32,30 +26,19 @@ export async function getTokenTotalSupply(contractAddress) {
   return Number.isFinite(n) ? n : 0;
 }
 
-export async function getTokenBalance(contractAddress, holder) {
+export async function getTokenBalance(contractAddress, address) {
   const res = await call({
-    module: 'account',
-    action: 'tokenbalance',
-    contractaddress: contractAddress,
-    address: holder,
-    tag: 'latest'
+    module:'account', action:'tokenbalance',
+    contractaddress: contractAddress, address, tag:'latest'
   });
   const n = Number(res?.TokenBalance ?? res?.result ?? res);
   return Number.isFinite(n) ? n : 0;
 }
 
-/* ---------------- transfers (ascending) ---------------- */
-
-export async function getTokenTransfers(contractAddress, startblock = 0, endblock = 999999999, page = 1, offset = 1000) {
+export async function getTokenTransfers(contractAddress, startblock=0, endblock=999999999, page=1, offset=1000) {
   const res = await call({
-    module: 'account',
-    action: 'tokentx',
-    contractaddress: contractAddress,
-    page,
-    offset,
-    startblock,
-    endblock,
-    sort: 'asc'
+    module:'account', action:'tokentx',
+    contractaddress: contractAddress, page, offset, startblock, endblock, sort:'asc'
   });
   const list = Array.isArray(res) ? res : (res?.result || []);
   return list.map(t => ({
@@ -65,17 +48,13 @@ export async function getTokenTransfers(contractAddress, startblock = 0, endbloc
     from: String(t.from || '').toLowerCase(),
     to: String(t.to || '').toLowerCase(),
     value: String(t.value ?? '0'),
-    tokenDecimal: Number(t.tokenDecimal || t.decimals || 18)
+    tokenDecimal: Number(t.tokenDecimal || t.decimals || 18),
   }));
 }
 
-/* ---------------- creator (deployer) ---------------- */
-
 export async function getContractCreator(contractAddress) {
   const res = await call({
-    module: 'contract',
-    action: 'getcontractcreation',
-    contractaddresses: contractAddress
+    module:'contract', action:'getcontractcreation', contractaddresses: contractAddress
   });
   const row = Array.isArray(res) ? res[0] : res;
   return {
@@ -85,10 +64,9 @@ export async function getContractCreator(contractAddress) {
   };
 }
 
-/* ---------------- compute helpers (buyers/status) ---------------- */
-
+/* helpers */
 export function computeFirst20BuyersSeed(transfersAsc) {
-  const first = new Map(); // addr -> { amountRaw, decimals }
+  const first = new Map();
   for (const t of transfersAsc) {
     const recv = t.to;
     if (!recv || recv === '0x0000000000000000000000000000000000000000') continue;
