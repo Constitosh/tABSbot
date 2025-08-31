@@ -70,6 +70,7 @@ export async function getAllTokenTransfers(ca, { maxPages = 50 } = {}) {
         hash: t.hash,
         from: (t.from || '').toLowerCase(),
         to: (t.to || '').toLowerCase(),
+        value: (typeof t.value === 'string' ? t.value : String(t.value ?? '0')),
         value: String(t.value || '0'),
         tokenDecimal: Number(t.tokenDecimal || 18),
         tokenSymbol: t.tokenSymbol || '',
