@@ -1,80 +1,110 @@
+// src/refreshWorker.js
+// Worker that refreshes a token snapshot and caches it for the bot.
+// Market: Dexscreener
+// Holders/Buyers/Creator/Supply: Etherscan v2 (chainid=2741)
+
 import './configEnv.js';
 import Redis from 'ioredis';
 import { Worker, Queue } from 'bullmq';
+
 import { setJSON, withLock } from './cache.js';
 import { getDexscreenerTokenStats } from './services/dexscreener.js';
-import { getContractCreator, getTokenHolders, getTokenTransfers } from './services/abscan.js';
-import { summarizeHolders, buildCurrentBalanceMap, first20BuyersStatus } from './services/compute.js';
-console.log('[WORKER BOOT] ABSCAN_API=', process.env.ABSCAN_API);
+import {
+  getAllTokenTransfers,
+  getTokenTotalSupply,
+  getContractCreator,
+  buildBalanceMap,
+  summarizeHoldersFromBalances,
+  first20BuyersStatus,
+} from './services/absEtherscanV2.js';
 
+// ---------- BullMQ Redis ----------
+const bullRedis = new Redis(process.env.REDIS_URL, {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false,
+});
 
-const bullRedis = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null, enableReadyCheck: false });
-
-export const queueName = 'tabs_refresh';
+// ---------- Queue ----------
+export const queueName = 'tabs_refresh'; // no colon
 export const queue = new Queue(queueName, { connection: bullRedis });
 
+// ---------- Core refresh ----------
 export async function refreshToken(tokenAddress) {
-  const ca = (tokenAddress || '').toLowerCase();
-  if (!/^0x[a-fA-F0-9]{40}$/.test(ca)) throw new Error(`Invalid contract address: ${tokenAddress}`);
+  const ca = String(tokenAddress || '').trim().toLowerCase();
+  if (!/^0x[a-f0-9]{40}$/.test(ca)) throw new Error(`Invalid contract address: ${tokenAddress}`);
 
   const lockKey = `lock:refresh:${ca}`;
   return withLock(lockKey, 60, async () => {
-    const { summary: mkt } = await getDexscreenerTokenStats(ca);
+    // 1) Dexscreener market
+    const market = await getDexscreenerTokenStats(ca).catch(() => null);
 
-    const { holders, holderCount } = await getTokenHolders(ca, 1, 100);
-    const creator     = await getContractCreator(ca);
-    const transfers   = await getTokenTransfers(ca, 0, 999999999, 1, 1000);
+    // 2) Etherscan V2 data
+    const [transfers, creatorInfo, totalSupply] = await Promise.all([
+      getAllTokenTransfers(ca, { maxPages: 50 }).catch(() => []),
+      getContractCreator(ca).catch(() => ({ contractAddress: ca, creatorAddress: null, txHash: null })),
+      getTokenTotalSupply(ca).catch(() => 0),
+    ]);
 
-    // adapt to compute utils expected shape
-    const holdersForCompute = holders.map(h => ({
-      TokenHolderAddress: h.address,
-      Percentage: h.percent,
-      Balance: h.balance,
-    }));
+    // 3) Build balances & summaries
+    const { balances, decimals } = buildBalanceMap(transfers);
+    const holdersSummary = summarizeHoldersFromBalances(balances, totalSupply, decimals);
 
-    const holdersSummary = summarizeHolders(holdersForCompute);
-    const balanceMap     = buildCurrentBalanceMap(holdersForCompute);
-    const buyers         = first20BuyersStatus(transfers, balanceMap);
+    // 4) First 20 buyers status
+    const buyers = first20BuyersStatus(transfers, balances);
 
-    const creatorAddr = creator?.creatorAddress || null;
+    // 5) Creator %
     let creatorPct = 0;
-    if (creatorAddr) {
-      const hit = holders.find(h => (h.address || '').toLowerCase() === creatorAddr);
-      creatorPct = hit ? Number(hit.percent || 0) : 0;
+    if (creatorInfo?.creatorAddress) {
+      try {
+        const bal = balances.get(creatorInfo.creatorAddress) || 0n;
+        const tot = BigInt(String(totalSupply || '0'));
+        creatorPct = tot > 0n ? Number((bal * 1000000n) / tot) / 10000 : 0;
+      } catch {}
     }
 
+    // 6) Final payload to cache
     const payload = {
       tokenAddress: ca,
       updatedAt: Date.now(),
-
-      market: mkt || null,
-
-      holdersCount: holderCount ?? null,
-      holdersTop20: holders.slice(0,20).map(h => ({ address: h.address, percent: Number(h.percent || 0) })),
-      top10CombinedPct: holdersSummary.top10Pct,
+      market,
+      holdersTop20: holdersSummary.holdersTop20,
+      top10CombinedPct: holdersSummary.top10CombinedPct,
       burnedPct: holdersSummary.burnedPct,
-
-      creator: { address: creatorAddr, percent: creatorPct },
-
+      holdersCount: holdersSummary.holdersCount,
+      creator: { address: creatorInfo?.creatorAddress || null, percent: creatorPct },
       first20Buyers: buyers,
     };
 
-    await setJSON(`token:${ca}:summary`, payload, 180);
-    await setJSON(`token:${ca}:last_refresh`, { ts: Date.now() }, 600);
+    await setJSON(`token:${ca}:summary`, payload, 180); // 3 min
+    await setJSON(`token:${ca}:last_refresh`, { ts: Date.now() }, 600); // 10 min gate
+
     return payload;
   });
 }
 
-new Worker(queueName, async (job) => {
-  const { tokenAddress } = job.data;
-  return refreshToken(tokenAddress);
-}, { connection: bullRedis });
+// ---------- Worker consumer ----------
+new Worker(
+  queueName,
+  async (job) => {
+    const { tokenAddress } = job.data || {};
+    return refreshToken(tokenAddress);
+  },
+  { connection: bullRedis }
+);
 
+// ---------- Optional cron ----------
 if (process.argv.includes('--cron') && process.env.DEFAULT_TOKENS) {
-  const list = process.env.DEFAULT_TOKENS.split(',').map(s=>s.trim()).filter(Boolean);
-  setInterval(async () => {
-    for (const ca of list) {
-      await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
-    }
-  }, 120_000);
+  const list = process.env.DEFAULT_TOKENS.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  if (list.length) {
+    console.log('[CRON] Refresh tokens every 120s:', list.join(', '));
+    setInterval(async () => {
+      for (const ca of list) {
+        try {
+          await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
+        } catch (e) {
+          console.error('[CRON] enqueue failed', ca, e?.message || e);
+        }
+      }
+    }, 120_000);
+  }
 }
