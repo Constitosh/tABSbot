@@ -133,18 +133,38 @@ function pctFromParts(part, total) {
   return Number((part * 1000000n) / total) / 10000;
 }
 
-/** Holders summary from balances + totalSupplyRaw (BigInt or number/string). */
 export function summarizeHoldersFromBalances(balances, totalSupplyRaw, decimals) {
-  const total = BigInt(String(totalSupplyRaw || '0'));
   const rows = [];
-
   for (const [addr, raw] of balances.entries()) {
     if (!addr || raw === 0n) continue;
     rows.push({ address: addr, raw });
   }
+  rows.sort((a,b) => (a.raw < b.raw ? 1 : -1));
 
-  rows.sort((a, b) => (a.raw < b.raw ? 1 : -1));
+  // fallback: if tokensupply == 0, infer total supply as sum of positive balances
+  let inferredTotal = rows.reduce((s, r) => (r.raw > 0n ? s + r.raw : s), 0n);
+  let total = BigInt(String(totalSupplyRaw || '0'));
+  if (total === 0n && inferredTotal > 0n) total = inferredTotal;
 
+  const DEAD = '0x000000000000000000000000000000000000dEaD';
+  const burnedRaw = balances.get(DEAD) || 0n;
+
+  const pct = (part, tot) => (tot > 0n ? Number((part * 1000000n) / tot) / 10000 : 0);
+
+  const holdersTop20 = rows.slice(0, 20).map(r => ({
+    address: r.address,
+    percent: pct(r.raw, total),
+  }));
+
+  const top10Raw = rows.slice(0, 10).reduce((s, r) => s + r.raw, 0n);
+  const top10CombinedPct = pct(top10Raw, total);
+  const burnedPct = pct(burnedRaw, total);
+
+  // holdersCount = positive-balance addresses excluding the zero address
+  const holdersCount = rows.filter(r => r.raw > 0n).length;
+
+  return { holdersTop20, top10CombinedPct, burnedPct, holdersCount, decimals };
+}
   // burned
   const burnedRaw = (balances.get(DEAD) || 0n);
   const burnedPct = total > 0n ? pctFromParts(burnedRaw, total) : 0;
