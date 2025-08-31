@@ -1,7 +1,7 @@
 // src/bot.js
 import './configEnv.js';
 import { Telegraf } from 'telegraf';
-import { queue } from './queueCore.js';          // only queue
+import { queue } from './queueCore.js';          // only queue here
 import { getJSON, setJSON } from './cache.js';
 import { renderOverview, renderBuyers, renderHolders, renderAbout } from './renderers.js';
 import { isAddress } from './util.js';
@@ -15,10 +15,10 @@ const sendHTML = (ctx, text, extra = {}) =>
 const editHTML = async (ctx, text, extra = {}) => {
   try {
     return await ctx.editMessageText(text, {
-    parse_mode: 'HTML',
-    disable_web_page_preview: true,
-    ...extra,
-  });
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...extra,
+    });
   } catch (err) {
     const desc = err?.response?.description || '';
     if (desc.includes('message is not modified')) {
@@ -29,56 +29,30 @@ const editHTML = async (ctx, text, extra = {}) => {
 };
 
 // ----- Data helpers -----
-// Enqueue refresh if missing and poll Redis briefly for the summary
-// ----- Data helpers -----
+// Get from cache; if empty, enqueue a refresh and return null.
 async function ensureData(ca) {
   const key = `token:${ca}:summary`;
   const cache = await getJSON(key);
   if (cache) return cache;
 
-  // cache miss → enqueue a refresh and return null
+  // cold start: enqueue a refresh and return null so UI says "Initializing…"
   try {
-    // throttle: set last_refresh to now so requestRefresh sees it
-    await setJSON(`token:${ca}:last_refresh`, { ts: Date.now() }, 600);
     await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
   } catch (_) {}
-  return null;
-}
-  // 1) fast path: cached
-  const cached = await getJSON(key);
-  if (cached) return cached;
-
-  // 2) gate + enqueue
-  const last = await getJSON(gateKey);
-  const age = last ? (Date.now() - last.ts) / 1000 : Infinity;
-  if (!(Number.isFinite(age) && age < 1)) {
-    await setJSON(gateKey, { ts: Date.now() }, 600).catch(() => {});
-    await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true }).catch(() => {});
-  }
-
-  // 3) poll Redis for up to ~3s
-  const deadline = Date.now() + 3000;
-  while (Date.now() < deadline) {
-    const got = await getJSON(key);
-    if (got) return got;
-    await new Promise(r => setTimeout(r, 250));
-  }
-
-  // 4) give up for now
   return null;
 }
 
 // Always return { ok:boolean, age?:number, error?:string }
 async function requestRefresh(ca) {
   try {
-    const gateKey = `token:${ca}:last_refresh`;
-    const last = await getJSON(gateKey);
+    const last = await getJSON(`token:${ca}:last_refresh`);
     const age = last ? (Date.now() - last.ts) / 1000 : Infinity;
 
     if (Number.isFinite(age) && age < 30) {
       return { ok: false, age };
     }
-    await setJSON(gateKey, { ts: Date.now() }, 600);
+
+    await setJSON(`token:${ca}:last_refresh`, { ts: Date.now() }, 600);
     await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
 
     return { ok: true, age: Number.isFinite(age) ? age : null };
@@ -98,11 +72,12 @@ bot.start((ctx) =>
   )
 );
 
+// /stats <ca>
 bot.command('stats', async (ctx) => {
   const [, caRaw] = ctx.message.text.trim().split(/\s+/);
   if (!isAddress(caRaw)) return ctx.reply('Send: /stats <contractAddress>');
-  const ca = caRaw.toLowerCase();
 
+  const ca = caRaw.toLowerCase();
   const data = await ensureData(ca);
   if (!data) return ctx.reply('Initializing… try again in a few seconds.');
 
@@ -110,12 +85,14 @@ bot.command('stats', async (ctx) => {
   return sendHTML(ctx, text, extra);
 });
 
+// /refresh <ca>
 bot.command('refresh', async (ctx) => {
   const [, caRaw] = ctx.message.text.trim().split(/\s+/);
   if (!isAddress(caRaw)) return ctx.reply('Send: /refresh <contractAddress>');
-  const ca = caRaw.toLowerCase();
 
+  const ca = caRaw.toLowerCase();
   const res = await requestRefresh(ca);
+
   if (!res.ok) {
     if (typeof res.age === 'number') {
       return ctx.reply(`Recently refreshed (${res.age.toFixed(0)}s ago). Try again shortly.`);
@@ -168,12 +145,18 @@ bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
   }
 });
 
+// About
 bot.action('about', async (ctx) => {
   const { text, extra } = renderAbout();
   return editHTML(ctx, text, extra);
 });
 
-// ----- Boot -----
-bot.launch().then(() => console.log('tABS Tools bot up.'));
+// Global error logging (helps when bot “does nothing”)
+bot.catch((err, ctx) => {
+  console.error('[BOT] error for update', ctx?.update?.update_id, err);
+});
+bot.telegram.getMe().then(me => console.log(`[BOT] up as @${me.username} (${me.id})`)).catch(console.error);
+bot.launch().then(() => console.log('tABS Tools bot up (polling).'));
+
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
