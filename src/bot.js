@@ -1,7 +1,6 @@
-// src/bot.js
 import './configEnv.js';
 import { Telegraf } from 'telegraf';
-import { queue } from './queueCore.js';
+import { queue } from './queueCore.js';          // <— ONLY queue here
 import { getJSON, setJSON } from './cache.js';
 import { renderOverview, renderBuyers, renderHolders, renderAbout } from './renderers.js';
 import { isAddress } from './util.js';
