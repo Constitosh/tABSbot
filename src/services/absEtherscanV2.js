@@ -25,13 +25,12 @@ function buildURL(params) {
   return u.toString();
 }
 
-async function call(params, { timeout = 20000 } = {}) {
+async function call(params, { timeout = 15000 } = {}) {
   const url = buildURL(params);
   console.log('[ESV2]', url);
   const { data } = await axios.get(url, { timeout });
-  if (!data) throw new Error('EtherscanV2: empty response');
-
-  // Etherscan-style envelope
+  if (!data) throw new Error('EtherscanV2: empty');
+  // v2 common pattern
   if (data.status === '0' && typeof data.result === 'string') {
     throw new Error(`EtherscanV2: ${data.result}`);
   }
@@ -83,31 +82,39 @@ export async function getAllTokenTransfers(ca, { maxPages = 50 } = {}) {
   return out;
 }
 
-/** Total supply (return **string** so we never lose precision). */
+/** Total supply — return as STRING (avoid scientific notation). */
 export async function getTokenTotalSupply(ca) {
-  // Only the TOKEN module; do not use any 'stats' fallback.
   const res = await call({
     module: 'token',
-    action: 'tokensupply',
+    action: 'tokensupply', // <- correct action
     contractaddress: ca,
   });
+  // Prefer string fields first, fall back carefully
+  if (typeof res?.result === 'string') return res.result;
+  if (typeof res?.TokenSupply === 'string') return res.TokenSupply;
+  if (typeof res === 'string') return res;
 
-  // Etherscan v2 returns {result: "string"} most of the time.
-  const raw = (res && typeof res === 'object') ? (res.result ?? res.TokenSupply) : res;
+  // If API gave us a number, stringify it without losing precision
+  if (typeof res === 'number') return String(res);
+  if (typeof res?.result === 'number') return String(res.result);
 
-  // Ensure we return a plain digits string. If API ever returned a number,
-  // refuse to coerce (numbers >1e15 are unsafe) — just stringify as-is.
-  if (typeof raw === 'string') {
-    // strip any accidental whitespace
-    return raw.trim();
-  }
-  if (typeof raw === 'number') {
-    // Last resort: avoid scientific notation commas etc.
-    // We intentionally string-coerce without locales. Precision might be lost,
-    // but this path should practically never happen on Etherscan (it returns strings).
-    return String(Math.trunc(raw));
-  }
+  // Last resort
   return '0';
+}
+
+/** Contract creator info. */
+export async function getContractCreator(ca) {
+  const res = await call({
+    module: 'contract',
+    action: 'getcontractcreation',
+    contractaddresses: ca,
+  });
+  const row = Array.isArray(res) ? res[0] : res;
+  return {
+    contractAddress: row?.contractAddress || ca,
+    creatorAddress: (row?.contractCreator || row?.creator || '').toLowerCase() || null,
+    txHash: row?.txHash || row?.transactionHash || null,
+  };
 }
 
 /** Build balances from transfers (BigInt map) + decimals heuristic. */
@@ -118,7 +125,7 @@ export function buildBalanceMap(transfers) {
   for (const t of transfers) {
     const dec = Number(t.tokenDecimal || 18);
     if (Number.isFinite(dec)) decimals = dec;
-    const v = BigInt(t.value || '0');
+    const v = BigInt(String(t.value || '0'));
     const from = (t.from || '').toLowerCase();
     const to = (t.to || '').toLowerCase();
 
@@ -128,49 +135,41 @@ export function buildBalanceMap(transfers) {
   return { balances, decimals };
 }
 
-function pctFromParts(part, total) {
-  if (total <= 0n) return 0;
-  // percentage with 4 decimals
-  return Number((part * 1000000n) / total) / 10000;
-}
-
-/** Holders summary (expects totalSupplyRaw as **string** or BigInt-convertible). */
+/** Summarize holders/topN/burn using computed balances + total supply (string). */
 export function summarizeHoldersFromBalances(balances, totalSupplyRaw, decimals) {
   const rows = [];
   for (const [addr, raw] of balances.entries()) {
     if (!addr || raw === 0n) continue;
     rows.push({ address: addr, raw });
   }
-  rows.sort((a,b) => (a.raw < b.raw ? 1 : -1));
+  rows.sort((a, b) => (a.raw < b.raw ? 1 : -1));
 
-  let total;
+  // Prefer true totalSupply; if 0, infer as sum of positive balances
+  let inferredTotal = rows.reduce((s, r) => (r.raw > 0n ? s + r.raw : s), 0n);
+  let total = 0n;
   try {
     total = BigInt(String(totalSupplyRaw || '0'));
   } catch {
     total = 0n;
   }
+  if (total === 0n && inferredTotal > 0n) total = inferredTotal;
 
-  // fallback: if tokensupply == 0, infer total as sum of positive balances
-  if (total === 0n) {
-    const inferred = rows.reduce((s, r) => (r.raw > 0n ? s + r.raw : s), 0n);
-    if (inferred > 0n) total = inferred;
-  }
+  const pct = (part, tot) => (tot > 0n ? Number((part * 1000000n) / tot) / 10000 : 0);
 
-  const burnedRaw = balances.get(DEAD) || 0n;
+  const burnedRaw = (balances.get(DEAD) || 0n);
+  const burnedPct = pct(burnedRaw, total);
 
-  const top20 = rows.slice(0, 20).map((r) => ({
+  const holdersTop20 = rows.slice(0, 20).map(r => ({
     address: r.address,
-    percent: pctFromParts(r.raw, total),
+    percent: pct(r.raw, total),
   }));
 
   const top10Raw = rows.slice(0, 10).reduce((s, r) => s + r.raw, 0n);
-  const top10CombinedPct = pctFromParts(top10Raw, total);
-  const burnedPct = pctFromParts(burnedRaw, total);
+  const top10CombinedPct = pct(top10Raw, total);
 
-  // holders count = addresses with positive balance
-  const holdersCount = rows.filter((r) => r.raw > 0n).length;
+  const holdersCount = rows.filter(r => r.raw > 0n).length;
 
-  return { holdersTop20: top20, top10CombinedPct, burnedPct, holdersCount, decimals };
+  return { holdersTop20, top10CombinedPct, burnedPct, holdersCount, decimals };
 }
 
 /** First 20 buyers status, skipping first 2 receivers (LP/mint heuristic). */
@@ -192,7 +191,7 @@ export function first20BuyersStatus(transfers, balanceMap) {
 
   const toNum = (raw, d = 18) => {
     try {
-      const v = BigInt(raw);
+      const v = BigInt(String(raw));
       const D = 10n ** BigInt(d);
       const whole = v / D;
       const frac = v % D;
