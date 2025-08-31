@@ -117,17 +117,85 @@ export async function getContractCreator(ca) {
   };
 }
 
-/** Build balances from transfers (BigInt map) + decimals heuristic. */
+// --- add near top of file (below existing consts), or just before buildBalanceMap ---
+
+// Accepts number | string | null and returns a BigInt.
+// Handles scientific notation like "9.9007e+26" or 9.9007e+26 safely.
+function toBigIntSafe(v) {
+  if (v == null) return 0n;
+
+  // If it's already a BigInt, done.
+  if (typeof v === 'bigint') return v;
+
+  // Normalize to string without losing precision if it's a Number.
+  // Using toLocaleString is risky; instead detect sci-notation and expand.
+  let s = typeof v === 'number' ? v.toString() : String(v).trim();
+
+  if (s === '' || s === 'NaN') return 0n;
+
+  // If plain integer string, fast path
+  if (/^[+-]?\d+$/.test(s)) {
+    return BigInt(s);
+  }
+
+  // If decimal or scientific notation, expand to an integer string.
+  // Examples: "1.23e+5", "9.0e18", "1.0", "0.0001e+22"
+  const sci = s.match(/^([+-]?)(\d+)(?:\.(\d+))?(?:e([+-]?\d+))?$/i);
+  if (!sci) {
+    // Fallback: try Number → BigInt of the integer part (last resort)
+    const n = Number(s);
+    if (!Number.isFinite(n)) return 0n;
+    return BigInt(Math.trunc(n));
+  }
+
+  const sign = sci[1] || '';
+  const intPart = sci[2] || '0';
+  const fracPart = sci[3] || '';
+  const exp = sci[4] ? parseInt(sci[4], 10) : 0;
+
+  // Build full digits (no decimal point)
+  let digits = intPart + fracPart;
+  // Effective decimal shift is frac length minus exponent
+  const decShift = fracPart.length - exp;
+
+  if (decShift === 0) {
+    // Already integer
+    return BigInt(sign + digits.replace(/^0+/, '') || '0');
+  }
+
+  if (decShift > 0) {
+    // Need to remove decShift digits from the end (pad with leading zeros if needed)
+    if (digits.length <= decShift) {
+      // becomes less than 1; integer part zero
+      return 0n;
+    }
+    const cut = digits.length - decShift;
+    const intDigits = digits.slice(0, cut);
+    return BigInt(sign + (intDigits.replace(/^0+/, '') || '0'));
+  }
+
+  // decShift < 0: need to append zeros
+  const zerosToAppend = -decShift;
+  digits = digits + '0'.repeat(zerosToAppend);
+  return BigInt(sign + (digits.replace(/^0+/, '') || '0'));
+}
+
+
+// --- replace your existing buildBalanceMap with this version ---
+
 export function buildBalanceMap(transfers) {
   const balances = new Map(); // address -> BigInt
   let decimals = 18;
 
-  for (const t of transfers) {
-    const dec = Number(t.tokenDecimal || 18);
+  for (const t of transfers || []) {
+    // Keep decimals heuristic from the feed (default 18)
+    const dec = Number(t?.tokenDecimal ?? 18);
     if (Number.isFinite(dec)) decimals = dec;
-    const v = BigInt(String(t.value || '0'));
-    const from = (t.from || '').toLowerCase();
-    const to = (t.to || '').toLowerCase();
+
+    // SAFELY convert transfer value to BigInt (handles numbers and sci-notation)
+    const v = toBigIntSafe(t?.value ?? '0');
+    const from = String(t?.from || '').toLowerCase();
+    const to = String(t?.to || '').toLowerCase();
 
     if (from && from !== ZERO) balances.set(from, (balances.get(from) || 0n) - v);
     if (to && to !== ZERO) balances.set(to, (balances.get(to) || 0n) + v);
@@ -172,19 +240,54 @@ export function summarizeHoldersFromBalances(balances, totalSupplyRaw, decimals)
   return { holdersTop20, top10CombinedPct, burnedPct, holdersCount, decimals };
 }
 
-/** First 20 buyers status, skipping first 2 receivers (LP/mint heuristic). */
+// --- replace your existing first20BuyersStatus with this version (uses the same toBigIntSafe) ---
+
 export function first20BuyersStatus(transfers, balanceMap) {
   const firstSeen = [];
   const seen = new Set();
 
-  for (const t of transfers) {
-    const to = t.to;
+  for (const t of transfers || []) {
+    const to = String(t?.to || '').toLowerCase();
     if (!to || to === ZERO) continue;
     if (seen.has(to)) continue;
     seen.add(to);
-    firstSeen.push({ address: to, amountRaw: String(t.value || '0'), decimals: t.tokenDecimal || 18 });
-    if (firstSeen.length >= 22) break; // will drop first 2
+
+    // Keep original amount RAW as safe string
+    const raw = toBigIntSafe(t?.value ?? '0').toString();
+    const d = Number(t?.tokenDecimal ?? 18);
+    firstSeen.push({ address: to, amountRaw: raw, decimals: Number.isFinite(d) ? d : 18 });
+    if (firstSeen.length >= 22) break; // drop first 2 later
   }
+
+  const list = firstSeen.slice(2, 22); // 20
+  const out = [];
+
+  const toNum = (raw, d = 18) => {
+    try {
+      const v = toBigIntSafe(raw);
+      const D = 10n ** BigInt(d);
+      const whole = v / D;
+      const frac = v % D;
+      const fs = frac.toString().padStart(d, '0').replace(/0+$/, '').slice(0, 6);
+      return Number(whole.toString() + (fs ? '.' + fs : ''));
+    } catch {
+      return 0;
+    }
+  };
+
+  for (const r of list) {
+    const start = toNum(r.amountRaw, r.decimals);
+    const currRaw = balanceMap.get(r.address) || 0n;
+    const curr = toNum(currRaw.toString(), r.decimals);
+    let status = 'HOLD';
+    const EPS = 1e-9;
+    if (curr <= EPS) status = 'SOLD ALL';
+    else if (curr > start + EPS) status = 'BOUGHT MORE';
+    else if (curr + EPS < start) status = 'SOLD SOME';
+    out.push({ address: r.address, status });
+  }
+  return out;
+}
 
   const list = firstSeen.slice(2, 22); // 20
   const out = [];
