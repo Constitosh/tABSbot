@@ -1,22 +1,18 @@
+// ecosystem.config.cjs
 module.exports = {
   apps: [
     {
-      name: 'tabs-worker',
-      script: 'src/refreshWorker.js',
+      name: 'tabs-bot',
       cwd: '/root/tABSbot/tABSbot',
-      args: '',                 // add '--cron' if you want DEFAULT_TOKENS auto-refresh
-      watch: false,
-      autorestart: true,
-      max_memory_restart: '300M',
+      script: 'src/bot.js',
+      node_args: '--enable-source-maps',
       env: { NODE_ENV: 'production' }
     },
     {
-      name: 'tabs-bot',
-      script: 'src/bot.js',
+      name: 'tabs-worker',
       cwd: '/root/tABSbot/tABSbot',
-      watch: false,
-      autorestart: true,
-      max_memory_restart: '300M',
+      script: 'src/refreshWorker.js',
+      node_args: '--enable-source-maps',
       env: { NODE_ENV: 'production' }
     }
   ]
