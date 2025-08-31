@@ -12,7 +12,15 @@ import {
   first20BuyersStatus
 } from './services/absEtherscanV2.js';
 
-import { getContractCreator } from './services/abscanFree.js'; // keep this (works fine)
+import {
+  getTokenTransfers,
+  getTokenTotalSupply,
+  getContractCreator,
+  getTokenBalance,
+  computeFirst20BuyersSeed,
+  statusFromBalance
+} from './services/abscanFree.js';
+
 
 const bullRedis = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null, enableReadyCheck: false });
 export const queueName = 'tabs_refresh';
