@@ -28,9 +28,9 @@ import {
   first20BuyersStatus,
 } from './services/absEtherscanV2.js';
 
-// ---------------- Redis (BullMQ connection) ----------------
+// ---------------- BullMQ Redis (must disable retries/ready check) ----------------
 const bullRedis = new Redis(process.env.REDIS_URL, {
-  maxRetriesPerRequest: null, // BullMQ requirement
+  maxRetriesPerRequest: null,
   enableReadyCheck: false,
 });
 
@@ -38,18 +38,78 @@ const bullRedis = new Redis(process.env.REDIS_URL, {
 export const queueName = 'tabs_refresh'; // NOTE: no colon allowed
 export const queue = new Queue(queueName, { connection: bullRedis });
 
+// ---------------- DS market normalizer (stable shape for UI) ----------------
+function normalizeMarket(ds) {
+  if (!ds) return null;
+
+  const priceUsd = Number(ds.priceUsd ?? ds.price ?? 0);
+
+  // volume
+  const vol =
+    ds.volume && typeof ds.volume === 'object'
+      ? {
+          m5:  Number(ds.volume.m5  ?? 0),
+          h1:  Number(ds.volume.h1  ?? 0),
+          h6:  Number(ds.volume.h6  ?? 0),
+          h24: Number(ds.volume.h24 ?? 0),
+        }
+      : {
+          m5:  0,
+          h1:  0,
+          h6:  0,
+          h24: Number(ds.volume24h ?? 0),
+        };
+
+  // price change
+  const ch = ds.priceChange || {};
+  const priceChange = {
+    m5:  Number(ch.m5  ?? 0),
+    h1:  Number(ch.h1  ?? 0),
+    h6:  Number(ch.h6  ?? 0),
+    h24: Number(ch.h24 ?? 0),
+  };
+
+  // cap + source
+  const marketCap = Number(ds.marketCap ?? ds.fdv ?? 0);
+  const marketCapSource =
+    ds.marketCap != null ? 'cap'
+    : (ds.fdv != null ? 'fdv' : undefined);
+
+  // socials/image best-effort
+  const socials = ds.socials || {};
+  const imageUrl = ds.imageUrl || ds.info?.imageUrl || null;
+
+  return {
+    name:   ds.name   ?? ds.baseToken?.name   ?? '',
+    symbol: ds.symbol ?? ds.baseToken?.symbol ?? '',
+    priceUsd,
+    volume: vol,
+    priceChange,
+    marketCap,
+    marketCapSource,
+    url: ds.url || null,
+    dexId: ds.dexId || null,
+    imageUrl,
+    socials: {
+      twitter:  typeof socials.twitter  === 'string' ? socials.twitter  : (ds.info?.socials?.find(s=>s.type==='twitter')?.url  || null),
+      telegram: typeof socials.telegram === 'string' ? socials.telegram : (ds.info?.socials?.find(s=>s.type==='telegram')?.url || null),
+      website:  typeof socials.website  === 'string' ? socials.website  : (ds.info?.websites?.[0] || null),
+    }
+  };
+}
+
 // ---------------- Core refresh ----------------
 export async function refreshToken(tokenAddress) {
   const ca = String(tokenAddress || '').trim().toLowerCase();
-
   if (!/^0x[a-f0-9]{40}$/.test(ca)) {
     throw new Error(`Invalid contract address: ${tokenAddress}`);
   }
 
   const lockKey = `lock:refresh:${ca}`;
   return withLock(lockKey, 60, async () => {
-    // 1) Dexscreener market (tolerate null)
-    const market = await getDexscreenerTokenStats(ca).catch(() => null);
+    // 1) Dexscreener market (normalize to stable shape; tolerate failure)
+    const mktRaw = await getDexscreenerTokenStats(ca).catch(() => null);
+    const market = normalizeMarket(mktRaw);
 
     // 2) Etherscan v2: transfers (ascending), creator, total supply
     const [transfers, creatorInfo, totalSupply] = await Promise.all([
@@ -58,18 +118,18 @@ export async function refreshToken(tokenAddress) {
       getTokenTotalSupply(ca).catch(() => 0),
     ]);
 
-    // 3) Build balance map from transfers and compute holders summary
+    // 3) Build balance map from transfers, compute holders summary
     const { balances, decimals } = buildBalanceMap(transfers);
     const holdersSummary = summarizeHoldersFromBalances(balances, totalSupply, decimals);
 
-    // 4) First 20 buyers status (skip first 2 receivers heuristic)
+    // 4) First 20 buyers status (skip first 2 receivers heuristic is inside)
     const buyers = first20BuyersStatus(transfers, balances);
 
     // 5) Creator % (from computed balances vs total supply)
     let creatorPct = 0;
     if (creatorInfo?.creatorAddress) {
       try {
-        const bal = balances.get(creatorInfo.creatorAddress) || 0n;
+        const bal = balances.get(creatorInfo.creatorAddress.toLowerCase()) || 0n;
         const tot = BigInt(String(totalSupply || '0'));
         creatorPct = tot > 0n ? Number((bal * 1000000n) / tot) / 10000 : 0; // 4 dp
       } catch {
@@ -81,7 +141,7 @@ export async function refreshToken(tokenAddress) {
     const payload = {
       tokenAddress: ca,
       updatedAt: Date.now(),
-      market, // { name, symbol, priceUsd, volume{m5,h1,h6,h24}, priceChange{m5,h1,h6,h24}, marketCap, marketCapSource, socials, ... } or null
+      market, // stable, normalized object or null
       holdersTop20: holdersSummary.holdersTop20,     // [{ address, percent }]
       top10CombinedPct: holdersSummary.top10CombinedPct,
       burnedPct: holdersSummary.burnedPct,
