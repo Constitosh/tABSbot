@@ -25,11 +25,13 @@ function buildURL(params) {
   return u.toString();
 }
 
-async function call(params, { timeout = 15000 } = {}) {
+async function call(params, { timeout = 20000 } = {}) {
   const url = buildURL(params);
   console.log('[ESV2]', url);
   const { data } = await axios.get(url, { timeout });
-  if (!data) throw new Error('EtherscanV2: empty');
+  if (!data) throw new Error('EtherscanV2: empty response');
+
+  // Etherscan-style envelope
   if (data.status === '0' && typeof data.result === 'string') {
     throw new Error(`EtherscanV2: ${data.result}`);
   }
@@ -81,40 +83,31 @@ export async function getAllTokenTransfers(ca, { maxPages = 50 } = {}) {
   return out;
 }
 
-/** Total supply (raw number). Try token/tokensupply then stats/tokensupply. */
+/** Total supply (return **string** so we never lose precision). */
 export async function getTokenTotalSupply(ca) {
-  // Try the common path first
-  try {
-    const r1 = await call({ module: 'token', action: 'tokensupply', contractaddress: ca });
-    const n1 = Number(r1?.result ?? r1?.TokenSupply ?? r1);
-    if (Number.isFinite(n1) && n1 > 0) return n1;
-  } catch (e) {
-    // swallow; we’ll try fallback
-  }
-  // Fallback some chains use:
-  try {
-    const r2 = await call({ module: 'stats', action: 'tokensupply', contractaddress: ca });
-    const n2 = Number(r2?.result ?? r2?.TokenSupply ?? r2);
-    if (Number.isFinite(n2)) return n2;
-  } catch (e2) {
-    console.warn('[ESV2] tokensupply fallback failed:', e2?.message || e2);
-  }
-  return 0;
-}
-
-/** Contract creator info. */
-export async function getContractCreator(ca) {
+  // Only the TOKEN module; do not use any 'stats' fallback.
   const res = await call({
-    module: 'contract',
-    action: 'getcontractcreation',
-    contractaddresses: ca,
+    module: 'token',
+    action: 'tokensupply',
+    contractaddress: ca,
   });
-  const row = Array.isArray(res) ? res[0] : res;
-  return {
-    contractAddress: row?.contractAddress || ca,
-    creatorAddress: (row?.contractCreator || row?.creator || '').toLowerCase() || null,
-    txHash: row?.txHash || row?.transactionHash || null,
-  };
+
+  // Etherscan v2 returns {result: "string"} most of the time.
+  const raw = (res && typeof res === 'object') ? (res.result ?? res.TokenSupply) : res;
+
+  // Ensure we return a plain digits string. If API ever returned a number,
+  // refuse to coerce (numbers >1e15 are unsafe) — just stringify as-is.
+  if (typeof raw === 'string') {
+    // strip any accidental whitespace
+    return raw.trim();
+  }
+  if (typeof raw === 'number') {
+    // Last resort: avoid scientific notation commas etc.
+    // We intentionally string-coerce without locales. Precision might be lost,
+    // but this path should practically never happen on Etherscan (it returns strings).
+    return String(Math.trunc(raw));
+  }
+  return '0';
 }
 
 /** Build balances from transfers (BigInt map) + decimals heuristic. */
@@ -130,41 +123,51 @@ export function buildBalanceMap(transfers) {
     const to = (t.to || '').toLowerCase();
 
     if (from && from !== ZERO) balances.set(from, (balances.get(from) || 0n) - v);
-    if (to && to !== ZERO) balances.set(to,   (balances.get(to)   || 0n) + v);
+    if (to && to !== ZERO) balances.set(to, (balances.get(to) || 0n) + v);
   }
   return { balances, decimals };
 }
 
 function pctFromParts(part, total) {
   if (total <= 0n) return 0;
-  return Number((part * 1000000n) / total) / 10000; // 4 dp
+  // percentage with 4 decimals
+  return Number((part * 1000000n) / total) / 10000;
 }
 
-/** Summarize holders/top10/burned%/count from balances + totalSupplyRaw. */
+/** Holders summary (expects totalSupplyRaw as **string** or BigInt-convertible). */
 export function summarizeHoldersFromBalances(balances, totalSupplyRaw, decimals) {
   const rows = [];
   for (const [addr, raw] of balances.entries()) {
     if (!addr || raw === 0n) continue;
     rows.push({ address: addr, raw });
   }
-  rows.sort((a, b) => (a.raw < b.raw ? 1 : -1));
+  rows.sort((a,b) => (a.raw < b.raw ? 1 : -1));
 
-  // Fallback: if tokensupply == 0, infer as sum of positive balances
-  const positiveSum = rows.reduce((s, r) => (r.raw > 0n ? s + r.raw : s), 0n);
-  let total = BigInt(String(totalSupplyRaw || '0'));
-  if (total === 0n && positiveSum > 0n) total = positiveSum;
+  let total;
+  try {
+    total = BigInt(String(totalSupplyRaw || '0'));
+  } catch {
+    total = 0n;
+  }
+
+  // fallback: if tokensupply == 0, infer total as sum of positive balances
+  if (total === 0n) {
+    const inferred = rows.reduce((s, r) => (r.raw > 0n ? s + r.raw : s), 0n);
+    if (inferred > 0n) total = inferred;
+  }
 
   const burnedRaw = balances.get(DEAD) || 0n;
-  const burnedPct = total > 0n ? pctFromParts(burnedRaw, total) : 0;
 
   const top20 = rows.slice(0, 20).map((r) => ({
     address: r.address,
-    percent: total > 0n ? pctFromParts(r.raw, total) : 0,
+    percent: pctFromParts(r.raw, total),
   }));
 
   const top10Raw = rows.slice(0, 10).reduce((s, r) => s + r.raw, 0n);
-  const top10CombinedPct = total > 0n ? pctFromParts(top10Raw, total) : 0;
+  const top10CombinedPct = pctFromParts(top10Raw, total);
+  const burnedPct = pctFromParts(burnedRaw, total);
 
+  // holders count = addresses with positive balance
   const holdersCount = rows.filter((r) => r.raw > 0n).length;
 
   return { holdersTop20: top20, top10CombinedPct, burnedPct, holdersCount, decimals };
@@ -181,7 +184,7 @@ export function first20BuyersStatus(transfers, balanceMap) {
     if (seen.has(to)) continue;
     seen.add(to);
     firstSeen.push({ address: to, amountRaw: String(t.value || '0'), decimals: t.tokenDecimal || 18 });
-    if (firstSeen.length >= 22) break; // drop first 2 later
+    if (firstSeen.length >= 22) break; // will drop first 2
   }
 
   const list = firstSeen.slice(2, 22); // 20
@@ -192,7 +195,7 @@ export function first20BuyersStatus(transfers, balanceMap) {
       const v = BigInt(raw);
       const D = 10n ** BigInt(d);
       const whole = v / D;
-      const frac  = v % D;
+      const frac = v % D;
       const fs = frac.toString().padStart(d, '0').replace(/0+$/, '').slice(0, 6);
       return Number(whole.toString() + (fs ? '.' + fs : ''));
     } catch {
@@ -201,16 +204,14 @@ export function first20BuyersStatus(transfers, balanceMap) {
   };
 
   for (const r of list) {
-    const start   = toNum(r.amountRaw, r.decimals);
+    const start = toNum(r.amountRaw, r.decimals);
     const currRaw = balanceMap.get(r.address) || 0n;
-    const curr    = toNum(currRaw.toString(), r.decimals);
-
+    const curr = toNum(currRaw.toString(), r.decimals);
     let status = 'HOLD';
     const EPS = 1e-9;
-    if (curr <= EPS)            status = 'SOLD ALL';
-    else if (curr > start+EPS)  status = 'BOUGHT MORE';
-    else if (curr + EPS < start)status = 'SOLD SOME';
-
+    if (curr <= EPS) status = 'SOLD ALL';
+    else if (curr > start + EPS) status = 'BOUGHT MORE';
+    else if (curr + EPS < start) status = 'SOLD SOME';
     out.push({ address: r.address, status });
   }
   return out;
