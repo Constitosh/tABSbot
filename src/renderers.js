@@ -14,9 +14,18 @@ export function renderOverview(data) {
   const t24 = trendBadge(m.priceChange?.h24);
 
   const capLabel = (m.marketCapSource === 'fdv') ? 'FDV (as cap)' : 'Market Cap';
+
   const holdersCountLine = (typeof data.holdersCount === 'number')
     ? `Holders: <b>${data.holdersCount.toLocaleString()}</b>`
-    : null;
+    : `Holders: <i>N/A (Etherscan free API)</i>`;
+
+  const top10Line = (data.top10CombinedPct != null)
+    ? `Top 10 combined: <b>${esc(pct(data.top10CombinedPct))}</b>`
+    : `Top 10 combined: <i>N/A (Etherscan free API)</i>`;
+
+  const burnedLine = (data.burnedPct != null)
+    ? `Burned: <b>${esc(pct(data.burnedPct))}</b>`
+    : `Burned: <i>N/A</i>`;
 
   const lines = [
     `🪙 <b>Token Overview — ${name}${sym ? ` (${sym})` : ''}</b>`,
@@ -26,45 +35,37 @@ export function renderOverview(data) {
     `Volume: 5m <b>${esc(money(m.volume?.m5))}</b> • 1h <b>${esc(money(m.volume?.h1))}</b> • 6h <b>${esc(money(m.volume?.h6))}</b> • 24h <b>${esc(money(m.volume?.h24))}</b>`,
     `Change: 5m <b>${esc(pct(m.priceChange?.m5))}</b> • 1h <b>${esc(pct(m.priceChange?.h1))}</b> • 6h <b>${esc(pct(m.priceChange?.h6))}</b> • 24h <b>${esc(pct(m.priceChange?.h24))}</b>`,
     `${capLabel}: <b>${esc(money(m.marketCap))}</b>`,
-    holdersCountLine || undefined,
+    holdersCountLine,
     `Creator: <code>${creator}</code> — <b>${esc(pct(data.creator?.percent))}</b>`,
-    `Top 10 combined: <b>${esc(pct(data.top10CombinedPct))}</b>`,
-    `Burned: <b>${esc(pct(data.burnedPct))}</b>`,
+    top10Line,
+    burnedLine,
     ``,
     `<i>Pick a section:</i>`,
     `• <b>Buyers</b> — first 20 buyers + status`,
-    `• <b>Holders</b> — top 20 holder percentages`,
+    ...(hasHolders(data) ? [`• <b>Holders</b> — top 20 holder percentages`] : []),
     ``,
     `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>`,
-    `<i>Source: Dexscreener · Abscan (Abstract)</i>`
-  ].filter(Boolean);
+    `<i>Source: Dexscreener · Etherscan</i>`
+  ];
 
   const text = lines.join('\n');
 
-  // in renderOverview(data) lines:
-const holdersCountLine = (typeof data.holdersCount === 'number')
-  ? `Holders: <b>${data.holdersCount.toLocaleString()}</b>`
-  : `Holders: <i>N/A (Etherscan free API)</i>`;
-
-const top10Line = (data.top10CombinedPct != null)
-  ? `Top 10 combined: <b>${esc(pct(data.top10CombinedPct))}</b>`
-  : `Top 10 combined: <i>N/A (Etherscan free API)</i>`;
-
-const burnedLine = (data.burnedPct != null)
-  ? `Burned: <b>${esc(pct(data.burnedPct))}</b>`
-  : `Burned: <i>N/A</i>`;
-
-
   // Keyboard
+  const navRow = hasHolders(data)
+    ? [
+        { text:'🧑‍🤝‍🧑 Buyers',  callback_data:`buyers:${data.tokenAddress}:1` },
+        { text:'📊 Holders',     callback_data:`holders:${data.tokenAddress}:1` }
+      ]
+    : [
+        { text:'🧑‍🤝‍🧑 Buyers',  callback_data:`buyers:${data.tokenAddress}:1` }
+      ];
+
   const kb = {
     reply_markup: {
       inline_keyboard: [
         // socials row will be unshifted below if present
         [],
-        [
-          { text:'🧑‍🤝‍🧑 Buyers',  callback_data:`buyers:${data.tokenAddress}:1` },
-          { text:'📊 Holders',     callback_data:`holders:${data.tokenAddress}:1` }
-        ],
+        navRow,
         [
           { text:'↻ Refresh',      callback_data:`refresh:${data.tokenAddress}` },
           { text:'ℹ️ About',       callback_data:'about' }
@@ -129,7 +130,7 @@ export function renderBuyers(data, page = 1, pageSize = 10) {
         ],
         [
           { text:'🏠 Overview', callback_data:`stats:${data.tokenAddress}` },
-          { text:'📊 Holders',  callback_data:`holders:${data.tokenAddress}:1` }
+          ...(hasHolders(data) ? [{ text:'📊 Holders',  callback_data:`holders:${data.tokenAddress}:1` }] : [])
         ]
       ]
     }
@@ -147,10 +148,12 @@ export function renderHolders(data, page = 1, pageSize = 10) {
   const rows = (data.holdersTop20 || []).slice(start, start + pageSize);
   const name = esc(data.market?.name || 'Token');
 
-  const body = rows.map((h, i) => {
-    const n = String(start + i + 1).padStart(2, '0');
-    return `${n}. <code>${esc(shortAddr(h.address))}</code> — <b>${esc(pct(h.percent))}</b>`;
-  }).join('\n') || '<i>No holders found yet</i>';
+  const body = rows.length
+    ? rows.map((h, i) => {
+        const n = String(start + i + 1).padStart(2, '0');
+        return `${n}. <code>${esc(shortAddr(h.address))}</code> — <b>${esc(pct(h.percent))}</b>`;
+      }).join('\n')
+    : '<i>Top holders are unavailable on the free Etherscan API.</i>';
 
   const totalPages = Math.ceil((data.holdersTop20 || []).length / pageSize) || 1;
   const prev = Math.max(1, page - 1);
@@ -198,7 +201,8 @@ export function renderAbout() {
     `🤖 <b>tABS Tools</b>`,
     ``,
     `• Market: Dexscreener (Abstract)`,
-    `• Holders & transfers: Abscan (Abstract explorer)`,
+    `• Transfers & creator: Etherscan (free API)`,
+    `• Holders: N/A on Etherscan free API`,
     `• Refresh cooldown: 30s`,
     `• Data cache: 3 minutes`,
     ``,
@@ -213,4 +217,9 @@ export function renderAbout() {
     }
   };
   return { text, extra };
+}
+
+/* ---------- helpers ---------- */
+function hasHolders(data) {
+  return Array.isArray(data.holdersTop20) && data.holdersTop20.length > 0;
 }
