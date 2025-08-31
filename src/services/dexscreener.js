@@ -1,248 +1,115 @@
 // src/services/dexscreener.js
 import axios from 'axios';
-import '../configEnv.js';
 
+const DS_BASE = 'https://api.dexscreener.com';
 
-/**
- * Fetch raw Dexscreener data for a token address (Abstract pairs only).
- * @param {string} tokenAddress 0x... (40 hex)
- * @returns {Promise<{ schemaVersion?: string, pairs: any[] }>}
- */
-export async function fetchDexscreenerRaw(tokenAddress) {
-  const ca = (tokenAddress || '').toLowerCase();
-  if (!/^0x[a-f0-9]{40}$/.test(ca)) {
-    throw new Error(`Dexscreener: invalid token address: ${tokenAddress}`);
+const n = (v) => {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : 0;
+};
+
+function pickBestPair(pairs) {
+  if (!Array.isArray(pairs) || !pairs.length) return null;
+  // sort by highest volume.h24, then by highest liquidity.usd
+  return [...pairs].sort((a, b) => {
+    const vA = n(a?.volume?.h24);
+    const vB = n(b?.volume?.h24);
+    if (vA !== vB) return vB - vA;
+    const lA = n(a?.liquidity?.usd);
+    const lB = n(b?.liquidity?.usd);
+    return lB - lA;
+  })[0];
+}
+
+function socialsFromInfo(info) {
+  const socials = Array.isArray(info?.socials) ? info.socials : [];
+  let twitter, telegram, website;
+  for (const s of socials) {
+    const type = (s?.type || '').toLowerCase();
+    const url  = s?.url || '';
+    if (type === 'twitter' && !twitter) twitter = url;
+    if ((type === 'telegram' || type === 'tg') && !telegram) telegram = url;
   }
-
-  const url = `https://api.dexscreener.com/latest/dex/tokens/${ca}`;
-  const { data } = await axios.get(url, { timeout: 12000 });
-
-  const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
-  const abstractPairs = pairs.filter(
-    (p) => (p?.chainId || '').toLowerCase() === 'abstract'
-  );
-
-  return { schemaVersion: data?.schemaVersion, pairs: abstractPairs };
+  const websites = Array.isArray(info?.websites) ? info.websites : [];
+  for (const w of websites) {
+    if (!website && w?.url) website = w.url;
+  }
+  return { twitter, telegram, website };
 }
 
 /**
- * Pick the "best" pair from a list.
- * @param {any[]} pairs  Dexscreener pair objects
- * @param {{metric?: 'volume.h24'|'liquidity.usd'}} [opts]
+ * getDexscreenerTokenStats(ca) -> normalized market object or null
+ * Fields used by renderer:
+ *  { name, symbol, priceUsd, volume{m5,h1,h6,h24}, priceChange{m5,h1,h6,h24},
+ *    marketCap, marketCapSource, imageUrl, socials{twitter,telegram,website},
+ *    url, dexId }
  */
-function pickBestPair(pairs, opts = {}) {
-  const metric = opts.metric || 'volume.h24';
-  const path = metric.split('.'); // e.g., ['volume','h24']
+export async function getDexscreenerTokenStats(contractAddress) {
+  const ca = String(contractAddress || '').trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(ca)) return null;
 
-  const getMetric = (p) => {
-    try {
-      let v = p;
-      for (const k of path) v = v?.[k];
-      const n = Number(v);
-      return Number.isFinite(n) ? n : 0;
-    } catch {
-      return 0;
-    }
-  };
+  const url = `${DS_BASE}/latest/dex/tokens/${ca}`;
+  if (process.env.DS_DEBUG) console.log('[DEX] GET', url);
 
-  return pairs
-    .slice()
-    .sort((a, b) => getMetric(b) - getMetric(a))[0] || null;
-}
+  const { data } = await axios.get(url, { timeout: 15000 }).catch((e) => {
+    if (process.env.DS_DEBUG) console.error('[DEX] ERROR', e?.message || e);
+    return { data: null };
+  });
 
-/**
- * Normalize a single pair to your desired summary structure.
- * Includes *all* useful public fields we can extract + raw pair object.
- * @param {any} best
- */
-function normalizePair(best) {
+  const allPairs = data?.pairs || [];
+  // Keep only Abstract chainId
+  const abstractPairs = allPairs.filter((p) => (p?.chainId || '').toLowerCase() === 'abstract');
+  if (process.env.DS_DEBUG) {
+    console.log('[DEX] pairs total=', allPairs.length, 'abstract=', abstractPairs.length);
+  }
+  if (!abstractPairs.length) return null;
+
+  const best = pickBestPair(abstractPairs);
   if (!best) return null;
 
-  const name   = best?.baseToken?.name   || best?.info?.baseToken?.name || '';
-  const symbol = best?.baseToken?.symbol || best?.info?.baseToken?.symbol || '';
-  const baseTokenAddress  = best?.baseToken?.address || null;
-  const quoteTokenAddress = best?.quoteToken?.address || null;
-  const quoteTokenSymbol  = best?.quoteToken?.symbol || null;
-
-  const priceNative = toNum(best?.priceNative);
-  const priceUsd    = toNum(best?.priceUsd ?? best?.price);
-
-  const txns = {
-    m5: safeTxn(best?.txns?.m5),
-    h1: safeTxn(best?.txns?.h1),
-    h6: safeTxn(best?.txns?.h6),
-    h24: safeTxn(best?.txns?.h24),
-  };
-
+  const name   = best?.baseToken?.name || 'Token';
+  const symbol = best?.baseToken?.symbol || '';
+  const priceUsd = n(best?.priceUsd);
   const volume = {
-    m5:  toNum(best?.volume?.m5),
-    h1:  toNum(best?.volume?.h1),
-    h6:  toNum(best?.volume?.h6),
-    h24: toNum(best?.volume?.h24),
+    m5: n(best?.volume?.m5),
+    h1: n(best?.volume?.h1),
+    h6: n(best?.volume?.h6),
+    h24: n(best?.volume?.h24),
   };
-
   const priceChange = {
-    m5:  toNum(best?.priceChange?.m5),
-    h1:  toNum(best?.priceChange?.h1),
-    h6:  toNum(best?.priceChange?.h6),
-    h24: toNum(best?.priceChange?.h24),
+    m5: n(best?.priceChange?.m5),
+    h1: n(best?.priceChange?.h1),
+    h6: n(best?.priceChange?.h6),
+    h24: n(best?.priceChange?.h24),
   };
 
-  const liquidity = {
-    usd: toNum(best?.liquidity?.usd),
-    base: toNum(best?.liquidity?.base),
-    quote: toNum(best?.liquidity?.quote),
+  // Prefer true marketCap if present; otherwise use fdv and mark source accordingly
+  const mc = n(best?.marketCap);
+  const fdv = n(best?.fdv);
+  let marketCap = mc || fdv || 0;
+  let marketCapSource = mc ? 'mc' : (fdv ? 'fdv' : undefined);
+
+  const imageUrl = best?.info?.imageUrl || null;
+  const { twitter, telegram, website } = socialsFromInfo(best?.info);
+  const dexId = best?.dexId || null;
+  const pairUrl = best?.url || null;
+
+  const out = {
+    name,
+    symbol,
+    priceUsd,
+    volume,
+    priceChange,
+    marketCap,
+    marketCapSource,
+    imageUrl,
+    socials: { twitter, telegram, website },
+    url: pairUrl,
+    dexId,
   };
 
-  // market cap: prefer marketCap, fallback to fdv
-  const rawMarketCap = toNum(best?.marketCap);
-  const fdv          = toNum(best?.fdv);
-  const marketCap    = rawMarketCap > 0 ? rawMarketCap : fdv;
-  const marketCapSource = rawMarketCap > 0 ? 'marketCap' : 'fdv';
-
-  // images & socials & websites
-  const imageUrl  = best?.info?.imageUrl || null;
-  const header    = best?.info?.header   || null;
-  const openGraph = best?.info?.openGraph || null;
-
-  const socials = normalizeSocials(best?.info?.socials, best?.info?.websites);
-
-  // moonshot block (if present)
-  const moon = best?.moonshot || null;
-  const moonshot = {
-    present: Boolean(moon),
-    progress: moon?.progress != null ? toNum(moon.progress) : null,
-    creator: moon?.creator || null,
-    curveType: moon?.curveType || null,
-    curvePosition: moon?.curvePosition || null,
-    marketcapThreshold: moon?.marketcapThreshold || null,
-  };
-
-  // meta
-  const meta = {
-    schemaVersion: best?.schemaVersion || null, // usually on top-level response
-    chainId: best?.chainId || 'abstract',
-    dexId: best?.dexId || null,
-    url: best?.url || null,
-    pairAddress: best?.pairAddress || null,
-    pairCreatedAt: best?.pairCreatedAt || null,
-  };
-
-  return {
-    // headline
-    name, symbol,
-    baseTokenAddress, quoteTokenAddress, quoteTokenSymbol,
-
-    // prices & volumes
-    priceNative, priceUsd, volume, priceChange, txns, liquidity,
-
-    // valuation
-    marketCap, fdv, marketCapSource,
-
-    // media & links
-    imageUrl, header, openGraph,
-    socials,  // { twitter, telegram, website, others: [...] }
-
-    // moonshot block
-    moonshot,
-
-    // meta
-    ...meta,
-
-    // keep the full raw pair (handy for future additions)
-    pairRaw: best,
-  };
+  if (process.env.DS_DEBUG) console.log('[DEX] selected pair', JSON.stringify(out, null, 2));
+  return out;
 }
 
-/**
- * Main function you can use in your worker/bot.
- * Returns: { summary, bestPair, pairsRaw, selection }
- *  - summary: normalized summary (see normalizePair)
- *  - bestPair: the same as summary.pairRaw (kept for convenience)
- *  - pairsRaw: ALL Abstract pairs as returned by Dexscreener (unmodified)
- *  - selection: which metric was used to pick best pair
- *
- * @param {string} tokenAddress
- * @param {{ metric?: 'volume.h24'|'liquidity.usd' }} [opts]
- */
-export async function getDexscreenerTokenStats(tokenAddress, opts = {}) {
-  const { schemaVersion, pairs } = await fetchDexscreenerRaw(tokenAddress);
-  if (!pairs.length) {
-    return { summary: null, bestPair: null, pairsRaw: [], selection: { metric: opts.metric || 'volume.h24', schemaVersion } };
-  }
-
-  const best = pickBestPair(pairs, opts);
-  const summary = normalizePair(best);
-  if (summary) summary.schemaVersion = schemaVersion || summary.schemaVersion;
-
-  return {
-    summary,
-    bestPair: best || null,
-    pairsRaw: pairs,
-    selection: { metric: opts.metric || 'volume.h24', schemaVersion },
-  };
-}
-
-/* ----------------- helpers ----------------- */
-
-function toNum(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
-}
-
-function safeTxn(obj) {
-  const buys  = toNum(obj?.buys);
-  const sells = toNum(obj?.sells);
-  return { buys, sells };
-}
-
-
-function pickUrl(x) {
-  if (!x) return null;
-  if (typeof x === 'string') return x;
-  if (typeof x === 'object' && typeof x.url === 'string') return x.url;
-  return null;
-}
-
-function normalizeSocials(socialsRaw, websitesRaw) {
-  const socials = Array.isArray(socialsRaw) ? socialsRaw : [];
-  const websites = Array.isArray(websitesRaw) ? websitesRaw : [];
-
-  let twitter = null;
-  let telegram = null;
-  let website = null;
-  const others = [];
-
-  for (const s of socials) {
-    const url = pickUrl(s?.url || s);
-    const type = (s?.type || '').toLowerCase();
-    if (!url) continue;
-
-    if (!twitter && (type === 'twitter' || /(^https?:\/\/)?(x\.com|twitter\.com)\//i.test(url))) {
-      twitter = url; continue;
-    }
-    if (!telegram && (type === 'telegram' || /(^https?:\/\/)?(t\.me|telegram\.me)\//i.test(url))) {
-      telegram = url; continue;
-    }
-    others.push({ type: type || 'unknown', url });
-  }
-
-  // websites can be strings or objects
-  if (websites.length) {
-    website = pickUrl(websites[0]);
-    for (let i = 1; i < websites.length; i++) {
-      const u = pickUrl(websites[i]);
-      if (u) others.push({ type: 'website', url: u });
-    }
-  }
-
-  // final sanitation: only keep strings
-  twitter = typeof twitter === 'string' ? twitter : null;
-  telegram = typeof telegram === 'string' ? telegram : null;
-  website = typeof website === 'string' ? website : null;
-
-  return { twitter, telegram, website, others };
-}
-
-
-
+export default { getDexscreenerTokenStats };
