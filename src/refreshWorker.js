@@ -1,8 +1,3 @@
-// src/refreshWorker.js
-// Worker that refreshes a token snapshot and caches it for the bot.
-// Market: Dexscreener
-// Holders/Buyers/Creator/Supply: Etherscan v2 (chainid=2741)
-
 import './configEnv.js';
 import Redis from 'ioredis';
 import { Worker, Queue } from 'bullmq';
@@ -17,7 +12,6 @@ import {
   summarizeHoldersFromBalances,
   first20BuyersStatus,
 } from './services/absEtherscanV2.js';
-
 // ---------- BullMQ Redis ----------
 const bullRedis = new Redis(process.env.REDIS_URL, {
   maxRetriesPerRequest: null,
