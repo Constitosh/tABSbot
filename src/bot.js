@@ -1,24 +1,24 @@
+// src/bot.js
 import './configEnv.js';
 import { Telegraf } from 'telegraf';
-import { queue } from './queueCore.js';          // <— ONLY queue here
+import { queue } from './queueCore.js';          // only queue
 import { getJSON, setJSON } from './cache.js';
 import { renderOverview, renderBuyers, renderHolders, renderAbout } from './renderers.js';
 import { isAddress } from './util.js';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// ----- HTML helpers (ensure consistent parse_mode) -----
+// ----- HTML helpers -----
 const sendHTML = (ctx, text, extra = {}) =>
   ctx.replyWithHTML(text, { disable_web_page_preview: true, ...extra });
 
-// Safe edit: ignore “message is not modified”
 const editHTML = async (ctx, text, extra = {}) => {
   try {
     return await ctx.editMessageText(text, {
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      ...extra,
-    });
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    ...extra,
+  });
   } catch (err) {
     const desc = err?.response?.description || '';
     if (desc.includes('message is not modified')) {
@@ -29,20 +29,36 @@ const editHTML = async (ctx, text, extra = {}) => {
 };
 
 // ----- Data helpers -----
-// Only read cache; on miss, enqueue a refresh and return null.
+// Enqueue refresh if missing and poll Redis briefly for the summary
 async function ensureData(ca) {
   const key = `token:${ca}:summary`;
-  const cache = await getJSON(key);
-  if (cache) return cache;
+  const gateKey = `token:${ca}:last_refresh`;
 
-  // cache miss — enqueue refresh for the worker and tell caller to try again shortly
-  try {
-    await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
-  } catch (_) {}
+  // 1) fast path: cached
+  const cached = await getJSON(key);
+  if (cached) return cached;
+
+  // 2) gate + enqueue
+  const last = await getJSON(gateKey);
+  const age = last ? (Date.now() - last.ts) / 1000 : Infinity;
+  if (!(Number.isFinite(age) && age < 1)) {
+    await setJSON(gateKey, { ts: Date.now() }, 600).catch(() => {});
+    await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true }).catch(() => {});
+  }
+
+  // 3) poll Redis for up to ~3s
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    const got = await getJSON(key);
+    if (got) return got;
+    await new Promise(r => setTimeout(r, 250));
+  }
+
+  // 4) give up for now
   return null;
 }
 
-// Throttle refresh to 30s per token; always return { ok, age? , error? }
+// Always return { ok:boolean, age?:number, error?:string }
 async function requestRefresh(ca) {
   try {
     const gateKey = `token:${ca}:last_refresh`;
@@ -52,7 +68,6 @@ async function requestRefresh(ca) {
     if (Number.isFinite(age) && age < 30) {
       return { ok: false, age };
     }
-
     await setJSON(gateKey, { ts: Date.now() }, 600);
     await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
 
@@ -73,12 +88,11 @@ bot.start((ctx) =>
   )
 );
 
-// /stats <ca>
 bot.command('stats', async (ctx) => {
   const [, caRaw] = ctx.message.text.trim().split(/\s+/);
   if (!isAddress(caRaw)) return ctx.reply('Send: /stats <contractAddress>');
-
   const ca = caRaw.toLowerCase();
+
   const data = await ensureData(ca);
   if (!data) return ctx.reply('Initializing… try again in a few seconds.');
 
@@ -86,14 +100,12 @@ bot.command('stats', async (ctx) => {
   return sendHTML(ctx, text, extra);
 });
 
-// /refresh <ca>
 bot.command('refresh', async (ctx) => {
   const [, caRaw] = ctx.message.text.trim().split(/\s+/);
   if (!isAddress(caRaw)) return ctx.reply('Send: /refresh <contractAddress>');
-
   const ca = caRaw.toLowerCase();
-  const res = await requestRefresh(ca);
 
+  const res = await requestRefresh(ca);
   if (!res.ok) {
     if (typeof res.age === 'number') {
       return ctx.reply(`Recently refreshed (${res.age.toFixed(0)}s ago). Try again shortly.`);
@@ -104,11 +116,8 @@ bot.command('refresh', async (ctx) => {
 });
 
 // ----- Callback handlers -----
-
-// noop buttons: just close the spinner
 bot.action('noop', (ctx) => ctx.answerCbQuery(''));
 
-// Main action router
 bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
   try {
     const [kind, ca, maybePage] = ctx.callbackQuery.data.split(':');
@@ -149,7 +158,6 @@ bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
   }
 });
 
-// About modal
 bot.action('about', async (ctx) => {
   const { text, extra } = renderAbout();
   return editHTML(ctx, text, extra);
