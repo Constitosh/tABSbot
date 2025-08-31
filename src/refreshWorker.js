@@ -13,7 +13,7 @@ import { getDexscreenerTokenStats } from './services/dexscreener.js';
 
 import {
   getAllTokenTransfers,
-  getTokenTotalSupply,   // returns STRING now
+  getTokenTotalSupply,   // returns STRING
   getContractCreator,
   buildBalanceMap,
   summarizeHoldersFromBalances,
@@ -45,7 +45,7 @@ export async function refreshToken(tokenAddress) {
     const market = await getDexscreenerTokenStats(ca)
       .then((m) => {
         console.log('[WORKER] Dexscreener ok', ca, 'mktCap=' + (m?.marketCap ?? m?.fdv ?? 0));
-        return m;
+        return m || null;
       })
       .catch((e) => {
         console.log('[WORKER] Dexscreener failed:', e?.message || e);
@@ -60,19 +60,30 @@ export async function refreshToken(tokenAddress) {
       [transfers, creatorInfo, totalSupplyStr] = await Promise.all([
         getAllTokenTransfers(ca, { maxPages: 50 }),
         getContractCreator(ca),
-        getTokenTotalSupply(ca), // <- STRING
+        getTokenTotalSupply(ca), // <- STRING (not scientific notation)
       ]);
-      console.log('[WORKER] ESV2 ok', ca, 'transfers=' + transfers.length, 'totalSupply=' + totalSupplyStr);
+      console.log(
+        '[WORKER] ESV2 ok',
+        ca,
+        'transfers=' + (transfers?.length ?? 0),
+        'totalSupply=' + totalSupplyStr
+      );
     } catch (e) {
       console.log('[WORKER] ESV2 failed:', e?.message || e);
     }
 
     // 3) Build balances + holders
-    let holdersSummary = { holdersTop20: [], top10CombinedPct: 0, burnedPct: 0, holdersCount: 0, decimals: 18 };
+    let holdersSummary = {
+      holdersTop20: [],
+      top10CombinedPct: 0,
+      burnedPct: 0,
+      holdersCount: 0,
+      decimals: 18,
+    };
     let balances = new Map();
     let decimals = 18;
     try {
-      const bm = buildBalanceMap(transfers);
+      const bm = buildBalanceMap(transfers || []);
       balances = bm.balances;
       decimals = bm.decimals;
       holdersSummary = summarizeHoldersFromBalances(balances, totalSupplyStr, decimals);
@@ -81,18 +92,19 @@ export async function refreshToken(tokenAddress) {
     }
 
     // 4) First 20 buyers status
-    let buyers = [];
+    let buyersList = [];
     try {
-      buyers = first20BuyersStatus(transfers, balances);
+      buyersList = first20BuyersStatus(transfers || [], balances || new Map());
     } catch (e) {
       console.log('[WORKER] buyers compute failed:', e?.message || e);
     }
 
     // 5) Creator %
     let creatorPct = 0;
+    let creatorAddr = creatorInfo?.creatorAddress || null;
     try {
-      if (creatorInfo?.creatorAddress) {
-        const bal = balances.get(creatorInfo.creatorAddress) || 0n;
+      if (creatorAddr) {
+        const bal = balances.get(creatorAddr) || 0n;
         const tot = BigInt(String(totalSupplyStr || '0'));
         creatorPct = tot > 0n ? Number((bal * 1000000n) / tot) / 10000 : 0;
       }
@@ -101,18 +113,31 @@ export async function refreshToken(tokenAddress) {
       creatorPct = 0;
     }
 
-    // 6) Final payload
+    // 6) Final payload (renderer-compatible)
     const payload = {
       tokenAddress: ca,
       updatedAt: Date.now(),
+
+      // Dexscreener slice (as your renderer expects)
       market, // dexscreener summary object or null
+
+      // On-chain slice (names your renderer already uses)
       holdersTop20: holdersSummary.holdersTop20,
       top10CombinedPct: holdersSummary.top10CombinedPct,
       burnedPct: holdersSummary.burnedPct,
       holdersCount: holdersSummary.holdersCount,
-      creator: { address: creatorInfo?.creatorAddress || null, percent: creatorPct },
-      first20Buyers: buyers,
+
+      // buyers exposed under both keys for compatibility
+      buyersFirst20: buyersList,
+      buyers: buyersList,
+
+      // creator exposed both nested & flat for compatibility
+      creator: { address: creatorAddr, percent: creatorPct },
+      creatorAddress: creatorAddr,
+      creatorPercent: creatorPct,
+
       decimals,
+      source: ['Dexscreener', 'Etherscan'],
     };
 
     // 7) Cache (3 min TTL for summary, 10 min for last_refresh gate)
