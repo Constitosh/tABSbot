@@ -17,7 +17,7 @@ const sleep = (ms)=> new Promise(r=>setTimeout(r,ms));
 
 function qs(params) {
   const u = new URL(BASE);
-  u.searchParams.set('chainid', CHAIN_ID);
+ u.searchParams.set('chainid', String(CHAIN_ID));
   if (KEY) u.searchParams.set('apikey', KEY);
   for (const [k,v] of Object.entries(params)) {
     if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, String(v));
