@@ -81,15 +81,25 @@ export async function getAllTokenTransfers(ca, { maxPages = 50 } = {}) {
   return out;
 }
 
-/** Total supply (raw number, decimals handled by UI where needed). */
+/** Total supply (raw number). Try token/tokensupply then stats/tokensupply. */
 export async function getTokenTotalSupply(ca) {
-  const res = await call({
-    module: 'token',
-    action: 'tokensupply',
-    contractaddress: ca,
-  });
-  const n = Number(res?.result ?? res?.TokenSupply ?? res);
-  return Number.isFinite(n) ? n : 0;
+  // Try the common path first
+  try {
+    const r1 = await call({ module: 'token', action: 'tokensupply', contractaddress: ca });
+    const n1 = Number(r1?.result ?? r1?.TokenSupply ?? r1);
+    if (Number.isFinite(n1) && n1 > 0) return n1;
+  } catch (e) {
+    // swallow; we’ll try fallback
+  }
+  // Fallback some chains use:
+  try {
+    const r2 = await call({ module: 'stats', action: 'tokensupply', contractaddress: ca });
+    const n2 = Number(r2?.result ?? r2?.TokenSupply ?? r2);
+    if (Number.isFinite(n2)) return n2;
+  } catch (e2) {
+    console.warn('[ESV2] tokensupply fallback failed:', e2?.message || e2);
+  }
+  return 0;
 }
 
 /** Contract creator info. */
