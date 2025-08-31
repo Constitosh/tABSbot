@@ -41,6 +41,20 @@ export function renderOverview(data) {
 
   const text = lines.join('\n');
 
+  // in renderOverview(data) lines:
+const holdersCountLine = (typeof data.holdersCount === 'number')
+  ? `Holders: <b>${data.holdersCount.toLocaleString()}</b>`
+  : `Holders: <i>N/A (Etherscan free API)</i>`;
+
+const top10Line = (data.top10CombinedPct != null)
+  ? `Top 10 combined: <b>${esc(pct(data.top10CombinedPct))}</b>`
+  : `Top 10 combined: <i>N/A (Etherscan free API)</i>`;
+
+const burnedLine = (data.burnedPct != null)
+  ? `Burned: <b>${esc(pct(data.burnedPct))}</b>`
+  : `Burned: <i>N/A</i>`;
+
+
   // Keyboard
   const kb = {
     reply_markup: {
