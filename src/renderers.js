@@ -33,6 +33,13 @@ export function renderOverview(data) {
 
   const creatorAddr = data.creator?.address ? esc(shortAddr(data.creator.address)) : 'unknown';
 
+  // ...existing code building `text` and `kb`...
+
+  const photo = data.market?.info?.imageUrl || null;
+  return { text, extra: kb, photo };
+}
+
+  
   const lines = [
     `🪙 <b>Token Overview — ${name}${sym ? ` (${sym})` : ''}</b>`,
     `CA: <code>${ca}</code>`,
