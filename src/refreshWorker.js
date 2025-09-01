@@ -1,7 +1,7 @@
 // src/refreshWorker.js
 // Worker that refreshes a token snapshot and caches it for the bot.
 // - Market data: Dexscreener
-// - Holders/Buyers/Creator/Supply: Etherscan v2 (chainid=2741)
+// - Holders/Buyers/Creator: Abscan (Etherscan-style for Abstract)
 // - Queue: BullMQ
 
 import './configEnv.js';
@@ -10,15 +10,19 @@ import { Worker, Queue } from 'bullmq';
 
 import { setJSON, withLock } from './cache.js';
 import { getDexscreenerTokenStats } from './services/dexscreener.js';
-
 import {
-  getAllTokenTransfers,
-  getTokenTotalSupply,   // returns STRING
+  getTokenHolders,
+  getTokenTransfers,
   getContractCreator,
-  buildBalanceMap,
-  summarizeHoldersFromBalances,
+} from './services/abscan.js';
+import {
+  summarizeHolders,
+  buildCurrentBalanceMap,
   first20BuyersStatus,
-} from './services/absEtherscanV2.js';
+} from './services/compute.js';
+
+console.log('[WORKER BOOT] ABSCAN_API =', process.env.ABSCAN_API || 'https://abscan.org/api');
+console.log('[WORKER BOOT] REDIS_URL  =', process.env.REDIS_URL ? 'set' : 'missing');
 
 // ---------------- Redis (BullMQ connection) ----------------
 const bullRedis = new Redis(process.env.REDIS_URL, {
@@ -39,114 +43,122 @@ export async function refreshToken(tokenAddress) {
 
   const lockKey = `lock:refresh:${ca}`;
   return withLock(lockKey, 60, async () => {
+    const startTs = Date.now();
     console.log('[WORKER] refreshToken start', ca);
 
     // 1) Dexscreener market (tolerate null)
-    const market = await getDexscreenerTokenStats(ca)
-      .then((m) => {
-        console.log('[WORKER] Dexscreener ok', ca, 'mktCap=' + (m?.marketCap ?? m?.fdv ?? 0));
-        return m || null;
-      })
-      .catch((e) => {
-        console.log('[WORKER] Dexscreener failed:', e?.message || e);
-        return null;
-      });
-
-    // 2) Etherscan v2: transfers, creator, totalSupply (string)
-    let transfers = [];
-    let creatorInfo = { contractAddress: ca, creatorAddress: null, txHash: null };
-    let totalSupplyStr = '0';
+    let market = null;
     try {
-      [transfers, creatorInfo, totalSupplyStr] = await Promise.all([
-        getAllTokenTransfers(ca, { maxPages: 50 }),
-        getContractCreator(ca),
-        getTokenTotalSupply(ca), // <- STRING (not scientific notation)
-      ]);
+      const { summary } = await getDexscreenerTokenStats(ca);
+      market = summary || null;
       console.log(
-        '[WORKER] ESV2 ok',
+        '[WORKER] Dexscreener ok',
         ca,
-        'transfers=' + (transfers?.length ?? 0),
-        'totalSupply=' + totalSupplyStr
+        'mktCap=',
+        market?.marketCap ?? market?.fdv ?? 0
       );
     } catch (e) {
-      console.log('[WORKER] ESV2 failed:', e?.message || e);
+      console.log('[WORKER] Dexscreener failed:', e?.message || e);
     }
 
-    // 3) Build balances + holders
-    let holdersSummary = {
-      holdersTop20: [],
-      top10CombinedPct: 0,
-      burnedPct: 0,
-      holdersCount: 0,
-      decimals: 18,
-    };
-    let balances = new Map();
-    let decimals = 18;
+    // 2) Abscan (Etherscan-style): holders, transfers, creator
+    let holders = [];
+    let holderCount = null;
+    let transfersAsc = [];
+    let creatorAddr = null;
+
     try {
-      const bm = buildBalanceMap(transfers || []);
-      balances = bm.balances;
-      decimals = bm.decimals;
-      holdersSummary = summarizeHoldersFromBalances(balances, totalSupplyStr, decimals);
+      const holdersRes = await getTokenHolders(ca, 1, 200);
+      holders = Array.isArray(holdersRes?.holders) ? holdersRes.holders : [];
+      holderCount = Number(holdersRes?.holderCount ?? holders.length) || null;
+      console.log('[WORKER] Holders ok', ca, 'count=', holderCount);
     } catch (e) {
-      console.log('[WORKER] compute holders failed:', e?.message || e);
+      console.log('[WORKER] Holders failed:', e?.message || e);
     }
 
-    // 4) First 20 buyers status
-    let buyersList = [];
     try {
-      buyersList = first20BuyersStatus(transfers || [], balances || new Map());
+      transfersAsc = await getTokenTransfers(ca, 0, 999999999, 1, 1000);
+      console.log('[WORKER] Transfers ok', ca, 'rows=', transfersAsc.length);
     } catch (e) {
-      console.log('[WORKER] buyers compute failed:', e?.message || e);
+      console.log('[WORKER] Transfers failed:', e?.message || e);
     }
 
-    // 5) Creator %
-    let creatorPct = 0;
-    let creatorAddr = creatorInfo?.creatorAddress || null;
     try {
+      const creator = await getContractCreator(ca);
+      creatorAddr = creator?.creatorAddress || null;
+      console.log('[WORKER] Creator ok', ca, 'creator=', creatorAddr || 'unknown');
+    } catch (e) {
+      console.log('[WORKER] Creator failed:', e?.message || e);
+    }
+
+    // 3) Compute holders & buyers summary
+    let top10CombinedPct = 0;
+    let burnedPct = 0;
+    let holdersTop20 = [];
+    let first20Buyers = [];
+    let creatorPercent = 0;
+
+    try {
+      // adapt to compute utils expected shape
+      const holdersForCompute = (holders || []).map((h) => ({
+        TokenHolderAddress: h.address,
+        TokenHolderQuantity: h.balance, // may be 0 if API doesn't return it; still ok for status proxy
+        Percentage: h.percent,
+      }));
+
+      const sums = summarizeHolders(holdersForCompute);
+      top10CombinedPct = Number(sums.top10Pct || 0);
+      burnedPct = Number(sums.burnedPct || 0);
+      holdersTop20 = (holders || [])
+        .slice(0, 20)
+        .map((h) => ({ address: h.address, percent: Number(h.percent || 0) }));
+
+      const balanceMap = buildCurrentBalanceMap(holdersForCompute);
+      first20Buyers = first20BuyersStatus(transfersAsc || [], balanceMap);
+
       if (creatorAddr) {
-        const bal = balances.get(creatorAddr) || 0n;
-        const tot = BigInt(String(totalSupplyStr || '0'));
-        creatorPct = tot > 0n ? Number((bal * 1000000n) / tot) / 10000 : 0;
+        const hit = (holders || []).find(
+          (h) => (h.address || '').toLowerCase() === creatorAddr
+        );
+        creatorPercent = hit ? Number(hit.percent || 0) : 0;
       }
     } catch (e) {
-      console.log('[WORKER] creator% compute failed:', e?.message || e);
-      creatorPct = 0;
+      console.log('[WORKER] Compute failed:', e?.message || e);
     }
 
-    // 6) Final payload (renderer-compatible)
+    // 4) Final payload (renderer-compatible)
     const payload = {
       tokenAddress: ca,
       updatedAt: Date.now(),
 
-      // Dexscreener slice (as your renderer expects)
-      market, // dexscreener summary object or null
+      // Dexscreener slice (your renderers read these fields)
+      market, // normalized summary or null
 
-      // On-chain slice (names your renderer already uses)
-      holdersTop20: holdersSummary.holdersTop20,
-      top10CombinedPct: holdersSummary.top10CombinedPct,
-      burnedPct: holdersSummary.burnedPct,
-      holdersCount: holdersSummary.holdersCount,
+      // On-chain slice
+      holdersCount: holderCount,
+      holdersTop20,
+      top10CombinedPct,
+      burnedPct,
 
-      // buyers exposed under both keys for compatibility
-      buyersFirst20: buyersList,
-      buyers: buyersList,
+      creator: { address: creatorAddr, percent: creatorPercent },
 
-      // creator exposed both nested & flat for compatibility
-      creator: { address: creatorAddr, percent: creatorPct },
-      creatorAddress: creatorAddr,
-      creatorPercent: creatorPct,
-
-      decimals,
-      source: ['Dexscreener', 'Etherscan'],
+      // buyers for renderBuyers()
+      first20Buyers,
     };
 
-    // 7) Cache (3 min TTL for summary, 10 min for last_refresh gate)
+    // 5) Cache (3 min TTL for summary, 10 min gate for refresh cooldown check)
     const sumKey = `token:${ca}:summary`;
     const gateKey = `token:${ca}:last_refresh`;
     try {
       await setJSON(sumKey, payload, 180);
       await setJSON(gateKey, { ts: Date.now() }, 600);
-      console.log('[WORKER] cached summary', sumKey, 'ttl=180');
+      console.log(
+        '[WORKER] cached summary',
+        sumKey,
+        'ttl=180',
+        'elapsed=',
+        (Date.now() - startTs) + 'ms'
+      );
     } catch (e) {
       console.log('[WORKER] cache write failed:', e?.message || e);
     }
@@ -160,9 +172,10 @@ export async function refreshToken(tokenAddress) {
 new Worker(
   queueName,
   async (job) => {
-    console.log('[WORKER] job received:', job.name, job.id, job.data);
+    const ca = job.data?.tokenAddress;
+    console.log('[WORKER] job received:', job.name, job.id, ca);
     try {
-      const res = await refreshToken(job.data?.tokenAddress);
+      const res = await refreshToken(ca);
       console.log('[WORKER] job OK:', job.id);
       return res;
     } catch (e) {
@@ -183,7 +196,11 @@ if (process.argv.includes('--cron') && process.env.DEFAULT_TOKENS) {
     setInterval(async () => {
       for (const ca of list) {
         try {
-          await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
+          await queue.add(
+            'refresh',
+            { tokenAddress: ca },
+            { removeOnComplete: true, removeOnFail: true }
+          );
         } catch (e) {
           console.error('[CRON] Enqueue failed for', ca, e?.message || e);
         }
