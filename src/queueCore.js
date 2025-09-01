@@ -1,12 +1,5 @@
 // src/queueCore.js
-import './configEnv.js';
-import Redis from 'ioredis';
-import { Queue } from 'bullmq';
+// Thin facade so other modules can import from one place.
+// Keeps refresh/queue logic single-sourced in refreshWorker.js.
 
-export const bullRedis = new Redis(process.env.REDIS_URL, {
-  maxRetriesPerRequest: null,
-  enableReadyCheck: false,
-});
-
-export const queueName = 'tabs_refresh';
-export const queue = new Queue(queueName, { connection: bullRedis });
+export { queue, refreshToken } from './refreshWorker.js';
