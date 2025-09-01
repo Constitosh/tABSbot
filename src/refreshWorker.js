@@ -34,6 +34,24 @@ const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741'; // Abstract
 if (!ES_KEY) console.warn('[WORKER BOOT] ETHERSCAN_API_KEY is missing');
 const httpES = axios.create({ baseURL: ES_BASE, timeout: 25_000 });
 
+// ---------- Etherscan rate limit (≤ 5 req/s by default) ----------
+const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
+const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS); // ms between calls
+
+let esLastTs = 0;
+let esChain = Promise.resolve(); // serialize the gates
+
+async function throttleES() {
+  // chain to ensure spacing between call *starts*
+  const start = Date.now();
+  await (esChain = esChain.then(async () => {
+    const now = Date.now();
+    const wait = Math.max(0, esLastTs + ES_MIN_INTERVAL - now);
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    esLastTs = Date.now(); // mark when the call is allowed to start
+  }));
+}
+
 function esParams(params) {
   return { params: { chainid: ES_CHAIN, apikey: ES_KEY, ...params } };
 }
