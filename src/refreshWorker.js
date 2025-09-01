@@ -259,51 +259,86 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
   return { holdersTop20: top20, top10CombinedPct, holdersCount: rows.length };
 }
 
-// Buyers matrix using final balances for status
+// Buyers matrix using final balances for status (accurate)
 function first20BuyersMatrix(logs, pairAddress, balances) {
   if (!pairAddress) return [];
   const pair = String(pairAddress).toLowerCase();
-  const buyers = new Map(); // addr -> { firstBuyBlock, buys, sells }
+  const buyers = new Map(); // addr -> { firstBuyBlock, firstBuyAmt, buysAmt, sellsAmt, buysN, sellsN }
 
   for (const lg of logs) {
     const from = topicToAddr(lg.topics[1]);
     const to   = topicToAddr(lg.topics[2]);
+
+    // ignore dead/zero and pair self
     if (DEAD.has(from) || DEAD.has(to)) continue;
+    if (from === pair && to === pair) continue;
+
+    const val = toBig(lg.data);
 
     // buy = pair -> user
     if (from === pair && to !== pair) {
-      const b = buyers.get(to) || { firstBuyBlock: Number(lg.blockNumber), buys: 0, sells: 0 };
-      b.firstBuyBlock = Math.min(b.firstBuyBlock, Number(lg.blockNumber));
-      b.buys++;
-      buyers.set(to, b);
+      const rec = buyers.get(to) || {
+        firstBuyBlock: Number(lg.blockNumber),
+        firstBuyAmt: 0n,
+        buysAmt: 0n,
+        sellsAmt: 0n,
+        buysN: 0,
+        sellsN: 0
+      };
+      if (rec.buysN === 0) rec.firstBuyAmt = val;
+      rec.firstBuyBlock = Math.min(rec.firstBuyBlock, Number(lg.blockNumber));
+      rec.buysAmt += val;
+      rec.buysN += 1;
+      buyers.set(to, rec);
     }
 
     // sell = user -> pair
     if (to === pair && from !== pair) {
-      const b = buyers.get(from) || { firstBuyBlock: Number.MAX_SAFE_INTEGER, buys: 0, sells: 0 };
-      b.sells++;
-      buyers.set(from, b);
+      const rec = buyers.get(from) || {
+        firstBuyBlock: Number.MAX_SAFE_INTEGER,
+        firstBuyAmt: 0n,
+        buysAmt: 0n,
+        sellsAmt: 0n,
+        buysN: 0,
+        sellsN: 0
+      };
+      rec.sellsAmt += val;
+      rec.sellsN += 1;
+      buyers.set(from, rec);
     }
   }
 
+  // Order by earliest first buy, take first 20 and label
   const ordered = [...buyers.entries()]
+    .filter(([, r]) => r.buysN > 0) // must have bought at least once
     .sort((a, b) => a[1].firstBuyBlock - b[1].firstBuyBlock)
     .slice(0, 20)
-    .map(([address, s]) => {
+    .map(([address, r]) => {
       const balNow = balances.get(address.toLowerCase()) || 0n;
       let status = 'hold';
-      if (balNow === 0n && s.buys > 0) {
+
+      if (balNow === 0n) {
         status = 'sold all';
-      } else if (s.sells > 0) {
+      } else if (r.sellsN > 0 && balNow < r.buysAmt) {
         status = 'sold some';
-      } else if (s.buys > 1) {
+      } else if (r.sellsN === 0 && (r.buysAmt > r.firstBuyAmt || r.buysN > 1)) {
         status = 'bought more';
+      } else {
+        status = 'hold';
       }
-      return { address, status, buys: s.buys, sells: s.sells };
+
+      return {
+        address,
+        status,
+        // (optional debug numbers if you ever want to display)
+        // buys: r.buysN, sells: r.sellsN,
+        // buysAmt: r.buysAmt.toString(), sellsAmt: r.sellsAmt.toString(),
+      };
     });
 
   return ordered;
 }
+
 
 // ---------- Redis / BullMQ ----------
 const bullRedis = new Redis(process.env.REDIS_URL, {
@@ -381,6 +416,17 @@ export async function refreshToken(tokenAddress) {
       console.log('[WORKER] ESV2 failed:', e?.message || e);
     }
 
+// sort logs to strict chronological order
+logs.sort((a, b) => {
+  const ba = Number(a.blockNumber || 0);
+  const bb = Number(b.blockNumber || 0);
+  if (ba !== bb) return ba - bb;
+  const ia = Number(a.logIndex || 0);
+  const ib = Number(b.logIndex || 0);
+  return ia - ib;
+});
+
+    
     // 3) Compute
     let holdersTop20 = [];
     let holdersCount = null;
