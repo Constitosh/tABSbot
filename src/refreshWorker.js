@@ -259,23 +259,24 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
   return { holdersTop20: top20, top10CombinedPct, holdersCount: rows.length };
 }
 
-// Buyers: first 20 unique recipients (mint or AMM), then status by final balance vs total bought
-function first20BuyersMatrix(logs, pairAddress, balances, tokenAddress) {
+// Buyers: first 20 unique recipients (mint or AMM), status from final balance vs total bought
+function first20BuyersMatrix(logs, pairAddress, balances) {
   const ZERO = '0x0000000000000000000000000000000000000000';
   const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
 
-  // Sort is assumed done earlier. If not, uncomment:
-  // logs.sort((a, b) => (Number(a.blockNumber)-Number(b.blockNumber)) || (Number(a.logIndex)-Number(b.logIndex)));
+  // Ensure logs are chronological (ok if you already sort earlier)
+  // logs.sort((a,b)=> (Number(a.blockNumber)-Number(b.blockNumber)) || (Number(a.logIndex)-Number(b.logIndex)));
 
-  // 1) Find first 20 unique recipients (excluding LP and dead)
+  // 1) earliest 20 unique recipients (from mint OR from LP). Exclude LP/dead.
   const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
   for (const lg of logs) {
     const from = topicToAddr(lg.topics[1]);
     const to   = topicToAddr(lg.topics[2]);
-    if (DEAD.has(to) || to === pair) continue;         // never count LP/dead as recipient
-    const isReceiveFromMint = from === ZERO;
-    const isReceiveFromAMM  = pair && from === pair;
-    if (!isReceiveFromMint && !isReceiveFromAMM) continue;
+    if (DEAD.has(to)) continue;
+    if (pair && to === pair) continue;              // never count LP itself
+    const isMintIn = from === ZERO;
+    const isLPIn   = pair && from === pair;
+    if (!isMintIn && !isLPIn) continue;
 
     if (!firstSeen.has(to)) {
       firstSeen.set(to, {
@@ -286,53 +287,51 @@ function first20BuyersMatrix(logs, pairAddress, balances, tokenAddress) {
     }
   }
 
-  // 2) For those addresses, compute totalBought (mint or AMM inflows)
-  const targetAddrs = new Set(firstSeen.keys());
+  // 2) for those 20 wallets, sum all later receives from mint/LP = totalBought
+  const target = new Set(firstSeen.keys());
   const totals = new Map(); // addr -> { totalBought, buysN }
-  for (const addr of targetAddrs) totals.set(addr, { totalBought: 0n, buysN: 0 });
+  for (const a of target) totals.set(a, { totalBought: 0n, buysN: 0 });
 
   for (const lg of logs) {
     const from = topicToAddr(lg.topics[1]);
     const to   = topicToAddr(lg.topics[2]);
-    if (!targetAddrs.has(to)) continue;
-    const isReceiveFromMint = from === ZERO;
-    const isReceiveFromAMM  = pair && from === pair;
-    if (!isReceiveFromMint && !isReceiveFromAMM) continue;
+    if (!target.has(to)) continue;
+    const isMintIn = from === ZERO;
+    const isLPIn   = pair && from === pair;
+    if (!isMintIn && !isLPIn) continue;
 
-    const x = totals.get(to);
-    x.totalBought += toBig(lg.data);
-    x.buysN += 1;
+    const t = totals.get(to);
+    t.totalBought += toBig(lg.data);
+    t.buysN += 1;
   }
 
-  // 3) Build rows in the same chronological order as first seen
-  const ordered = [...firstSeen.entries()]
-    .sort((a, b) => a[1].firstBuyBlock - b[1].firstBuyBlock)
+  // 3) build ordered output (earliest first) + status from final balance vs totalBought
+  const out = [...firstSeen.entries()]
+    .sort((a,b)=> a[1].firstBuyBlock - b[1].firstBuyBlock)
     .map(([address, info]) => {
-      const tot = totals.get(address) || { totalBought: 0n, buysN: 0 };
+      const t = totals.get(address) || { totalBought: 0n, buysN: 0 };
       const balNow = balances.get(address.toLowerCase()) || 0n;
 
       let status = 'hold';
       if (balNow === 0n) {
         status = 'sold all';
-      } else if (balNow < tot.totalBought) {
+      } else if (balNow < t.totalBought) {
         status = 'sold some';
-      } else if (tot.buysN > 1 || tot.totalBought > info.firstBuyAmt) {
+      } else if (t.buysN > 1 || t.totalBought > info.firstBuyAmt) {
         status = 'bought more';
-      } else {
-        status = 'hold';
-      }
+      } // else keep 'hold'
 
       return {
         address,
         status,
-        // useful if you later want to show numbers:
+        // uncomment if you want to display amounts later
         // firstBuy: info.firstBuyAmt.toString(),
-        // totalBought: tot.totalBought.toString(),
-        // currentBalance: balNow.toString(),
+        // totalBought: t.totalBought.toString(),
+        // balanceNow: balNow.toString(),
       };
     });
 
-  return ordered;
+  return out;
 }
 
 
