@@ -271,22 +271,19 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
   return { holdersTop20: top20, top10CombinedPct, holdersCount: rows.length };
 }
 
-// Buyers: first 20 unique recipients (mint or AMM), status from final balance vs total bought
+// First 20 recipients (any sender), status from final balance vs total bought
 function first20BuyersMatrix(logs, pairAddress, balances) {
   const ZERO = '0x0000000000000000000000000000000000000000';
   const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
 
-  // 1) earliest 20 unique recipients (from mint OR from LP). Exclude LP/dead.
+  // 1) earliest 20 unique recipients (exclude LP + dead)
   const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
   for (const lg of logs) {
     const from = topicToAddr(lg.topics[1]);
     const to   = topicToAddr(lg.topics[2]);
     if (DEAD.has(to)) continue;
-    if (pair && to === pair) continue;              // never count LP itself
-    const isMintIn = from === ZERO;
-    const isLPIn   = pair && from === pair;
-    if (!isMintIn && !isLPIn) continue;
-
+    if (pair && to === pair) continue;           // never count LP itself
+    // treat ANY inbound as the "first receive" (mint, LP, creator, distributor, etc.)
     if (!firstSeen.has(to)) {
       firstSeen.set(to, {
         firstBuyBlock: Number(lg.blockNumber),
@@ -296,27 +293,22 @@ function first20BuyersMatrix(logs, pairAddress, balances) {
     }
   }
 
-  // 2) for those 20 wallets, sum all later receives from mint/LP = totalBought
-  const target = new Set(firstSeen.keys());
-  const totals = new Map(); // addr -> { totalBought, buysN }
-  for (const a of target) totals.set(a, { totalBought: 0n, buysN: 0 });
+  // 2) for those addresses, sum ALL inbound transfers as "totalBought"
+  const targets = new Set(firstSeen.keys());
+  const totals  = new Map(); // addr -> { totalBought, buysN }
+  for (const a of targets) totals.set(a, { totalBought: 0n, buysN: 0 });
 
   for (const lg of logs) {
-    const from = topicToAddr(lg.topics[1]);
-    const to   = topicToAddr(lg.topics[2]);
-    if (!target.has(to)) continue;
-    const isMintIn = from === ZERO;
-    const isLPIn   = pair && from === pair;
-    if (!isMintIn && !isLPIn) continue;
-
+    const to = topicToAddr(lg.topics[2]);
+    if (!targets.has(to)) continue;
     const t = totals.get(to);
     t.totalBought += toBig(lg.data);
     t.buysN += 1;
   }
 
-  // 3) build ordered output (earliest first) + status from final balance vs totalBought
+  // 3) ordered output + status
   const out = [...firstSeen.entries()]
-    .sort((a,b)=> a[1].firstBuyBlock - b[1].firstBuyBlock)
+    .sort((a,b) => a[1].firstBuyBlock - b[1].firstBuyBlock)
     .map(([address, info]) => {
       const t = totals.get(address) || { totalBought: 0n, buysN: 0 };
       const balNow = balances.get(address.toLowerCase()) || 0n;
@@ -330,15 +322,11 @@ function first20BuyersMatrix(logs, pairAddress, balances) {
         status = 'bought more';
       } // else keep 'hold'
 
-      return {
-        address,
-        status,
-      };
+      return { address, status };
     });
 
   return out;
 }
-
 
 // ---------- Redis / BullMQ ----------
 const bullRedis = new Redis(process.env.REDIS_URL, {
