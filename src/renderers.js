@@ -63,19 +63,22 @@ export function renderOverview(data) {
   const creatorAddr = data.creator?.address ? esc(shortAddr(data.creator.address)) : 'unknown';
 
   const lines = [
-    `🪙 ${moonshotHeaderIcon}<b>Token Overview — ${name}${sym ? ` (${sym})` : ''}</b>`,
+    `${moonshotHeaderIcon}<b>${name}${sym ? ` (${sym})` : ''}</b>`,
     `CA:\n<code>${ca}</code>`,
     moonshotLine,
     ``,
+    (m ? `${capLabel}: <b>${esc(money(m.marketCap))}</b>` : undefined),
     (m && typeof m.priceUsd === 'number')
       ? `Price: <b>${esc(money(m.priceUsd, 8))}</b>   ${t24}`
       : `<i>No market data yet (no Abstract pair indexed)</i>`,
-    (m ? `Volume: 5m <b>${esc(money(vol.m5))}</b> • 1h <b>${esc(money(vol.h1))}</b> • 6h <b>${esc(money(vol.h6))}</b> • 24h <b>${esc(money(vol.h24))}</b>` : undefined),
-    (m ? `Change: 5m <b>${esc(pct(chg.m5))}</b> • 1h <b>${esc(pct(chg.h1))}</b> • 6h <b>${esc(pct(chg.h6))}</b> • 24h <b>${esc(pct(chg.h24))}</b>` : undefined),
-    (m ? `${capLabel}: <b>${esc(money(m.marketCap))}</b>` : undefined),
+    `Volume:`,
+    (m ? `5m <b>${esc(money(vol.m5))}</b> • 1h <b>${esc(money(vol.h1))}</b> • 6h <b>${esc(money(vol.h6))}</b> • 24h <b>${esc(money(vol.h24))}</b>` : undefined),
+    `Change:`,
+    (m ? `5m <b>${esc(pct(chg.m5))}</b> • 1h <b>${esc(pct(chg.h1))}</b> • 6h <b>${esc(pct(chg.h6))}</b> • 24h <b>${esc(pct(chg.h24))}</b>` : undefined),
+   
     holdersLine,
-    `Creator: <code>${creatorAddr}</code> — <b>${esc(pct(data.creator?.percent))}</b>`,
     top10Line,
+    `Creator: <code>${creatorAddr}</code> — <b>${esc(pct(data.creator?.percent))}</b>`,
     burnedLine,
     ``,
     `<i>Pick a section:</i>`,
