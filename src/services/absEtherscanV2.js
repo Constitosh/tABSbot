@@ -1,216 +1,205 @@
 // src/services/absEtherscanV2.js
-// Abstract (chainid=2741) via Etherscan v2.
-// Requires ETHERSCAN_V2_BASE and ETHERSCAN_API_KEY in env.
+// Etherscan v2 helpers for Abstract (chainid=2741)
 
-import '../configEnv.js';
-import axios from 'axios';
+const BASE = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
+const CHAIN_ID = process.env.ETHERSCAN_CHAIN_ID || '2741';
+const API_KEY = process.env.ETHERSCAN_API_KEY || process.env.ETHERSCAN_APIKEY || '';
 
-const BASE = (process.env.ETHERSCAN_V2_BASE || 'https://api.etherscan.io/v2/api').replace(/\/+$/, '');
-const KEY = process.env.ETHERSCAN_API_KEY || '';
-const CHAIN_ID = 2741; // Abstract
-const PAGE_SIZE = 1000;
-
-const ZERO = '0x0000000000000000000000000000000000000000';
-const DEAD = '0x000000000000000000000000000000000000dEaD';
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function buildURL(params) {
-  const u = new URL(BASE);
-  u.searchParams.set('chainid', String(CHAIN_ID));
-  if (KEY) u.searchParams.set('apikey', KEY);
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, String(v));
-  }
-  return u.toString();
+function qs(obj) {
+  return Object.entries(obj)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join('&');
 }
 
-async function call(params, { timeout = 15000 } = {}) {
-  const url = buildURL(params);
+async function esv2(module, action, params = {}) {
+  const url = `${BASE}?${qs({
+    chainid: CHAIN_ID,
+    module,
+    action,
+    apikey: API_KEY,
+    ...params,
+  })}`;
   console.log('[ESV2]', url);
-  const { data } = await axios.get(url, { timeout });
-  if (!data) throw new Error('EtherscanV2: empty response');
-  // v2 error shape
-  if (data.status === '0' && typeof data.result === 'string') {
-    throw new Error(`EtherscanV2: ${data.result}`);
+  const r = await fetch(url);
+  const t = await r.text();
+  try {
+    const j = JSON.parse(t);
+    // v2 returns { status, message, result }
+    if (j.status === '1' || j.message === 'OK') return j.result;
+    throw new Error(j?.result || j?.message || 'Etherscan v2 error');
+  } catch (e) {
+    throw new Error(`Etherscan v2 error: ${t}`);
   }
-  return data.result ?? data;
 }
 
-/** All ERC20 transfers for a token (ascending pagination). */
-export async function getAllTokenTransfers(ca, { maxPages = 50 } = {}) {
-  const out = [];
-  for (let page = 1; page <= maxPages; page++) {
-    const res = await call({
-      module: 'account',
-      action: 'tokentx',
-      contractaddress: ca,
-      page,
-      offset: PAGE_SIZE,
-      startblock: 0,
-      endblock: 999999999,
-      sort: 'asc',
-    }).catch(async (e) => {
-      if (/rate limit/i.test(String(e?.message))) {
-        await sleep(300);
-        return null;
-      }
-      throw e;
-    });
+/* ---------------- core endpoints ---------------- */
 
-    if (!res) continue;
+// Transfer logs (topic0 = ERC20 Transfer)
+const TRANSFER_TOPIC =
+  '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 
-    const arr = Array.isArray(res) ? res : (res?.result || []);
-    if (!arr.length) break;
+export async function getTransferLogsPage(address, page = 1, offset = 1000) {
+  return esv2('logs', 'getLogs', {
+    address,
+    topic0: TRANSFER_TOPIC,
+    fromBlock: 0,
+    toBlock: 'latest',
+    page,
+    offset,
+  });
+}
 
-    out.push(
-      ...arr.map((t) => ({
-        blockNumber: Number(t.blockNumber),
-        timeStamp: Number(t.timeStamp || t.blockTimestamp || 0),
-        hash: t.hash,
-        from: (t.from || '').toLowerCase(),
-        to: (t.to || '').toLowerCase(),
-        value: String(t.value || '0'),
-        tokenDecimal: Number(t.tokenDecimal || 18),
-        tokenSymbol: t.tokenSymbol || '',
-      }))
-    );
-
-    if (arr.length < PAGE_SIZE) break;
-    await sleep(150);
+export async function getAllTransferLogs(address, { maxPages = 25, pageSize = 1000 } = {}) {
+  const all = [];
+  for (let p = 1; p <= maxPages; p++) {
+    const batch = await getTransferLogsPage(address, p, pageSize);
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    all.push(...batch);
+    if (batch.length < pageSize) break;
   }
-  return out;
+  return all;
 }
 
-/** Total supply — return as STRING (do not coerce to number). */
-export async function getTokenTotalSupply(ca) {
-  const res = await call({
-    module: 'token',
-    action: 'tokensupply',
-    contractaddress: ca,
+export async function getContractCreation(address) {
+  const res = await esv2('contract', 'getcontractcreation', {
+    contractaddresses: address,
   });
-  // Prefer stringy result; fallback through common fields.
-  const s =
-    (typeof res === 'string' && res) ||
-    res?.result ||
-    res?.TokenSupply ||
-    '0';
-  return String(s);
-}
-
-/** Contract creator info. */
-export async function getContractCreator(ca) {
-  const res = await call({
-    module: 'contract',
-    action: 'getcontractcreation',
-    contractaddresses: ca,
-  });
-  const row = Array.isArray(res) ? res[0] : res;
+  // v2 returns array like [{ contractAddress, contractCreator, txHash }]
+  const row = Array.isArray(res) ? res[0] : null;
   return {
-    contractAddress: row?.contractAddress || ca,
-    creatorAddress: (row?.contractCreator || row?.creator || '').toLowerCase() || null,
-    txHash: row?.txHash || row?.transactionHash || null,
+    contractAddress: address.toLowerCase(),
+    creatorAddress: (row?.contractCreator || row?.creatorAddress || '').toLowerCase() || null,
+    txHash: row?.txHash || null,
   };
 }
 
-/** Build balances from transfers (BigInt map) + decimals heuristic. */
-export function buildBalanceMap(transfers) {
+// Always use stats.tokensupply which returns a full integer string (no scientific notation)
+export async function getTokenTotalSupply(address) {
+  const res = await esv2('stats', 'tokensupply', { contractaddress: address });
+  // result is a decimal string
+  if (typeof res !== 'string') throw new Error('tokensupply: unexpected result');
+  return res;
+}
+
+/* ---------------- decoding + compute ---------------- */
+
+function topicAddr(t) {
+  // topics are 0x + 64 hex; right-most 40 belong to the addr
+  if (typeof t !== 'string' || t.length < 66) return null;
+  return ('0x' + t.slice(26)).toLowerCase();
+}
+function hexToBigInt(h) {
+  if (!h || h === '0x') return 0n;
+  return BigInt(h);
+}
+
+// Build balances map from Transfer logs (mint/burn supported)
+export function buildBalanceMapFromLogs(logs) {
   const balances = new Map(); // address -> BigInt
-  let decimals = 18;
+  for (const L of logs) {
+    const from = topicAddr(L.topics?.[1]);
+    const to = topicAddr(L.topics?.[2]);
+    const value = hexToBigInt(L.data);
 
-  for (const t of transfers) {
-    const dec = Number(t.tokenDecimal || 18);
-    if (Number.isFinite(dec)) decimals = dec;
-    const v = BigInt(String(t.value || '0'));
-    const from = (t.from || '').toLowerCase();
-    const to = (t.to || '').toLowerCase();
-
-    if (from && from !== ZERO) balances.set(from, (balances.get(from) || 0n) - v);
-    if (to && to !== ZERO) balances.set(to, (balances.get(to) || 0n) + v);
+    if (from && value) {
+      balances.set(from, (balances.get(from) || 0n) - value);
+    }
+    if (to && value) {
+      balances.set(to, (balances.get(to) || 0n) + value);
+    }
   }
-  return { balances, decimals };
+  return { balances, decimals: 18 }; // decimals best-effort (on-chain read avoided)
 }
 
-function pct(part, total) {
-  return total > 0n ? Number((part * 1000000n) / total) / 10000 : 0;
+const NULL_ADDR = '0x0000000000000000000000000000000000000000';
+const DEAD_ADDR = '0x000000000000000000000000000000000000dead';
+
+function isBurn(a) {
+  if (!a) return false;
+  const x = a.toLowerCase();
+  return x === NULL_ADDR || x === DEAD_ADDR;
 }
 
-/** Summarize holders (top20 %, top10 combined %, burned %, holdersCount). */
-export function summarizeHoldersFromBalances(balances, totalSupplyRaw, decimals) {
-  const rows = [];
-  for (const [addr, raw] of balances.entries()) {
-    if (!addr || raw === 0n) continue;
-    rows.push({ address: addr, raw });
+export function summarizeHoldersFromBalances(
+  balances,
+  totalSupplyStr,
+  { exclude = [] } = {}
+) {
+  const tot = BigInt(totalSupplyStr);
+  const skip = new Set([...exclude.map((a) => a?.toLowerCase()).filter(Boolean), NULL_ADDR, DEAD_ADDR]);
+
+  const entries = [];
+  let burned = 0n;
+
+  for (const [addr, bal] of balances.entries()) {
+    if (bal <= 0n) continue;
+    if (isBurn(addr)) {
+      burned += bal;
+      continue;
+    }
+    if (skip.has(addr.toLowerCase())) continue;
+    entries.push([addr, bal]);
   }
-  rows.sort((a, b) => (a.raw < b.raw ? 1 : -1));
 
-  // If tokensupply == 0, infer as sum of positive balances
-  let inferredTotal = rows.reduce((s, r) => (r.raw > 0n ? s + r.raw : s), 0n);
-  let total = 0n;
-  try {
-    total = BigInt(String(totalSupplyRaw || '0'));
-  } catch {
-    total = 0n;
-  }
-  if (total === 0n && inferredTotal > 0n) total = inferredTotal;
-
-  const burnedRaw = balances.get(DEAD) || 0n;
-
-  const holdersTop20 = rows.slice(0, 20).map((r) => ({
-    address: r.address,
-    percent: pct(r.raw, total),
+  entries.sort((a, b) => (b[1] > a[1] ? 1 : b[1] < a[1] ? -1 : 0));
+  const top20 = entries.slice(0, 20).map(([address, bal]) => ({
+    address,
+    percent: tot > 0n ? Number((bal * 1000000n) / tot) / 10000 : 0, // two decimals
   }));
 
-  const top10Raw = rows.slice(0, 10).reduce((s, r) => s + r.raw, 0n);
-  const top10CombinedPct = pct(top10Raw, total);
-  const burnedPct = pct(burnedRaw, total);
+  const top10CombinedPct = entries
+    .slice(0, 10)
+    .reduce((acc, [, bal]) => acc + (tot > 0n ? Number((bal * 1000000n) / tot) / 10000 : 0), 0);
 
-  const holdersCount = rows.filter((r) => r.raw > 0n).length;
+  const burnedPct = tot > 0n ? Number((burned * 1000000n) / tot) / 10000 : 0;
 
-  return { holdersTop20, top10CombinedPct, burnedPct, holdersCount, decimals };
+  return {
+    holdersTop20: top20,
+    top10CombinedPct,
+    burnedPct,
+    holdersCount: entries.length, // after skipping zeros/burn/pair(s)
+  };
 }
 
-/** First 20 buyers status, skipping first 2 receivers (LP/mint heuristic). */
-export function first20BuyersStatus(transfers, balanceMap) {
-  const firstSeen = [];
-  const seen = new Set();
+// First 20 buyers: creator first, then first 19 unique recipients (excluding pair & burn)
+export function first20BuyersStatus({ logs, balances, creator, pair }) {
+  const pairSet = new Set((Array.isArray(pair) ? pair : [pair]).filter(Boolean).map((x) => x.toLowerCase()));
+  const uniq = [];
+  const firstRecv = new Map(); // addr -> BigInt initial received
 
-  for (const t of transfers) {
-    const to = t.to;
-    if (!to || to === ZERO) continue;
-    if (seen.has(to)) continue;
-    seen.add(to);
-    firstSeen.push({ address: to, amountRaw: String(t.value || '0'), decimals: t.tokenDecimal || 18 });
-    if (firstSeen.length >= 22) break; // will drop first 2
-  }
+  // logs come back time-ordered asc from our fetch; if not, sort by blockNumber/logIndex
+  const sorted = [...logs].sort((a, b) => {
+    const bn = (x) => Number(x.blockNumber || x.blocknumber || 0);
+    const li = (x) => Number(x.logIndex || x.logindex || 0);
+    return bn(a) - bn(b) || li(a) - li(b);
+  });
 
-  const list = firstSeen.slice(2, 22); // 20
-  const out = [];
+  // Seed with creator first
+  if (creator) uniq.push(creator.toLowerCase());
 
-  const toNum = (raw, d = 18) => {
-    try {
-      const v = BigInt(String(raw));
-      const D = 10n ** BigInt(d);
-      const whole = v / D;
-      const frac = v % D;
-      const fs = frac.toString().padStart(d, '0').replace(/0+$/, '').slice(0, 6);
-      return Number(whole.toString() + (fs ? '.' + fs : ''));
-    } catch {
-      return 0;
+  for (const L of sorted) {
+    const to = topicAddr(L.topics?.[2]);
+    if (!to || isBurn(to) || pairSet.has(to.toLowerCase())) continue;
+    if (!uniq.includes(to.toLowerCase())) {
+      uniq.push(to.toLowerCase());
+      // initial received in this event
+      firstRecv.set(to.toLowerCase(), hexToBigInt(L.data));
     }
-  };
-
-  for (const r of list) {
-    const start = toNum(r.amountRaw, r.decimals);
-    const currRaw = balanceMap.get(r.address) || 0n;
-    const curr = toNum(currRaw.toString(), r.decimals);
-    let status = 'HOLD';
-    const EPS = 1e-9;
-    if (curr <= EPS) status = 'SOLD ALL';
-    else if (curr > start + EPS) status = 'BOUGHT MORE';
-    else if (curr + EPS < start) status = 'SOLD SOME';
-    out.push({ address: r.address, status });
+    if (uniq.length >= 20) break;
   }
 
-  return out;
+  const list = uniq.slice(0, 20).map((addr) => {
+    const initial = firstRecv.get(addr) || 0n;
+    const current = balances.get(addr) || 0n;
+
+    let status = 'hold';
+    if (current === 0n) status = 'sold';
+    else if (current > initial) status = 'bought more';
+    else if (current < initial) status = 'sold some';
+
+    return { address: addr, status };
+  });
+
+  return list;
 }
