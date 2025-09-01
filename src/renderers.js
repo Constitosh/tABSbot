@@ -2,7 +2,7 @@
 // HTML renderers for Telegram UI (safe against MarkdownV2 issues)
 import { esc, pct, money, shortAddr, trendBadge } from './ui_html.js';
 
-// tiny text progress bar (10 slots)
+/** tiny text progress bar (10 slots) */
 function progressBar(pctNum) {
   if (typeof pctNum !== 'number' || !isFinite(pctNum)) return null;
   const p = Math.max(0, Math.min(100, pctNum));
@@ -12,7 +12,7 @@ function progressBar(pctNum) {
 }
 
 /**
- * Overview screen (styled like your screenshot)
+ * Overview screen
  */
 export function renderOverview(data) {
   const m = data.market || null;
@@ -25,7 +25,7 @@ export function renderOverview(data) {
   const chg = m?.priceChange || {};
   const capLabel = (m?.marketCapSource === 'fdv') ? 'FDV (as cap)' : 'Market Cap';
 
-  // Moonshot detection
+  // ---- Moonshot detection & line ----
   const isMoonshot =
     !!m?.launchPadPair ||
     String(m?.dexId || '').toLowerCase() === 'moonshot' ||
@@ -38,21 +38,17 @@ export function renderOverview(data) {
   // Header icon: 🌙 only if moonshot
   const moonshotHeaderIcon = isMoonshot ? '🌙 ' : '';
 
-  // “Moonshot: …” line
+  // Dedicated Moonshot line
   const moonshotLine = isMoonshot
     ? (moonProgress != null
         ? `Moonshot: <b>Yes</b>  ${esc(progressBar(moonProgress))}`
         : `Moonshot: <b>Yes</b>`)
     : `Moonshot: <b>No</b>`;
 
-  // Compose single-line rows for Volume / Change with pipes
-  const volRow = `5m <b>${esc(money(vol.m5))}</b> | 1h <b>${esc(money(vol.h1))}</b> | 6h <b>${esc(money(vol.h6))}</b> | 24h <b>${esc(money(vol.h24))}</b>`;
-  const chgRow = `5m <b>${esc(pct(chg.m5))}</b> | 1h <b>${esc(pct(chg.h1))}</b> | 6h <b>${esc(pct(chg.h6))}</b> | 24h <b>${esc(pct(chg.h24))}</b>`;
-
   const holdersLine =
     typeof data.holdersCount === 'number'
       ? `Holders: <b>${data.holdersCount.toLocaleString()}</b>`
-      : `Holders: <i>N/A</i>`;
+      : `Holders: <i>N/A (explorer)</i>`;
 
   const top10Line =
     data.top10CombinedPct != null
@@ -67,41 +63,41 @@ export function renderOverview(data) {
   const creatorAddr = data.creator?.address ? esc(shortAddr(data.creator.address)) : 'unknown';
 
   const lines = [
-    // Title
-    `🪙 ${moonshotHeaderIcon}<b>${name}${sym ? ` (${sym})` : ''}</b>`,
-    // CA on its own line
-    `<code>${ca}</code>`,
-    // Moonshot line with optional progress bar
+    `${moonshotHeaderIcon}<b>${name}${sym ? ` (${sym})` : ''}</b>`,
+    `\n<code>${ca}</code>`,
     moonshotLine,
     ``,
-    // FDV/Cap BEFORE price
+    ``,
     (m ? `${capLabel}: <b>${esc(money(m.marketCap))}</b>` : undefined),
     (m && typeof m.priceUsd === 'number')
       ? `Price: <b>${esc(money(m.priceUsd, 8))}</b>   ${t24}`
       : `<i>No market data yet (no Abstract pair indexed)</i>`,
     ``,
-    (m ? `Volume:` : undefined),
-    (m ? volRow : undefined),
     ``,
-    (m ? `Change:` : undefined),
-    (m ? chgRow : undefined),
+    `Volume:`,
+    (m ? `5m <b>${esc(money(vol.m5))}</b> • 1h <b>${esc(money(vol.h1))}</b> • 6h <b>${esc(money(vol.h6))}</b> • 24h <b>${esc(money(vol.h24))}</b>` : undefined),
+    `Change:`,
+    (m ? `5m <b>${esc(pct(chg.m5))}</b> • 1h <b>${esc(pct(chg.h1))}</b> • 6h <b>${esc(pct(chg.h6))}</b> • 24h <b>${esc(pct(chg.h24))}</b>` : undefined),
+    ``,
     ``,
     holdersLine,
-    `Top 10 combined: <b>${esc(pct(data.top10CombinedPct))}</b>`,
     `Creator: <code>${creatorAddr}</code> — <b>${esc(pct(data.creator?.percent))}</b>`,
-    `Burned: <b>${esc(pct(data.burnedPct))}</b>`,
+    top10Line,
+    burnedLine,
     ``,
-    `Pick a section:`,
-    `🟨 <b>Buyers</b> — first 20 buyers + status`,
-    ...(hasHolders(data) ? [`🟨 <b>Holders</b> — top 20 holder percentages`] : []),
     ``,
-    `Updated: ${esc(new Date(data.updatedAt).toLocaleString())}`,
-    `Source: Dexscreener | Explorer`
+    `<i>Pick a section:</i>`,
+    `• <b>Buyers</b> — first 20 buyers + status`,
+    ...(hasHolders(data) ? [`• <b>Holders</b> — top 20 holder percentages`] : []),
+    ``,
+    ``,
+    `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>`,
+    `<i>Source: Dexscreener · Explorer</i>`
   ].filter(Boolean);
 
   const text = lines.join('\n');
 
-  // Keyboard stays the same as before
+  // Keyboard (no extra moonshot link button anymore)
   const navRow = hasHolders(data)
     ? [
         { text:'🧑‍🤝‍🧑 Buyers',  callback_data:`buyers:${data.tokenAddress}:1` },
@@ -140,6 +136,7 @@ export function renderOverview(data) {
   return { text, extra: kb };
 }
 
+/**
  * Buyers screen with pagination
  * data.first20Buyers = [{ address, status, buys?, sells? }, ...]
  */
