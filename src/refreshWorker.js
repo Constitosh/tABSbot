@@ -259,69 +259,64 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
   return { holdersTop20: top20, top10CombinedPct, holdersCount: rows.length };
 }
 
-// Buyers matrix using final balances for status (accurate)
-function first20BuyersMatrix(logs, pairAddress, balances) {
-  if (!pairAddress) return [];
-  const pair = String(pairAddress).toLowerCase();
-  const buyers = new Map(); // addr -> { firstBuyBlock, firstBuyAmt, buysAmt, sellsAmt, buysN, sellsN }
+// Buyers: first 20 unique recipients (mint or AMM), then status by final balance vs total bought
+function first20BuyersMatrix(logs, pairAddress, balances, tokenAddress) {
+  const ZERO = '0x0000000000000000000000000000000000000000';
+  const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
+
+  // Sort is assumed done earlier. If not, uncomment:
+  // logs.sort((a, b) => (Number(a.blockNumber)-Number(b.blockNumber)) || (Number(a.logIndex)-Number(b.logIndex)));
+
+  // 1) Find first 20 unique recipients (excluding LP and dead)
+  const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
+  for (const lg of logs) {
+    const from = topicToAddr(lg.topics[1]);
+    const to   = topicToAddr(lg.topics[2]);
+    if (DEAD.has(to) || to === pair) continue;         // never count LP/dead as recipient
+    const isReceiveFromMint = from === ZERO;
+    const isReceiveFromAMM  = pair && from === pair;
+    if (!isReceiveFromMint && !isReceiveFromAMM) continue;
+
+    if (!firstSeen.has(to)) {
+      firstSeen.set(to, {
+        firstBuyBlock: Number(lg.blockNumber),
+        firstBuyAmt: toBig(lg.data),
+      });
+      if (firstSeen.size >= 20) break;
+    }
+  }
+
+  // 2) For those addresses, compute totalBought (mint or AMM inflows)
+  const targetAddrs = new Set(firstSeen.keys());
+  const totals = new Map(); // addr -> { totalBought, buysN }
+  for (const addr of targetAddrs) totals.set(addr, { totalBought: 0n, buysN: 0 });
 
   for (const lg of logs) {
     const from = topicToAddr(lg.topics[1]);
     const to   = topicToAddr(lg.topics[2]);
+    if (!targetAddrs.has(to)) continue;
+    const isReceiveFromMint = from === ZERO;
+    const isReceiveFromAMM  = pair && from === pair;
+    if (!isReceiveFromMint && !isReceiveFromAMM) continue;
 
-    // ignore dead/zero and pair self
-    if (DEAD.has(from) || DEAD.has(to)) continue;
-    if (from === pair && to === pair) continue;
-
-    const val = toBig(lg.data);
-
-    // buy = pair -> user
-    if (from === pair && to !== pair) {
-      const rec = buyers.get(to) || {
-        firstBuyBlock: Number(lg.blockNumber),
-        firstBuyAmt: 0n,
-        buysAmt: 0n,
-        sellsAmt: 0n,
-        buysN: 0,
-        sellsN: 0
-      };
-      if (rec.buysN === 0) rec.firstBuyAmt = val;
-      rec.firstBuyBlock = Math.min(rec.firstBuyBlock, Number(lg.blockNumber));
-      rec.buysAmt += val;
-      rec.buysN += 1;
-      buyers.set(to, rec);
-    }
-
-    // sell = user -> pair
-    if (to === pair && from !== pair) {
-      const rec = buyers.get(from) || {
-        firstBuyBlock: Number.MAX_SAFE_INTEGER,
-        firstBuyAmt: 0n,
-        buysAmt: 0n,
-        sellsAmt: 0n,
-        buysN: 0,
-        sellsN: 0
-      };
-      rec.sellsAmt += val;
-      rec.sellsN += 1;
-      buyers.set(from, rec);
-    }
+    const x = totals.get(to);
+    x.totalBought += toBig(lg.data);
+    x.buysN += 1;
   }
 
-  // Order by earliest first buy, take first 20 and label
-  const ordered = [...buyers.entries()]
-    .filter(([, r]) => r.buysN > 0) // must have bought at least once
+  // 3) Build rows in the same chronological order as first seen
+  const ordered = [...firstSeen.entries()]
     .sort((a, b) => a[1].firstBuyBlock - b[1].firstBuyBlock)
-    .slice(0, 20)
-    .map(([address, r]) => {
+    .map(([address, info]) => {
+      const tot = totals.get(address) || { totalBought: 0n, buysN: 0 };
       const balNow = balances.get(address.toLowerCase()) || 0n;
-      let status = 'hold';
 
+      let status = 'hold';
       if (balNow === 0n) {
         status = 'sold all';
-      } else if (r.sellsN > 0 && balNow < r.buysAmt) {
+      } else if (balNow < tot.totalBought) {
         status = 'sold some';
-      } else if (r.sellsN === 0 && (r.buysAmt > r.firstBuyAmt || r.buysN > 1)) {
+      } else if (tot.buysN > 1 || tot.totalBought > info.firstBuyAmt) {
         status = 'bought more';
       } else {
         status = 'hold';
@@ -330,9 +325,10 @@ function first20BuyersMatrix(logs, pairAddress, balances) {
       return {
         address,
         status,
-        // (optional debug numbers if you ever want to display)
-        // buys: r.buysN, sells: r.sellsN,
-        // buysAmt: r.buysAmt.toString(), sellsAmt: r.sellsAmt.toString(),
+        // useful if you later want to show numbers:
+        // firstBuy: info.firstBuyAmt.toString(),
+        // totalBought: tot.totalBought.toString(),
+        // currentBalance: balNow.toString(),
       };
     });
 
