@@ -2,6 +2,8 @@
 // HTML renderers for Telegram UI (safe against MarkdownV2 issues)
 import { esc, pct, money, shortAddr, trendBadge } from './ui_html.js';
 
+const MOONSHOT_ICON_URL = 'https://files.thefakerug.com/tabs/Ms.png';
+
 /**
  * Overview screen
  */
@@ -15,6 +17,31 @@ export function renderOverview(data) {
   const vol = m?.volume || {};
   const chg = m?.priceChange || {};
   const capLabel = (m?.marketCapSource === 'fdv') ? 'FDV (as cap)' : 'Market Cap';
+
+  // ---- Moonshot detection & line ----
+  const isMoonshot =
+    !!m?.launchPadPair ||                      // we annotate this in refreshWorker
+    String(m?.dexId || '').toLowerCase() === 'moonshot' ||
+    !!m?.moonshot;
+
+  // prefer DS progress if present; else show 100 if bonded (moonshot present on bonded tokens often reports 100)
+  const moonProgress = (typeof m?.moonshot?.progress === 'number')
+    ? Math.max(0, Math.min(100, Number(m.moonshot.progress)))
+    : (isMoonshot ? null : null);
+
+  // Optional label text to show “Moonshot” with progress
+  const moonshotHeaderIcon = isMoonshot
+    // Using a link placeholder (Telegram doesn't render inline <img>, but this gives a tiny clickable marker)
+    ? `<a href="${MOONSHOT_ICON_URL}">🟧</a>`
+    : '';
+
+  const moonshotLine = isMoonshot
+    ? (
+        moonProgress != null
+          ? `Moonshot: <b>${esc(moonProgress.toFixed(2))}%</b>`
+          : `Moonshot: <b>Yes</b>`
+      )
+    : null;
 
   const holdersLine =
     typeof data.holdersCount === 'number'
@@ -34,8 +61,11 @@ export function renderOverview(data) {
   const creatorAddr = data.creator?.address ? esc(shortAddr(data.creator.address)) : 'unknown';
 
   const lines = [
-    `🪙 <b>Token Overview — ${name}${sym ? ` (${sym})` : ''}</b>`,
+    // Header with optional Moonshot icon marker
+    `🪙 ${moonshotHeaderIcon} <b>Token Overview — ${name}${sym ? ` (${sym})` : ''}</b>`,
     `CA: <code>${ca}</code>`,
+    // Dedicated Moonshot line (if applicable)
+    (isMoonshot ? moonshotLine : undefined),
     ``,
     (m && typeof m.priceUsd === 'number')
       ? `Price: <b>${esc(money(m.priceUsd, 8))}</b>   ${t24}`
@@ -92,6 +122,11 @@ export function renderOverview(data) {
   if (typeof g === 'string' && g.length) linkRow.push({ text: 'Telegram',  url: g });
   if (typeof w === 'string' && w.length) linkRow.push({ text: 'Website',   url: w });
 
+  // If moonshot, add a small quick link to the icon (optional)
+  if (isMoonshot) {
+    linkRow.push({ text: '🟧 Moonshot', url: MOONSHOT_ICON_URL });
+  }
+
   if (linkRow.length) kb.reply_markup.inline_keyboard.unshift(linkRow);
 
   return { text, extra: kb };
@@ -99,7 +134,7 @@ export function renderOverview(data) {
 
 /**
  * Buyers screen with pagination
- * data.first20Buyers = [{ address, status }, ...]
+ * data.first20Buyers = [{ address, status, buys?, sells? }, ...]
  */
 export function renderBuyers(data, page = 1, pageSize = 10) {
   const start = (page - 1) * pageSize;
@@ -120,7 +155,7 @@ export function renderBuyers(data, page = 1, pageSize = 10) {
     ``,
     body,
     ``,
-    `Tip: Status compares current balance vs their first received amount.`,
+    `Tip: Status uses final balance vs buy/sell history.`,
     ``,
     `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>  ·  <i>Page ${page}/${totalPages}</i>`
   ].join('\n');
