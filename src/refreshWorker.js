@@ -271,7 +271,6 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
   return { holdersTop20: top20, top10CombinedPct, holdersCount: rows.length };
 }
 
-// First 20 recipients (any sender), status from final balance vs total bought
 // First recipients (any sender), status from final balance vs total bought.
 // On Moonshot: collect first 22, then drop the first 2 (LP + distributor), keep next 20.
 function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false } = {}) {
@@ -282,8 +281,7 @@ function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false }
   // 1) Earliest unique recipients (exclude LP + dead)
   const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
   for (const lg of logs) {
-    const from = topicToAddr(lg.topics[1]);
-    const to   = topicToAddr(lg.topics[2]);
+    const to = topicToAddr(lg.topics[2]);
 
     if (DEAD.has(to)) continue;
     if (pair && to === pair) continue; // never count the LP itself
@@ -362,6 +360,7 @@ export async function refreshToken(tokenAddress) {
     let ammPair = null;        // real on-chain LP (0x…)
     let launchPadPair = null;  // ":moon" pseudo-id (for UI only)
     let creatorAddr = null;
+    let isMoonshot = false;    // << declare here for later use
 
     try {
       const { summary } = await getDexscreenerTokenStats(ca);
@@ -374,7 +373,7 @@ export async function refreshToken(tokenAddress) {
 
       // Keep market as-is but annotate discovered pairs
       if (market) {
-        market.pairAddress = ammPair || market.pairAddress || null;  // prefer AMM
+        market.pairAddress   = ammPair || market.pairAddress || null;  // prefer AMM
         market.launchPadPair = launchPadPair || null;
       }
 
@@ -383,13 +382,13 @@ export async function refreshToken(tokenAddress) {
       // Preferred creator: tokens/v1
       creatorAddr = await getDexCreator(ca);
 
-// Flag if this token is Moonshot (used in buyers function)
-const isMoonshot =
-  !!market?.launchPadPair ||
-  String(market?.dexId || '').toLowerCase() === 'moonshot' ||
-  !!market?.moonshot;
+      // Flag if this token is Moonshot (used in buyers function)
+      isMoonshot =
+        !!market?.launchPadPair ||
+        String(market?.dexId || '').toLowerCase() === 'moonshot' ||
+        !!market?.moonshot;
 
-      // Fallback 1: dexscreener moonshot.creator (string address when present)
+      // Fallback 1: dexscreener moonshot.creator
       if (!creatorAddr) {
         const dsMoonCreator = market?.moonshot?.creator;
         if (dsMoonCreator && /^0x[a-fA-F0-9]{40}$/.test(dsMoonCreator)) {
@@ -482,8 +481,8 @@ const isMoonshot =
       }
       creatorPercent = (supply > 0n) ? Number((creatorBal * 1000000n) / supply) / 10000 : 0;
 
-      // Buyers: compute regardless of AMM pair (function handles pure-mint)
-      first20Buyers = first20BuyersMatrix(logs, ammPair, balances { isMoonshot });
+      // Buyers: compute regardless of AMM pair (function handles pure-mint / distributor)
+      first20Buyers = first20BuyersMatrix(logs, ammPair, balances, { isMoonshot });
     } catch (e) {
       console.log('[WORKER] compute failed:', e?.message || e);
     }
