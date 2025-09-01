@@ -139,6 +139,82 @@ export async function getDexscreenerTokenStats(contractAddress) {
     dexId,
   };
 
+
+  // src/services/dexscreener.js
+// Normalize Dexscreener Abstract response into a compact "market" object your renderers expect.
+
+function pickSocials(info) {
+  const socials = { twitter: '', telegram: '', website: '' };
+  if (Array.isArray(info?.socials)) {
+    for (const s of info.socials) {
+      if (s.type === 'twitter' && !socials.twitter) socials.twitter = s.url;
+      if (s.type === 'telegram' && !socials.telegram) socials.telegram = s.url;
+    }
+  }
+  if (Array.isArray(info?.websites)) {
+    const w = info.websites.find(Boolean);
+    if (w?.url && !socials.website) socials.website = w.url;
+  }
+  return socials;
+}
+
+export async function getDexscreenerTokenStats(contractAddress) {
+  const ca = contractAddress.toLowerCase();
+  const url = `https://api.dexscreener.com/tokens/v1/abstract/${ca}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Dexscreener HTTP ${r.status}`);
+  const arr = await r.json();
+  if (!Array.isArray(arr) || !arr.length) return null;
+
+  // choose the first pair (same base = our token)
+  const p = arr.find((x) => x?.baseToken?.address?.toLowerCase() === ca) || arr[0];
+
+  const info = p.info || {};
+  const socials = pickSocials(info);
+
+  const priceChange = {
+    m5: p?.priceChange?.m5 ?? null, // often undefined for tokens endpoint
+    h1: p?.priceChange?.h1 ?? null,
+    h6: p?.priceChange?.h6 ?? null,
+    h24: p?.priceChange?.h24 ?? null,
+  };
+
+  const volume = {
+    m5: Number(p?.volume?.m5 ?? 0),
+    h1: Number(p?.volume?.h1 ?? 0),
+    h6: Number(p?.volume?.h6 ?? 0),
+    h24: Number(p?.volume?.h24 ?? 0),
+  };
+
+  // prefer marketCap, fall back to fdv
+  const mcap = Number(p?.marketCap ?? 0) || Number(p?.fdv ?? 0);
+  const capSource = p?.marketCap ? 'mcap' : 'fdv';
+
+  return {
+    pairAddress: p.pairAddress?.toLowerCase() || null,
+    url: p.url || null,
+    name: p.baseToken?.name || 'Token',
+    symbol: p.baseToken?.symbol || '',
+    priceNative: Number(p?.priceNative ?? 0) || null,
+    priceUsd: Number(p?.priceUsd ?? 0) || null,
+    priceChange,
+    volume,
+    liquidity: { usd: Number(p?.liquidity?.usd ?? 0) || 0 },
+    marketCap: mcap || null,
+    fdv: Number(p?.fdv ?? 0) || null,
+    marketCapSource: capSource,
+    socials,
+    info: {
+      imageUrl: info.imageUrl || null,
+      openGraph: info.openGraph || null,
+    },
+    moonshot: {
+      creator: p?.moonshot?.creator?.toLowerCase() || null,
+    },
+  };
+}
+
+
   if (process.env.DS_DEBUG) {
     console.log('[DEX] selected pair:', JSON.stringify({
       chainId: best?.chainId,
