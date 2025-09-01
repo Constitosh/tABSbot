@@ -2,7 +2,14 @@
 // HTML renderers for Telegram UI (safe against MarkdownV2 issues)
 import { esc, pct, money, shortAddr, trendBadge } from './ui_html.js';
 
-const MOONSHOT_ICON_URL = 'https://files.thefakerug.com/tabs/Ms.png';
+/** tiny text progress bar (10 slots) */
+function progressBar(pctNum) {
+  if (typeof pctNum !== 'number' || !isFinite(pctNum)) return null;
+  const p = Math.max(0, Math.min(100, pctNum));
+  const filled = Math.round(p / 10);  // 0..10
+  const empty  = 10 - filled;
+  return `[${'█'.repeat(filled)}${'░'.repeat(empty)}] ${p.toFixed(2)}%`;
+}
 
 /**
  * Overview screen
@@ -20,38 +27,33 @@ export function renderOverview(data) {
 
   // ---- Moonshot detection & line ----
   const isMoonshot =
-    !!m?.launchPadPair ||                      // we annotate this in refreshWorker
+    !!m?.launchPadPair ||
     String(m?.dexId || '').toLowerCase() === 'moonshot' ||
     !!m?.moonshot;
 
-  // prefer DS progress if present; else show 100 if bonded (moonshot present on bonded tokens often reports 100)
   const moonProgress = (typeof m?.moonshot?.progress === 'number')
     ? Math.max(0, Math.min(100, Number(m.moonshot.progress)))
-    : (isMoonshot ? null : null);
-
-  // Optional label text to show “Moonshot” with progress
-  const moonshotHeaderIcon = isMoonshot
-    // Using a link placeholder (Telegram doesn't render inline <img>, but this gives a tiny clickable marker)
-    ? `<a href="${MOONSHOT_ICON_URL}">🟧</a>`
-    : '';
-
-  const moonshotLine = isMoonshot
-    ? (
-        moonProgress != null
-          ? `Moonshot: <b>${esc(moonProgress.toFixed(2))}%</b>`
-          : `Moonshot: <b>Yes</b>`
-      )
     : null;
+
+  // Header icon: 🌙 only if moonshot
+  const moonshotHeaderIcon = isMoonshot ? '🌙 ' : '';
+
+  // Dedicated Moonshot line
+  const moonshotLine = isMoonshot
+    ? (moonProgress != null
+        ? `Moonshot: <b>Yes</b>  ${esc(progressBar(moonProgress))}`
+        : `Moonshot: <b>Yes</b>`)
+    : `Moonshot: <b>No</b>`;
 
   const holdersLine =
     typeof data.holdersCount === 'number'
       ? `Holders: <b>${data.holdersCount.toLocaleString()}</b>`
-      : `Holders: <i>N/A (Etherscan free API)</i>`;
+      : `Holders: <i>N/A (explorer)</i>`;
 
   const top10Line =
     data.top10CombinedPct != null
       ? `Top 10 combined: <b>${esc(pct(data.top10CombinedPct))}</b>`
-      : `Top 10 combined: <i>N/A (Etherscan free API)</i>`;
+      : `Top 10 combined: <i>N/A</i>`;
 
   const burnedLine =
     data.burnedPct != null
@@ -61,11 +63,9 @@ export function renderOverview(data) {
   const creatorAddr = data.creator?.address ? esc(shortAddr(data.creator.address)) : 'unknown';
 
   const lines = [
-    // Header with optional Moonshot icon marker
-    `🪙 ${moonshotHeaderIcon} <b>Token Overview — ${name}${sym ? ` (${sym})` : ''}</b>`,
-    `CA: <code>${ca}</code>`,
-    // Dedicated Moonshot line (if applicable)
-    (isMoonshot ? moonshotLine : undefined),
+    `🪙 ${moonshotHeaderIcon}<b>Token Overview — ${name}${sym ? ` (${sym})` : ''}</b>`,
+    `CA:\n<code>${ca}</code>`,
+    moonshotLine,
     ``,
     (m && typeof m.priceUsd === 'number')
       ? `Price: <b>${esc(money(m.priceUsd, 8))}</b>   ${t24}`
@@ -83,12 +83,12 @@ export function renderOverview(data) {
     ...(hasHolders(data) ? [`• <b>Holders</b> — top 20 holder percentages`] : []),
     ``,
     `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>`,
-    `<i>Source: Dexscreener · Etherscan</i>`
+    `<i>Source: Dexscreener · Explorer</i>`
   ].filter(Boolean);
 
   const text = lines.join('\n');
 
-  // Keyboard
+  // Keyboard (no extra moonshot link button anymore)
   const navRow = hasHolders(data)
     ? [
         { text:'🧑‍🤝‍🧑 Buyers',  callback_data:`buyers:${data.tokenAddress}:1` },
@@ -121,11 +121,6 @@ export function renderOverview(data) {
   if (typeof t === 'string' && t.length) linkRow.push({ text: '𝕏 Twitter', url: t });
   if (typeof g === 'string' && g.length) linkRow.push({ text: 'Telegram',  url: g });
   if (typeof w === 'string' && w.length) linkRow.push({ text: 'Website',   url: w });
-
-  // If moonshot, add a small quick link to the icon (optional)
-  if (isMoonshot) {
-    linkRow.push({ text: '🟧 Moonshot', url: MOONSHOT_ICON_URL });
-  }
 
   if (linkRow.length) kb.reply_markup.inline_keyboard.unshift(linkRow);
 
@@ -196,7 +191,7 @@ export function renderHolders(data, page = 1, pageSize = 10) {
         const n = String(start + i + 1).padStart(2, '0');
         return `${n}. <code>${esc(shortAddr(h.address))}</code> — <b>${esc(pct(h.percent))}</b>`;
       }).join('\n')
-    : '<i>Top holders are unavailable on the free Etherscan API.</i>';
+    : '<i>Top holders unavailable.</i>';
 
   const totalPages = Math.ceil((data.holdersTop20 || []).length / pageSize) || 1;
   const prev = Math.max(1, page - 1);
@@ -244,8 +239,7 @@ export function renderAbout() {
     `🤖 <b>tABS Tools</b>`,
     ``,
     `• Market: Dexscreener (Abstract)`,
-    `• Transfers & creator: Etherscan (free API)`,
-    `• Holders: N/A on Etherscan free API`,
+    `• Transfers & creator: Explorer`,
     `• Refresh cooldown: 30s`,
     `• Data cache: 3 minutes`,
     ``,
