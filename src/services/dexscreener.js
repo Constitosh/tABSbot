@@ -15,6 +15,40 @@ export async function fetchDexscreenerRaw(tokenAddress) {
   }
 
   const url = `https://api.dexscreener.com/latest/dex/tokens/${ca}`;
+  
+  // after fetching Dexscreener /latest/dex/tokens/<CA>
+const pairs = Array.isArray(data.pairs) ? data.pairs : [];
+const pairsAbstract = pairs.filter(p => p.chainId === 'abstract');
+
+// pick best AMM (real on-chain) pair
+const ammCandidates = pairsAbstract.filter(p => !String(p.pairAddress).includes(':moon'));
+const bestAMM = ammCandidates
+  .slice()
+  .sort((a, b) => ((b.volume?.h24 || 0) - (a.volume?.h24 || 0)) ||
+                  ((b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)))
+  [0] || null;
+
+// pick moonshot “pair” if present
+const moon = pairsAbstract.find(p => String(p.pairAddress).includes(':moon')) || null;
+
+return {
+  summary: {
+    name: baseTokenName,
+    symbol: baseTokenSymbol,
+    priceUsd: Number(bestAMM?.priceUsd ?? moon?.priceUsd ?? 0) || null,
+    volume: bestAMM?.volume || moon?.volume || null,
+    priceChange: bestAMM?.priceChange || moon?.priceChange || null,
+    fdv: Number(bestAMM?.fdv ?? moon?.fdv ?? 0) || null,
+    marketCapSource: bestAMM?.marketCap ? 'market' : (bestAMM?.fdv || moon?.fdv ? 'fdv' : null),
+
+    // IMPORTANT: expose both — one is real on-chain, the other is not.
+    pairAddress: bestAMM?.pairAddress || null,       // real 0x… (for buyers & LP exclusion)
+    launchPadPair: moon?.pairAddress || null,        // "0xTOKEN:moon" (for UI only)
+    dexId: bestAMM?.dexId || moon?.dexId || null,
+    chainId: 'abstract',
+  }
+};
+  
   const { data } = await axios.get(url, { timeout: 12000 });
 
   const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
