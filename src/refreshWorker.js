@@ -1,7 +1,7 @@
 // src/refreshWorker.js
 // Sources:
-//  • Market + creator: Dexscreener (pair + /tokens/v1/abstract/<CA> for creator)
-//  • On-chain math: Etherscan V2 (chainid=2741) — logs.getLogs, stats.tokensupply, account.tokenbalance
+//  • Dexscreener tokens API (market + pair + socials + image + creator)
+//  • Etherscan V2 (chainid=2741): logs.getLogs, stats.tokensupply, account.tokenbalance
 // Queue: BullMQ
 
 import './configEnv.js';
@@ -10,20 +10,57 @@ import Redis from 'ioredis';
 import { Worker, Queue } from 'bullmq';
 
 import { setJSON, withLock } from './cache.js';
-import { getDexscreenerTokenStats } from './services/dexscreener.js';
 
-// ---------- Dexscreener: creator helper ----------
-async function getDexCreator(ca) {
-  try {
-    const url = `https://api.dexscreener.com/tokens/v1/abstract/${ca}`;
-    const { data } = await axios.get(url, { timeout: 12_000 });
-    // API may return either an object or an array (be defensive)
-    if (data?.creator) return String(data.creator).toLowerCase();
-    if (Array.isArray(data) && data[0]?.creator) return String(data[0].creator).toLowerCase();
-    return null;
-  } catch {
-    return null;
+// ---------- Dexscreener helpers ----------
+async function getDexTokenSnapshot(ca) {
+  const url = `https://api.dexscreener.com/tokens/v1/abstract/${ca}`;
+  const { data } = await axios.get(url, { timeout: 15_000 });
+  // API returns an array with one pair object
+  if (!Array.isArray(data) || !data.length) return null;
+  const p = data[0];
+
+  // normalize socials into simple strings your renderer already expects
+  const socials = {};
+  if (Array.isArray(p.info?.socials)) {
+    for (const s of p.info.socials) {
+      if (s.type === 'twitter' && !socials.twitter) socials.twitter = s.url;
+      if (s.type === 'telegram' && !socials.telegram) socials.telegram = s.url;
+    }
   }
+  if (Array.isArray(p.info?.websites) && p.info.websites[0]?.url) {
+    socials.website = p.info.websites[0].url;
+  }
+
+  // market cap fallback logic
+  const marketCap = (typeof p.marketCap === 'number' && p.marketCap > 0) ? p.marketCap
+                  : (typeof p.fdv === 'number' && p.fdv > 0) ? p.fdv
+                  : null;
+  const marketCapSource = (marketCap && marketCap === p.fdv && p.marketCap !== p.fdv) ? 'fdv' : 'marketcap';
+
+  // ensure priceChange has an m5 field (dexscreener doesn’t provide it)
+  const priceChange = { m5: 0, h1: p.priceChange?.h1 ?? 0, h6: p.priceChange?.h6 ?? 0, h24: p.priceChange?.h24 ?? 0 };
+
+  return {
+    // fields your renderer uses
+    name: p.baseToken?.name || 'Token',
+    symbol: p.baseToken?.symbol || '',
+    priceUsd: p.priceUsd ? Number(p.priceUsd) : null,
+    volume: p.volume || {},              // {m5,h1,h6,h24}
+    priceChange,                         // {m5,h1,h6,h24}
+    liquidity: { usd: p.liquidity?.usd || null },
+    marketCap,
+    marketCapSource,
+    pairAddress: p.pairAddress || null,
+    url: p.url || null,
+
+    // extras for UI
+    info: {
+      imageUrl: p.info?.imageUrl || null,
+    },
+    socials,
+    // creator from Dexscreener (moonshot creator)
+    creator: p.moonshot?.creator ? String(p.moonshot.creator).toLowerCase() : null,
+  };
 }
 
 // ---------- Etherscan V2 client ----------
@@ -31,28 +68,27 @@ const ES_BASE  = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api'
 const ES_KEY   = process.env.ETHERSCAN_API_KEY;
 const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741'; // Abstract
 
-if (!ES_KEY) console.warn('[WORKER BOOT] ETHERSCAN_API_KEY is missing');
-const httpES = axios.create({ baseURL: ES_BASE, timeout: 25_000 });
+if (!ES_KEY) console.warn('[WORKER BOOT] ETHERSCAN_API_KEY missing');
 
-function esParams(params) {
-  return { params: { chainid: ES_CHAIN, apikey: ES_KEY, ...params } };
-}
-function esURL(params) {
+const httpES = axios.create({ baseURL: ES_BASE, timeout: 25_000 });
+const esParams = (p) => ({ params: { chainid: ES_CHAIN, apikey: ES_KEY, ...p } });
+const esURL = (p) => {
   const u = new URL(ES_BASE);
-  Object.entries({ chainid: ES_CHAIN, apikey: ES_KEY, ...params }).forEach(([k,v]) => u.searchParams.set(k, String(v)));
+  Object.entries({ chainid: ES_CHAIN, apikey: ES_KEY, ...p }).forEach(([k,v])=>u.searchParams.set(k,String(v)));
   return u.toString();
-}
-async function esGET(params, { logOnce = false, tag = '' } = {}) {
-  if (logOnce) console.log(`[ESV2] ${tag} ${esURL(params)}`);
+};
+
+async function esGET(params, { tag='', logOnce=false } = {}) {
+  if (logOnce) console.log('[ESV2]', tag, esURL(params));
   const { data } = await httpES.get('', esParams(params));
   if (data?.status !== '1') {
-    const msg = data?.result || data?.message || 'Unknown error';
+    const msg = data?.result || data?.message || 'Unknown';
     throw new Error(`Etherscan v2 error: ${msg}`);
   }
   return data.result;
 }
 
-// ERC-20 Transfer(address,address,uint256) topic
+// ERC-20 Transfer(address,address,uint256)
 const TOPIC_TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const DEAD = new Set([
   '0x0000000000000000000000000000000000000000',
@@ -63,18 +99,16 @@ const DEAD = new Set([
 const toBig = (x) => BigInt(String(x));
 const topicToAddr = (t) => ('0x' + String(t).slice(-40)).toLowerCase();
 
-// Pull all Transfer logs (paginated)
-async function getAllTransferLogs(token, { fromBlock = 0, toBlock = 'latest', pageStart = 1, maxPages = 50, offset = 1000 } = {}) {
+async function getAllTransferLogs(token, { fromBlock=0, toBlock='latest', pageStart=1, maxPages=50, offset=1000 } = {}) {
   const all = [];
   for (let page = pageStart; page < pageStart + maxPages; page++) {
-    const params = {
+    const batch = await esGET({
       module: 'logs',
       action: 'getLogs',
       address: token,
       topic0: TOPIC_TRANSFER,
-      fromBlock, toBlock, page, offset,
-    };
-    const batch = await esGET(params, { logOnce: page === pageStart, tag: '[logs]' });
+      fromBlock, toBlock, page, offset
+    }, { tag:'[logs]', logOnce: page === pageStart });
     if (!Array.isArray(batch) || batch.length === 0) break;
     all.push(...batch);
     if (batch.length < offset) break;
@@ -82,25 +116,23 @@ async function getAllTransferLogs(token, { fromBlock = 0, toBlock = 'latest', pa
   return all;
 }
 
-// Total supply (raw units string)
-async function getTokenTotalSupply(token) {
+async function getTotalSupply(token) {
   return String(await esGET(
-    { module: 'stats', action: 'tokensupply', contractaddress: token },
-    { logOnce: true, tag: '[supply]' }
+    { module:'stats', action:'tokensupply', contractaddress: token },
+    { tag:'[supply]', logOnce:true }
   ));
 }
 
-// Creator token balance (raw units string)
 async function getCreatorTokenBalance(token, creator) {
   if (!creator) return '0';
   return String(await esGET(
-    { module: 'account', action: 'tokenbalance', contractaddress: token, address: creator, tag: 'latest' },
-    { logOnce: true, tag: '[creatorBalance]' }
+    { module:'account', action:'tokenbalance', contractaddress: token, address: creator, tag:'latest' },
+    { tag:'[creatorBalance]', logOnce:true }
   ));
 }
 
-// Build balances by replaying Transfer logs
-function buildBalancesFromLogs(logs) {
+// ---------- on-chain maths ----------
+function buildBalancesFromLogs(logs, { exclude = new Set() } = {}) {
   const balances = new Map(); // addr -> bigint
   for (const lg of logs) {
     const from = topicToAddr(lg.topics[1]);
@@ -109,40 +141,67 @@ function buildBalancesFromLogs(logs) {
     if (!DEAD.has(from)) balances.set(from, (balances.get(from) || 0n) - val);
     if (!DEAD.has(to))   balances.set(to,   (balances.get(to)   || 0n) + val);
   }
-  for (const [a, v] of balances) if (v <= 0n) balances.delete(a);
+  // prune non-positives and excluded addresses (e.g., LP/pair)
+  for (const [a, v] of balances) {
+    if (v <= 0n || exclude.has(a)) balances.delete(a);
+  }
   return balances;
 }
 
-// First 20 buyers based on pairAddress
-function first20BuyersMatrix(logs, pairAddress) {
-  if (!pairAddress) return [];
-  const pair = String(pairAddress).toLowerCase();
-  const buyers = new Map(); // addr -> { firstBuy, buys, sells }
+function first20BuyersMatrix(logs, pairAddress, creatorAddr, balancesMap) {
+  const buyers = [];
+  const seen = new Set();
 
+  // 0) creator is always "first buyer" per your definition
+  if (creatorAddr) {
+    // figure out creator's first received amount
+    let firstBuy = 0n;
+    for (const lg of logs) {
+      const to = topicToAddr(lg.topics[2]);
+      if (to === creatorAddr) { firstBuy = toBig(lg.data); break; }
+    }
+    const current = balancesMap?.get(creatorAddr) || 0n;
+    let status = 'hold';
+    if (current === 0n) status = 'sold all';
+    else if (firstBuy && current > firstBuy) status = 'bought more';
+    else if (firstBuy && current < firstBuy) status = 'sold some';
+    buyers.push({ address: creatorAddr, status });
+    seen.add(creatorAddr);
+  }
+
+  if (!pairAddress) return buyers; // deck may not be live yet
+
+  const pair = String(pairAddress).toLowerCase();
+
+  // 1) scan logs and collect first 19 unique wallets that bought from pair
+  const temp = new Map(); // addr -> { firstBuy, buys, sells }
   for (const lg of logs) {
     const from = topicToAddr(lg.topics[1]);
     const to   = topicToAddr(lg.topics[2]);
     const val  = toBig(lg.data);
 
     if (from === pair) {
-      if (!buyers.has(to)) buyers.set(to, { firstBuy: val, buys: 0n, sells: 0n });
-      buyers.get(to).buys += val;
-      if (buyers.size >= 20) break;
+      if (!temp.has(to)) temp.set(to, { firstBuy: val, buys: 0n, sells: 0n });
+      temp.get(to).buys += val;
+      if (temp.size >= 1000) break; // safety
     } else if (to === pair) {
-      if (!buyers.has(from)) continue;
-      buyers.get(from).sells += val;
+      if (!temp.has(from)) continue;
+      temp.get(from).sells += val;
     }
   }
 
-  const out = [];
-  for (const [addr, { firstBuy, buys, sells }] of buyers) {
+  for (const [addr, { firstBuy, buys, sells }] of temp) {
+    if (seen.has(addr)) continue;
     let status = 'hold';
     if (sells === 0n && buys > firstBuy) status = 'bought more';
     else if (sells > 0n && sells < buys) status = 'sold some';
     else if (sells >= buys) status = 'sold all';
-    out.push({ address: addr, status });
+    buyers.push({ address: addr, status });
+    seen.add(addr);
+    if (buyers.length >= 20) break;
   }
-  return out.slice(0, 20);
+
+  return buyers.slice(0, 20);
 }
 
 // ---------- Redis / BullMQ ----------
@@ -163,42 +222,35 @@ export async function refreshToken(tokenAddress) {
     const t0 = Date.now();
     console.log('[WORKER] refreshToken start', ca);
 
-    // 1) Dexscreener (market + pair + creator from tokens API)
+    // 1) Dexscreener market + pair + socials + image + creator
     let market = null;
-    let pairAddress = null;
-    let creatorAddr = null;
     try {
-      const { summary } = await getDexscreenerTokenStats(ca);
-      market = summary || null;
-      pairAddress = summary?.pairAddress || null;
-      console.log('[WORKER] Dexscreener ok', ca, 'pair=', pairAddress, 'cap=', summary?.marketCap ?? summary?.fdv ?? 0);
-
-      // fetch creator from Dexscreener tokens/v1
-      creatorAddr = await getDexCreator(ca);
-      console.log('[WORKER] Dex creator', creatorAddr || 'unknown');
+      market = await getDexTokenSnapshot(ca);
+      console.log('[WORKER] Dex ok', ca, 'pair=', market?.pairAddress, 'cap=', market?.marketCap);
     } catch (e) {
-      console.log('[WORKER] Dexscreener failed:', e?.message || e);
+      console.log('[WORKER] Dex failed:', e?.message || e);
     }
 
-    // 2) Etherscan V2 pulls
+    // 2) Etherscan pulls
     let logs = [];
     let totalSupplyRaw = '0';
+    let creatorAddr = market?.creator || null;
     let creatorBalRaw = '0';
+
     try {
       [logs, totalSupplyRaw] = await Promise.all([
         getAllTransferLogs(ca, { maxPages: 50, offset: 1000 }),
-        getTokenTotalSupply(ca),
+        getTotalSupply(ca),
       ]);
-      // get creator balance if we have a creator address
       if (creatorAddr) {
         creatorBalRaw = await getCreatorTokenBalance(ca, creatorAddr);
       }
-      console.log('[WORKER] ESV2 ok', ca, 'logs=', logs.length, 'supply=', totalSupplyRaw, 'creatorBal=', creatorBalRaw);
+      console.log('[WORKER] ESV2 ok', ca, 'logs=', logs.length, 'supply=', totalSupplyRaw, 'creator=', creatorAddr, 'creatorBal=', creatorBalRaw);
     } catch (e) {
       console.log('[WORKER] ESV2 failed:', e?.message || e);
     }
 
-    // 3) Compute
+    // 3) Compute (exclude LP/pair from holders AND from top10%)
     let holdersTop20 = [];
     let holdersCount = null;
     let top10CombinedPct = 0;
@@ -207,9 +259,11 @@ export async function refreshToken(tokenAddress) {
     let creatorPercent = 0;
 
     try {
-      const balances = buildBalancesFromLogs(logs);
+      const pair = market?.pairAddress ? String(market.pairAddress).toLowerCase() : null;
+      const excludeSet = new Set(pair ? [pair] : []);
+      const balances = buildBalancesFromLogs(logs, { exclude: excludeSet });
 
-      // burned supply (sum transfers to dead addresses)
+      // burned = sum of transfers to dead addresses (not excluded)
       let burned = 0n;
       for (const lg of logs) {
         const to = topicToAddr(lg.topics[2]);
@@ -217,6 +271,7 @@ export async function refreshToken(tokenAddress) {
       }
 
       const supply = toBig(totalSupplyRaw || '0');
+
       const ranked = [...balances.entries()].sort((a, b) => (b[1] > a[1] ? 1 : -1));
       holdersCount = ranked.length;
 
@@ -227,27 +282,29 @@ export async function refreshToken(tokenAddress) {
 
       const top10Sum = ranked.slice(0, 10).reduce((a, [, v]) => a + v, 0n);
       top10CombinedPct = supply > 0n ? Number((top10Sum * 1000000n) / supply) / 10000 : 0;
+
       burnedPct = supply > 0n ? Number((burned * 1000000n) / supply) / 10000 : 0;
 
-      // creator percent from tokenbalance (preferred) ; falls back to balances map if needed
+      // creator %
       let creatorBal = 0n;
       try { creatorBal = toBig(creatorBalRaw || '0'); } catch {}
       if (creatorBal === 0n && creatorAddr) {
+        // fall back to current balance from our map
         creatorBal = balances.get(creatorAddr) || 0n;
       }
-      creatorPercent = (supply > 0n) ? Number((creatorBal * 1000000n) / supply) / 10000 : 0;
+      creatorPercent = supply > 0n ? Number((creatorBal * 1000000n) / supply) / 10000 : 0;
 
-      first20Buyers = first20BuyersMatrix(logs, pairAddress);
+      // buyers (creator is always first), then first 19 DEX buyers via pairAddress
+      first20Buyers = first20BuyersMatrix(logs, market?.pairAddress, creatorAddr, balances);
     } catch (e) {
       console.log('[WORKER] compute failed:', e?.message || e);
     }
 
-    // 4) Final payload for your renderers
+    // 4) Final payload for renderers
     const payload = {
       tokenAddress: ca,
       updatedAt: Date.now(),
-
-      market, // Dexscreener block (price/volume/change/cap/socials/pairAddress)
+      market, // includes price, volume, change, cap/fdv, liquidity, pairAddress, socials, imageUrl, name/symbol
 
       holdersTop20,
       top10CombinedPct,
