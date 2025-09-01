@@ -34,12 +34,13 @@ async function getDexPairAddresses(ca) {
   try {
     const url = `https://api.dexscreener.com/latest/dex/tokens/${ca}`;
     const { data } = await axios.get(url, { timeout: 15_000 });
-    const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
-    const abstractPairs = pairs.filter(p => p?.chainId === 'abstract');
+
+    const dsPairs = Array.isArray(data?.pairs) ? data.pairs : [];
+    const abstractPairs = dsPairs.filter(p => p?.chainId === 'abstract');
 
     const isMoon = (p) => String(p?.pairAddress || '').includes(':moon');
 
-    // Best AMM candidate (not :moon), sort by vol.h24 then liquidity.usd desc
+    // Best AMM candidate (not :moon)
     const ammCandidates = abstractPairs.filter(p => !isMoon(p));
     ammCandidates.sort((a, b) => {
       const vA = Number(a?.volume?.h24 || 0), vB = Number(b?.volume?.h24 || 0);
