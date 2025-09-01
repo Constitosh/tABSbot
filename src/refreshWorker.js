@@ -272,28 +272,32 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
 }
 
 // First 20 recipients (any sender), status from final balance vs total bought
-function first20BuyersMatrix(logs, pairAddress, balances) {
-  const ZERO = '0x0000000000000000000000000000000000000000';
+// First recipients (any sender), status from final balance vs total bought.
+// On Moonshot: collect first 22, then drop the first 2 (LP + distributor), keep next 20.
+function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false } = {}) {
   const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
 
-  // 1) earliest 20 unique recipients (exclude LP + dead)
+  const LIMIT = isMoonshot ? 22 : 20;
+
+  // 1) Earliest unique recipients (exclude LP + dead)
   const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
   for (const lg of logs) {
     const from = topicToAddr(lg.topics[1]);
     const to   = topicToAddr(lg.topics[2]);
+
     if (DEAD.has(to)) continue;
-    if (pair && to === pair) continue;           // never count LP itself
-    // treat ANY inbound as the "first receive" (mint, LP, creator, distributor, etc.)
+    if (pair && to === pair) continue; // never count the LP itself
+
     if (!firstSeen.has(to)) {
       firstSeen.set(to, {
         firstBuyBlock: Number(lg.blockNumber),
         firstBuyAmt: toBig(lg.data),
       });
-      if (firstSeen.size >= 20) break;
+      if (firstSeen.size >= LIMIT) break;
     }
   }
 
-  // 2) for those addresses, sum ALL inbound transfers as "totalBought"
+  // 2) For those addresses, sum ALL inbound transfers as "totalBought"
   const targets = new Set(firstSeen.keys());
   const totals  = new Map(); // addr -> { totalBought, buysN }
   for (const a of targets) totals.set(a, { totalBought: 0n, buysN: 0 });
@@ -306,8 +310,8 @@ function first20BuyersMatrix(logs, pairAddress, balances) {
     t.buysN += 1;
   }
 
-  // 3) ordered output + status
-  const out = [...firstSeen.entries()]
+  // 3) Build ordered output + status
+  let ordered = [...firstSeen.entries()]
     .sort((a,b) => a[1].firstBuyBlock - b[1].firstBuyBlock)
     .map(([address, info]) => {
       const t = totals.get(address) || { totalBought: 0n, buysN: 0 };
@@ -325,7 +329,14 @@ function first20BuyersMatrix(logs, pairAddress, balances) {
       return { address, status };
     });
 
-  return out;
+  // 4) Moonshot: drop the first 2 bootstrap recipients, keep next 20
+  if (isMoonshot) {
+    ordered = ordered.slice(2, 22);
+  } else {
+    ordered = ordered.slice(0, 20);
+  }
+
+  return ordered;
 }
 
 // ---------- Redis / BullMQ ----------
@@ -371,6 +382,12 @@ export async function refreshToken(tokenAddress) {
 
       // Preferred creator: tokens/v1
       creatorAddr = await getDexCreator(ca);
+
+// Flag if this token is Moonshot (used in buyers function)
+const isMoonshot =
+  !!market?.launchPadPair ||
+  String(market?.dexId || '').toLowerCase() === 'moonshot' ||
+  !!market?.moonshot;
 
       // Fallback 1: dexscreener moonshot.creator (string address when present)
       if (!creatorAddr) {
@@ -466,7 +483,7 @@ export async function refreshToken(tokenAddress) {
       creatorPercent = (supply > 0n) ? Number((creatorBal * 1000000n) / supply) / 10000 : 0;
 
       // Buyers: compute regardless of AMM pair (function handles pure-mint)
-      first20Buyers = first20BuyersMatrix(logs, ammPair, balances);
+      first20Buyers = first20BuyersMatrix(logs, ammPair, balances { isMoonshot });
     } catch (e) {
       console.log('[WORKER] compute failed:', e?.message || e);
     }
