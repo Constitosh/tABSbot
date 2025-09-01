@@ -1,152 +1,29 @@
 // src/services/dexscreener.js
-// Dexscreener market fetch + normalization for Abstract chain.
-//
-// Exports:
-//   getDexscreenerTokenStats(contractAddress) -> {
-//     name, symbol, priceUsd,
-//     volume: { m5,h1,h6,h24 },
-//     priceChange: { m5,h1,h6,h24 },
-//     marketCap,              // prefers marketCap; falls back to fdv
-//     marketCapSource,        // 'mc' or 'fdv'
-//     imageUrl,
-//     socials: { twitter, telegram, website },
-//     url,                    // pair url
-//     dexId                   // e.g. 'abstractswap', 'moonshot'
-//   } | null
-//
-// Notes:
-// - Filters strictly to chainId === 'abstract'.
-// - Chooses pair by highest volume.h24, tiebreaker liquidity.usd.
-// - Safe numeric parsing and null guards.
-// - Opt-in debug logs: set DS_DEBUG=true
+// Dexscreener (Abstract) → normalized "market" object for the bot/renderers.
 
-import axios from 'axios';
+function toNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
 
-const DS_BASE = (process.env.DS_ENDPOINT || 'https://api.dexscreener.com').replace(/\/+$/, '');
+function pickBestPair(list, ca) {
+  const baseMatches = list.filter(
+    (p) => p?.baseToken?.address?.toLowerCase() === ca
+  );
+  const candidates = baseMatches.length ? baseMatches : list;
 
-// ---------- small helpers ----------
-const num = (v) => {
-  const x = Number(v);
-  return Number.isFinite(x) ? x : 0;
-};
-
-const isAbstract = (p) => String(p?.chainId || '').toLowerCase() === 'abstract';
-
-function pickBestPair(pairs) {
-  if (!Array.isArray(pairs) || pairs.length === 0) return null;
-
-  // Clone + sort: primary key = volume.h24 desc, secondary = liquidity.usd desc
-  const sorted = [...pairs].sort((a, b) => {
-    const vA = num(a?.volume?.h24);
-    const vB = num(b?.volume?.h24);
-    if (vA !== vB) return vB - vA;
-
-    const lA = num(a?.liquidity?.usd);
-    const lB = num(b?.liquidity?.usd);
-    return lB - lA;
-  });
-
-  return sorted[0] || null;
+  // choose highest-liquidity pair
+  return candidates
+    .slice()
+    .sort((a, b) => toNum(b?.liquidity?.usd || 0) - toNum(a?.liquidity?.usd || 0))[0];
 }
 
 function extractSocials(info) {
-  const socials = Array.isArray(info?.socials) ? info.socials : [];
-  const websites = Array.isArray(info?.websites) ? info.websites : [];
-
-  let twitter, telegram, website;
-
-  for (const s of socials) {
-    const type = String(s?.type || '').toLowerCase();
-    const url  = s?.url || '';
-    if (!twitter && type === 'twitter' && url)  twitter  = url;
-    if (!telegram && (type === 'telegram' || type === 'tg') && url) telegram = url;
-  }
-  for (const w of websites) {
-    if (!website && w?.url) website = w.url;
-  }
-  return { twitter, telegram, website };
-}
-
-// ---------- main ----------
-export async function getDexscreenerTokenStats(contractAddress) {
-  const ca = String(contractAddress || '').trim();
-  if (!/^0x[0-9a-fA-F]{40}$/.test(ca)) return null;
-
-  const url = `${DS_BASE}/latest/dex/tokens/${ca}`;
-  if (process.env.DS_DEBUG) console.log('[DEX] GET', url);
-
-  let data;
-  try {
-    const res = await axios.get(url, { timeout: 15000 });
-    data = res?.data;
-  } catch (e) {
-    if (process.env.DS_DEBUG) console.error('[DEX] HTTP ERROR', e?.message || e);
-    return null;
-  }
-
-  const allPairs = Array.isArray(data?.pairs) ? data.pairs : [];
-  const abstractPairs = allPairs.filter(isAbstract);
-
-  if (process.env.DS_DEBUG) {
-    console.log('[DEX] pairs total=', allPairs.length, 'abstract=', abstractPairs.length);
-  }
-
-  if (abstractPairs.length === 0) return null;
-
-  const best = pickBestPair(abstractPairs);
-  if (!best) return null;
-
-  const name   = best?.baseToken?.name   || 'Token';
-  const symbol = best?.baseToken?.symbol || '';
-  const priceUsd = num(best?.priceUsd);
-
-  const volume = {
-    m5: num(best?.volume?.m5),
-    h1: num(best?.volume?.h1),
-    h6: num(best?.volume?.h6),
-    h24: num(best?.volume?.h24),
-  };
-
-  const priceChange = {
-    m5:  num(best?.priceChange?.m5),
-    h1:  num(best?.priceChange?.h1),
-    h6:  num(best?.priceChange?.h6),
-    h24: num(best?.priceChange?.h24),
-  };
-
-  // Prefer marketCap; fallback to fdv; label source.
-  const mc  = num(best?.marketCap);
-  const fdv = num(best?.fdv);
-  const marketCap = mc || fdv || 0;
-  const marketCapSource = mc ? 'mc' : (fdv ? 'fdv' : undefined);
-
-  const imageUrl = best?.info?.imageUrl || null;
-  const { twitter, telegram, website } = extractSocials(best?.info);
-  const dexId = best?.dexId || null;
-  const pairUrl = best?.url || null;
-
-  const mapped = {
-    name,
-    symbol,
-    priceUsd,
-    volume,
-    priceChange,
-    marketCap,
-    marketCapSource,   // renderer uses this to label "Market Cap" vs "FDV (as cap)"
-    imageUrl,
-    socials: { twitter, telegram, website },
-    url: pairUrl,
-    dexId,
-  };
-
-
-  // src/services/dexscreener.js
-// Normalize Dexscreener Abstract response into a compact "market" object your renderers expect.
-
-function pickSocials(info) {
   const socials = { twitter: '', telegram: '', website: '' };
+
   if (Array.isArray(info?.socials)) {
     for (const s of info.socials) {
+      if (!s?.url) continue;
       if (s.type === 'twitter' && !socials.twitter) socials.twitter = s.url;
       if (s.type === 'telegram' && !socials.telegram) socials.telegram = s.url;
     }
@@ -158,78 +35,88 @@ function pickSocials(info) {
   return socials;
 }
 
+/**
+ * Fetch & normalize Dexscreener token data for Abstract chain.
+ * Returns:
+ * {
+ *   pairAddress, url, name, symbol,
+ *   priceNative, priceUsd,
+ *   priceChange: { m5,h1,h6,h24 },
+ *   volume: { m5,h1,h6,h24 },
+ *   liquidity: { usd },
+ *   marketCap, fdv, marketCapSource: 'mcap'|'fdv',
+ *   socials: { twitter, telegram, website },
+ *   info: { imageUrl, header, openGraph },
+ *   moonshot: { creator }
+ * }
+ */
 export async function getDexscreenerTokenStats(contractAddress) {
-  const ca = contractAddress.toLowerCase();
-  const url = `https://api.dexscreener.com/tokens/v1/abstract/${ca}`;
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`Dexscreener HTTP ${r.status}`);
-  const arr = await r.json();
-  if (!Array.isArray(arr) || !arr.length) return null;
+  const ca = String(contractAddress || '').trim().toLowerCase();
+  if (!/^0x[a-f0-9]{40}$/.test(ca)) throw new Error('Invalid contract address');
 
-  // choose the first pair (same base = our token)
-  const p = arr.find((x) => x?.baseToken?.address?.toLowerCase() === ca) || arr[0];
+  const url = `https://api.dexscreener.com/tokens/v1/abstract/${ca}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Dexscreener HTTP ${res.status}`);
+  const data = await res.json();
+  if (!Array.isArray(data) || data.length === 0) return null;
+
+  const p = pickBestPair(data, ca);
+  if (!p) return null;
 
   const info = p.info || {};
-  const socials = pickSocials(info);
+  const socials = extractSocials(info);
 
   const priceChange = {
-    m5: p?.priceChange?.m5 ?? null, // often undefined for tokens endpoint
-    h1: p?.priceChange?.h1 ?? null,
-    h6: p?.priceChange?.h6 ?? null,
-    h24: p?.priceChange?.h24 ?? null,
+    m5: toNum(p?.priceChange?.m5),
+    h1: toNum(p?.priceChange?.h1),
+    h6: toNum(p?.priceChange?.h6),
+    h24: toNum(p?.priceChange?.h24),
   };
 
   const volume = {
-    m5: Number(p?.volume?.m5 ?? 0),
-    h1: Number(p?.volume?.h1 ?? 0),
-    h6: Number(p?.volume?.h6 ?? 0),
-    h24: Number(p?.volume?.h24 ?? 0),
+    m5: toNum(p?.volume?.m5) || 0,
+    h1: toNum(p?.volume?.h1) || 0,
+    h6: toNum(p?.volume?.h6) || 0,
+    h24: toNum(p?.volume?.h24) || 0,
   };
 
-  // prefer marketCap, fall back to fdv
-  const mcap = Number(p?.marketCap ?? 0) || Number(p?.fdv ?? 0);
-  const capSource = p?.marketCap ? 'mcap' : 'fdv';
+  // Prefer marketCap; fall back to fdv (and tell the renderer which one we used)
+  const mcap = toNum(p?.marketCap);
+  const fdv = toNum(p?.fdv);
+  const marketCap = mcap ?? fdv ?? null;
+  const marketCapSource = mcap != null ? 'mcap' : 'fdv';
 
   return {
-    pairAddress: p.pairAddress?.toLowerCase() || null,
-    url: p.url || null,
-    name: p.baseToken?.name || 'Token',
-    symbol: p.baseToken?.symbol || '',
-    priceNative: Number(p?.priceNative ?? 0) || null,
-    priceUsd: Number(p?.priceUsd ?? 0) || null,
+    pairAddress: p?.pairAddress?.toLowerCase() || null,
+    url: p?.url || null,
+
+    name: p?.baseToken?.name || 'Token',
+    symbol: p?.baseToken?.symbol || '',
+
+    priceNative: toNum(p?.priceNative),
+    priceUsd: toNum(p?.priceUsd),
+
     priceChange,
     volume,
-    liquidity: { usd: Number(p?.liquidity?.usd ?? 0) || 0 },
-    marketCap: mcap || null,
-    fdv: Number(p?.fdv ?? 0) || null,
-    marketCapSource: capSource,
+
+    liquidity: { usd: toNum(p?.liquidity?.usd) || 0 },
+
+    marketCap,
+    fdv: fdv ?? null,
+    marketCapSource,
+
     socials,
     info: {
-      imageUrl: info.imageUrl || null,
-      openGraph: info.openGraph || null,
+      imageUrl: info?.imageUrl || null,
+      header: info?.header || null,
+      openGraph: info?.openGraph || null,
     },
+
+    // for creator fallback in worker if needed
     moonshot: {
-      creator: p?.moonshot?.creator?.toLowerCase() || null,
+      creator: p?.moonshot?.creator
+        ? String(p.moonshot.creator).toLowerCase()
+        : null,
     },
   };
 }
-
-
-  if (process.env.DS_DEBUG) {
-    console.log('[DEX] selected pair:', JSON.stringify({
-      chainId: best?.chainId,
-      dexId: best?.dexId,
-      url: best?.url,
-      priceUsd: mapped.priceUsd,
-      volume: mapped.volume,
-      priceChange: mapped.priceChange,
-      marketCap: mapped.marketCap,
-      marketCapSource: mapped.marketCapSource,
-      socials: mapped.socials
-    }, null, 2));
-  }
-
-  return mapped;
-}
-
-export default { getDexscreenerTokenStats };
