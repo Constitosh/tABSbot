@@ -6,218 +6,81 @@ import axios from 'axios';
 import '../configEnv.js'; // ensure .env is loaded before we read process.env
 // ...rest of file
 
-const BASE = (process.env.ABSCAN_API || 'https://abscan.org/api').replace(/\/+$/, '');
-const KEY  = process.env.ABSCAN_API_KEY || null;
-const DBG  = /^true$/i.test(process.env.ABSCAN_DEBUG || '');
+// src/services/abscan.js
+// Thin Etherscan v2 client used across the app. No side effects on import.
 
-// build query string
-const qs = (o) =>
-  Object.entries(o)
-    .filter(([, v]) => v !== undefined && v !== null && v !== '')
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-    .join('&');
+const ETHERSCAN_BASE =
+  process.env.ETHERSCAN_BASE?.trim() || 'https://api.etherscan.io/v2/api';
+const ETHERSCAN_CHAIN_ID =
+  (process.env.ETHERSCAN_CHAIN_ID || '2741').trim(); // Abstract = 2741
+const ETHERSCAN_API_KEY =
+  (process.env.ETHERSCAN_API_KEY || process.env.ETHERSCAN_KEY || '').trim();
 
-async function callApi(params, { timeout = 15000 } = {}) {
-  const url = `${BASE}?${qs({ ...params, apikey: KEY || undefined })}`;
-  if (DBG) console.log('[ABSCAN] GET', url);
-  const { data } = await axios.get(url, { timeout });
-
-  if (!data) throw new Error('Abscan: empty response');
-
-  // Etherscan-like envelopes are common:
-  // { status: "1"|"0", message: "OK"|..., result: [...]|... }
-  // Some clones just return the array/object directly.
-  if (data.status === '0' && String(data.result).match(/Max rate limit/i)) {
-    throw new Error('Abscan: rate limited');
+function buildUrl(module, action, params = {}) {
+  const u = new URL(ETHERSCAN_BASE);
+  u.searchParams.set('chainid', ETHERSCAN_CHAIN_ID);
+  if (ETHERSCAN_API_KEY) u.searchParams.set('apikey', ETHERSCAN_API_KEY);
+  u.searchParams.set('module', module);
+  u.searchParams.set('action', action);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null) u.searchParams.set(k, String(v));
   }
-
-  const result = data.result ?? data;
-  if (DBG) {
-    const preview = Array.isArray(result) ? { len: result.length, first: result[0] } : result;
-    console.log('[ABSCAN] RESULT PREVIEW', JSON.stringify(preview)?.slice(0, 800));
-  }
-  return result;
+  return u.toString();
 }
 
-/* ---------------- HOLDERS ---------------- */
+async function getJSON(url) {
+  const res = await fetch(url, { method: 'GET' });
+  const text = await res.text();
+  let j;
+  try { j = JSON.parse(text); }
+  catch { throw new Error(`[ESV2] Non-JSON response: ${text.slice(0, 160)}`); }
 
-/**
- * Try several common holders endpoints and return the first non-empty result.
- * Normalizes to: { holders: [{address,balance,percent}], totalSupply, holderCount }
- */
-export async function getTokenHolders(contractAddress, page = 1, offset = 100) {
-  // Candidate actions seen across explorer forks
-  const candidates = [
-    { module: 'token', action: 'tokenholderlist',   args: { sort: 'desc' } },
-    { module: 'token', action: 'tokenholders',      args: { sort: 'desc' } },
-    { module: 'stats', action: 'tokenholderlist',   args: { sort: 'desc' } },
-    { module: 'token', action: 'tokenholderlistv2', args: { sort: 'desc' } },
-  ];
-
-  let raw = null;
-  for (const c of candidates) {
-    try {
-      const res = await callApi({
-        module: c.module,
-        action: c.action,
-        contractaddress: contractAddress,
-        page,
-        offset,
-        ...(c.args || {}),
-      });
-
-      // Accept if it's a non-empty array (or contains array in common keys)
-      const arr =
-        (Array.isArray(res) && res) ||
-        res?.holders ||
-        res?.result ||
-        res?.data ||
-        res?.items ||
-        null;
-
-      if (Array.isArray(arr) && arr.length > 0) {
-        raw = { envelope: res, rows: arr, action: `${c.module}.${c.action}` };
-        break;
-      }
-
-      // Some APIs return { holders:[], holderCount:N } — accept even if rows empty if count > 0
-      const holderCount =
-        res?.HolderCount ??
-        res?.holderCount ??
-        res?.total ??
-        res?.pagination?.total ??
-        0;
-
-      if (Number(holderCount) > 0) {
-        raw = { envelope: res, rows: arr || [], action: `${c.module}.${c.action}` };
-        break;
-      }
-    } catch (e) {
-      if (DBG) console.warn(`[ABSCAN] ${c.module}.${c.action} failed:`, e.message);
-      // try next candidate
-    }
+  // Etherscan v2 returns { status, message, result }
+  if (j?.status === '0' && j?.message) {
+    throw new Error(`[ESV2] ${j.message}`);
   }
-
-  if (!raw) {
-    if (DBG) console.warn('[ABSCAN] no holders endpoint yielded data');
-    return { holders: [], totalSupply: 0, holderCount: 0 };
-  }
-
-  const { envelope, rows } = raw;
-
-  const totalSupply = toNum(
-    envelope?.TokenTotalSupply ??
-    envelope?.totalSupply ??
-    envelope?.supply ??
-    // some explorers put totalSupply in the first row or nested
-    rows?.[0]?.TokenTotalSupply ??
-    rows?.[0]?.totalSupply ??
-    0
-  );
-
-  let holderCount = toInt(
-    envelope?.HolderCount ??
-    envelope?.holderCount ??
-    envelope?.total ??
-    envelope?.pagination?.total ??
-    null
-  );
-  if (!holderCount && Array.isArray(rows)) holderCount = rows.length;
-
-  const holders = (rows || []).map(normalizeHolder(totalSupply));
-
-  return { holders, totalSupply, holderCount };
+  return j?.result ?? j;
 }
 
-function normalizeHolder(totalSupply) {
-  return (r) => {
-    const address =
-      r.HolderAddress ||
-      r.TokenHolderAddress ||
-      r.Address ||
-      r.address ||
-      r.wallet ||
-      null;
+// ---------------- Public helpers ----------------
 
-    const balance = toNum(
-      r.TokenHolderQuantity ??
-      r.Balance ??
-      r.balance ??
-      r.Value ??
-      r.value ??
-      0
-    );
-
-    let percent = r.Percentage != null ? toNum(r.Percentage) : null;
-    if ((percent == null || !isFinite(percent)) && totalSupply > 0) {
-      percent = (balance / totalSupply) * 100;
-    }
-
-    return {
-      address: address ? String(address).toLowerCase() : null,
-      balance,
-      percent: toNum(percent),
-    };
-  };
-}
-
-/* ---------------- TRANSFERS ---------------- */
-
-/**
- * Get ERC-20 transfers (ascending). Normalizes minimal fields.
- */
-export async function getTokenTransfers(
-  contractAddress,
-  startblock = 0,
-  endblock = 999999999,
-  page = 1,
-  offset = 1000
-) {
-  // standard etherscan-style
-  const result = await callApi({
-    module: 'account',
-    action: 'tokentx',
+// Transfers (ERC-20 token tx list)
+export async function getTokenTransfers(contractAddress, { page = 1, offset = 1000 } = {}) {
+  const url = buildUrl('account', 'tokentx', {
     contractaddress: contractAddress,
-    page,
-    offset,
-    startblock,
-    endblock,
-    sort: 'asc',
+    page, offset, startblock: 0, endblock: 999999999, sort: 'asc',
   });
-
-  const list = Array.isArray(result) ? result : (result?.result || []);
-  return list.map((t) => ({
-    blockNumber: toInt(t.blockNumber ?? t.block_number),
-    timeStamp: toInt(t.timeStamp ?? t.timeStampSec ?? t.timeStampMs),
-    hash: t.hash,
-    from: String(t.from || '').toLowerCase(),
-    to: String(t.to || '').toLowerCase(),
-    value: t.value,              // raw string in token decimals
-    tokenDecimal: toInt(t.tokenDecimal ?? t.decimals),
-  }));
+  return getJSON(url);
 }
 
-/* ---------------- CREATOR ---------------- */
-
-/**
- * Contract creator (deployer).
- */
+// Contract creator
 export async function getContractCreator(contractAddress) {
-  // typical: module=contract&action=getcontractcreation&contractaddresses=<ca>
-  const result = await callApi({
-    module: 'contract',
-    action: 'getcontractcreation',
+  const url = buildUrl('contract', 'getcontractcreation', {
     contractaddresses: contractAddress,
   });
-
-  const row = Array.isArray(result) ? result[0] : result;
-  return {
-    contractAddress: row?.contractAddress || contractAddress,
-    creatorAddress: (row?.contractCreator || row?.creator || '').toLowerCase() || null,
-    txHash: row?.txHash || row?.transactionHash || null,
-  };
+  const res = await getJSON(url);
+  // ESV2 returns array; pick first row’s contractCreator if present
+  const row = Array.isArray(res) ? res[0] : res;
+  return row?.contractCreator || null;
 }
 
-/* ---------------- utils ---------------- */
-function toNum(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
-function toInt(v) { const n = parseInt(v, 10); return Number.isFinite(n) ? n : 0; }
+// Total supply
+export async function getTokenSupply(contractAddress) {
+  const url = buildUrl('stats', 'tokensupply', { contractaddress: contractAddress });
+  const r = await getJSON(url);
+  return typeof r === 'string' ? r : (r?.result ?? '0');
+}
+
+// (Optional) Transfer logs if you prefer to compute holders from logs
+export async function getTransferLogs(contractAddress, { page = 1, offset = 1000 } = {}) {
+  // topic0 is keccak256("Transfer(address,address,uint256)")
+  const url = buildUrl('logs', 'getLogs', {
+    address: contractAddress,
+    topic0: '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
+    fromBlock: 0,
+    toBlock: 'latest',
+    page,
+    offset,
+  });
+  return getJSON(url);
+}
