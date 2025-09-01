@@ -120,30 +120,63 @@ const DEAD = new Set([
 const toBig = (x) => BigInt(String(x));
 const topicToAddr = (t) => ('0x' + String(t).slice(-40)).toLowerCase();
 
-// ---------- Block-windowed Transfer log crawler (no page=50 cap) ----------
+// ---------- Discover concrete block bounds (finite crawl) ----------
+async function getCreationBlock(token) {
+  // Try contract creation first (param name is plural)
+  try {
+    const res = await esGET(
+      { module: 'contract', action: 'getcontractcreation', contractaddresses: token },
+      { logOnce: true, tag: '[creatorBlock]' }
+    );
+    const first = Array.isArray(res) ? res[0] : res;
+    const n = Number(first?.blockNumber || first?.blocknumber || first);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch {}
+  // Fallback: earliest token tx
+  try {
+    const r = await esGET(
+      { module: 'account', action: 'tokentx', contractaddress: token, page: 1, offset: 1, sort: 'asc' },
+      { logOnce: true, tag: '[firstTx]' }
+    );
+    const n = Number((Array.isArray(r) && r[0]?.blockNumber) || r?.blockNumber);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch {}
+  return 0;
+}
+
+async function getLatestBlock() {
+  try {
+    const ts = Math.floor(Date.now() / 1000);
+    const r = await esGET(
+      { module: 'block', action: 'getblocknobytime', timestamp: ts, closest: 'before' },
+      { logOnce: true, tag: '[latestBlock]' }
+    );
+    const n = Number(r?.blockNumber || r?.BlockNumber || r);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch {}
+  // hard fallback (shouldn't be hit)
+  return 9_223_372_036;
+}
+
+// ---------- Block-windowed Transfer log crawler (finite) ----------
 async function getAllTransferLogs(token, {
-  fromBlock = 0,
-  toBlock = 'latest',
-  window = 250_000,     // adjust if needed
+  fromBlock,
+  toBlock,
+  window = 300_000,
   offset = 1000,
-  maxEmptyWindows = 4,
+  maxWindows = 200,
 } = {}) {
-  // resolve "latest" timestamp to block number (approx) via Etherscan time->block
-  let latest = Number.MAX_SAFE_INTEGER;
-  if (toBlock === 'latest') {
-    // cheap heuristic: just leave "latest" and rely on Etherscan accepting it
-    // If your Etherscan v2 doesn't accept 'latest', you can implement a time→block lookup
-  } else {
-    latest = Number(toBlock);
+  if (!Number.isFinite(fromBlock) || !Number.isFinite(toBlock) || fromBlock > toBlock) {
+    throw new Error(`bad block range ${fromBlock}..${toBlock}`);
   }
 
   const all = [];
   let start = fromBlock;
-  let emptyStreak = 0;
+  let windows = 0;
 
-  while (true) {
-    const end = toBlock === 'latest' ? 'latest' : Math.min(start + window, latest);
-    // paginate inside the window
+  while (start <= toBlock) {
+    const end = Math.min(start + window, toBlock);
+
     for (let page = 1; ; page++) {
       const params = {
         module: 'logs',
@@ -158,26 +191,16 @@ async function getAllTransferLogs(token, {
       const batch = await esGET(params, { logOnce: page === 1, tag: `[logs ${start}-${end}]` });
       if (!Array.isArray(batch) || batch.length === 0) break;
       all.push(...batch);
-      if (batch.length < offset) break;
+      if (batch.length < offset) break; // no more pages for this window
     }
 
-    if (all.length === 0) {
-      emptyStreak++;
-      if (emptyStreak >= maxEmptyWindows) break;
-    } else {
-      emptyStreak = 0;
-    }
-
-    if (toBlock === 'latest') {
-      // keep crawling forward; stop if window produced nothing several times
-      start = (typeof end === 'number' ? end : start + window) + 1;
-      if (start > Number.MAX_SAFE_INTEGER - window) break; // safety
-    } else {
-      start = (end) + 1;
-      if (start > latest) break;
+    start = end + 1;
+    windows++;
+    if (windows >= maxWindows) {
+      console.warn(`[ESV2] window cap hit (${maxWindows}); stopping early at block ${end}`);
+      break;
     }
   }
-
   return all;
 }
 
@@ -330,13 +353,23 @@ export async function refreshToken(tokenAddress) {
       console.log('[WORKER] Dexscreener failed:', e?.message || e);
     }
 
-    // 2) Etherscan V2 pulls (windowed logs + totals)
+    // 2) Etherscan V2 pulls (finite windowed logs + totals)
     let logs = [];
     let totalSupplyRaw = '0';
     let creatorBalRaw = '0';
     try {
+      const [creationBlock, latestBlock] = await Promise.all([
+        getCreationBlock(ca),
+        getLatestBlock(),
+      ]);
+
+      const fromB = Math.max(0, creationBlock - 1); // include mint
+      const toB   = latestBlock;
+
+      console.log('[WORKER] range', ca, fromB, '→', toB);
+
       [logs, totalSupplyRaw] = await Promise.all([
-        getAllTransferLogs(ca, { fromBlock: 0, toBlock: 'latest', window: 250_000, offset: 1000 }),
+        getAllTransferLogs(ca, { fromBlock: fromB, toBlock: toB, window: 300_000, offset: 1000 }),
         getTokenTotalSupply(ca),
       ]);
 
