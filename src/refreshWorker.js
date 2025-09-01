@@ -62,12 +62,28 @@ function esURL(params) {
 }
 async function esGET(params, { logOnce = false, tag = '' } = {}) {
   if (logOnce) console.log(`[ESV2] ${tag} ${esURL(params)}`);
-  const { data } = await httpES.get('', esParams(params));
-  if (data?.status !== '1') {
-    const msg = data?.result || data?.message || 'Unknown error';
-    throw new Error(`Etherscan v2 error: ${msg}`);
+
+  // Respect global Etherscan throttle
+  await throttleES();
+
+  // Simple retry with backoff for transient NOTOKs/timeouts
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const { data } = await httpES.get('', esParams(params));
+      if (data?.status === '1') return data.result;
+
+      const msg = data?.result || data?.message || 'Unknown Etherscan error';
+      // Some NOTOK messages are transient; let retries handle them
+      if (attempt === maxAttempts) {
+        throw new Error(`Etherscan v2 error: ${msg}`);
+      }
+    } catch (e) {
+      if (attempt === maxAttempts) throw e;
+    }
+    // backoff: 0.4s, 0.8s (kept small to not stall the worker too long)
+    await new Promise(r => setTimeout(r, 400 * attempt));
   }
-  return data.result;
 }
 
 // ERC-20 Transfer(address,address,uint256) topic
