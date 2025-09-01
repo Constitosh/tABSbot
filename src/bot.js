@@ -1,26 +1,18 @@
 // src/bot.js
 import './configEnv.js';
 import { Telegraf } from 'telegraf';
-import { queue } from './queueCore.js';          // only queue here
 import { getJSON, setJSON } from './cache.js';
+import { queue, refreshToken } from './queueCore.js';
 import { renderOverview, renderBuyers, renderHolders, renderAbout } from './renderers.js';
 import { isAddress } from './util.js';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// ---------- Safe middleware (NO top-level return) ----------
-bot.use(async (ctx, next) => {
-  try {
-    await next();
-  } catch (err) {
-    console.error('[BOT] middleware error:', err);
-  }
-});
-
-// ---------- HTML helpers ----------
+// ----- HTML helpers (ensure consistent parse_mode) -----
 const sendHTML = (ctx, text, extra = {}) =>
   ctx.replyWithHTML(text, { disable_web_page_preview: true, ...extra });
 
+// Safe edit: ignore “message is not modified”
 const editHTML = async (ctx, text, extra = {}) => {
   try {
     return await ctx.editMessageText(text, {
@@ -37,17 +29,23 @@ const editHTML = async (ctx, text, extra = {}) => {
   }
 };
 
-// ---------- Data helpers ----------
+// ----- Data helpers -----
 async function ensureData(ca) {
-  const key = `token:${ca}:summary`;
-  const cache = await getJSON(key);
-  if (cache) return cache;
-
-  // cold start: enqueue a refresh and return null so UI says "Initializing…"
   try {
-    await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
-  } catch (_) {}
-  return null;
+    const key = `token:${ca}:summary`;
+    const cache = await getJSON(key);
+    if (cache) return cache;
+
+    // cold start: try a synchronous refresh once
+    const fresh = await refreshToken(ca);
+    return fresh || null;
+  } catch (e) {
+    // enqueue and ask user to retry
+    try {
+      await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
+    } catch (_) {}
+    return null;
+  }
 }
 
 // Always return { ok:boolean, age?:number, error?:string }
@@ -69,7 +67,7 @@ async function requestRefresh(ca) {
   }
 }
 
-// ---------- Commands ----------
+// ----- Commands -----
 bot.start((ctx) =>
   ctx.reply(
     [
@@ -79,9 +77,6 @@ bot.start((ctx) =>
     ].join('\n')
   )
 );
-
-// quick health check
-bot.command('ping', (ctx) => ctx.reply('pong ✅'));
 
 // /stats <ca>
 bot.command('stats', async (ctx) => {
@@ -113,9 +108,12 @@ bot.command('refresh', async (ctx) => {
   return ctx.reply(`Refreshing ${ca}…`);
 });
 
-// ---------- Callback handlers ----------
+// ----- Callback handlers -----
+
+// noop buttons: just close the spinner
 bot.action('noop', (ctx) => ctx.answerCbQuery(''));
 
+// Main action router
 bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
   try {
     const [kind, ca, maybePage] = ctx.callbackQuery.data.split(':');
@@ -152,31 +150,17 @@ bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
       return editHTML(ctx, text, extra);
     }
   } catch (e) {
-    console.error('[BOT] action error:', e);
     return ctx.answerCbQuery('Error — try again', { show_alert: true });
   }
 });
 
-// About
+// About modal
 bot.action('about', async (ctx) => {
   const { text, extra } = renderAbout();
   return editHTML(ctx, text, extra);
 });
 
-// ---------- Global error logging ----------
-bot.catch((err, ctx) => {
-  console.error('[BOT] error for update', ctx?.update?.update_id, err);
-});
-
-// Ensure long polling (clear any webhook)
-bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(() => {});
-
-// Boot
-bot.telegram.getMe()
-  .then(me => console.log(`[BOT] up as @${me.username} (${me.id})`))
-  .catch(console.error);
-
-bot.launch().then(() => console.log('tABS Tools bot up (polling).')).catch(console.error);
-
+// ----- Boot -----
+bot.launch().then(() => console.log('tABS Tools bot up.'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
