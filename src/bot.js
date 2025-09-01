@@ -28,6 +28,19 @@ const editHTML = async (ctx, text, extra = {}) => {
   }
 };
 
+// send overview with optional token logo photo (caption = overview text)
+const sendOverview = (ctx, { text, extra, photo }) => {
+  if (photo) {
+    return ctx.replyWithPhoto(photo, {
+      caption: text,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...extra,
+    });
+  }
+  return sendHTML(ctx, text, extra);
+};
+
 // ----- Data helpers -----
 // Get from cache; if empty, enqueue a refresh and return null.
 async function ensureData(ca) {
@@ -82,7 +95,8 @@ bot.command('stats', async (ctx) => {
   if (!data) return ctx.reply('Initializing… try again in a few seconds.');
 
   const { text, extra } = renderOverview(data);
-  return sendHTML(ctx, text, extra);
+  const photo = data?.market?.info?.imageUrl || null; // use token logo if present
+  return sendOverview(ctx, { text, extra, photo });
 });
 
 // /refresh <ca>
@@ -126,6 +140,14 @@ bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
 
     if (kind === 'stats') {
       const { text, extra } = renderOverview(data);
+      const photo = data?.market?.info?.imageUrl || null;
+
+      // if we have a photo, simplest UX is to replace the old message with a fresh photo+caption
+      if (photo) {
+        try { await ctx.deleteMessage(); } catch (_) {}
+        return sendOverview(ctx, { text, extra, photo });
+      }
+      // otherwise just edit the text in place
       return editHTML(ctx, text, extra);
     }
 
