@@ -27,8 +27,6 @@ async function getDexCreator(ca) {
 
 /**
  * Detect both AMM pair (real on-chain 0x...) and Moonshot pair (pseudo ":moon")
- * without changing your existing dexscreener service. We fetch the token pairs
- * endpoint directly and choose the best AMM by h24 volume (then liquidity).
  */
 async function getDexPairAddresses(ca) {
   try {
@@ -49,7 +47,6 @@ async function getDexPairAddresses(ca) {
       return lB - lA;
     });
     const bestAMM = ammCandidates[0] || null;
-
     const moon = abstractPairs.find(isMoon) || null;
 
     return {
@@ -158,6 +155,21 @@ async function getLatestBlock() {
   return 9_223_372_036;
 }
 
+// ---------- Contract creator fallback ----------
+async function getContractCreator(token) {
+  try {
+    const res = await esGET(
+      { module: 'contract', action: 'getcontractcreation', contractaddresses: token },
+      { logOnce: false, tag: '' }
+    );
+    const first = Array.isArray(res) ? res[0] : res;
+    const addr = first?.contractCreator || first?.creatorAddress || first?.contractCreatorAddress;
+    return addr ? String(addr).toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
 // ---------- Block-windowed Transfer log crawler (finite) ----------
 async function getAllTransferLogs(token, {
   fromBlock,
@@ -264,9 +276,6 @@ function first20BuyersMatrix(logs, pairAddress, balances) {
   const ZERO = '0x0000000000000000000000000000000000000000';
   const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
 
-  // Ensure logs are chronological (ok if you already sort earlier)
-  // logs.sort((a,b)=> (Number(a.blockNumber)-Number(b.blockNumber)) || (Number(a.logIndex)-Number(b.logIndex)));
-
   // 1) earliest 20 unique recipients (from mint OR from LP). Exclude LP/dead.
   const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
   for (const lg of logs) {
@@ -324,10 +333,6 @@ function first20BuyersMatrix(logs, pairAddress, balances) {
       return {
         address,
         status,
-        // uncomment if you want to display amounts later
-        // firstBuy: info.firstBuyAmt.toString(),
-        // totalBought: t.totalBought.toString(),
-        // balanceNow: balNow.toString(),
       };
     });
 
@@ -376,9 +381,23 @@ export async function refreshToken(tokenAddress) {
 
       console.log('[WORKER] Dexscreener ok', ca, 'ammPair=', ammPair, 'moonPair=', launchPadPair, 'cap=', market?.marketCap ?? market?.fdv ?? 0);
 
-      // fetch creator from Dexscreener tokens/v1
+      // Preferred creator: tokens/v1
       creatorAddr = await getDexCreator(ca);
-      console.log('[WORKER] Dex creator', creatorAddr || 'unknown');
+
+      // Fallback 1: dexscreener moonshot.creator (string address when present)
+      if (!creatorAddr) {
+        const dsMoonCreator = market?.moonshot?.creator;
+        if (dsMoonCreator && /^0x[a-fA-F0-9]{40}$/.test(dsMoonCreator)) {
+          creatorAddr = String(dsMoonCreator).toLowerCase();
+        }
+      }
+
+      // Fallback 2: explorer contract creation creator
+      if (!creatorAddr) {
+        creatorAddr = await getContractCreator(ca);
+      }
+
+      console.log('[WORKER] Creator address', creatorAddr || 'unknown');
     } catch (e) {
       console.log('[WORKER] Dexscreener failed:', e?.message || e);
     }
@@ -411,15 +430,14 @@ export async function refreshToken(tokenAddress) {
       console.log('[WORKER] ESV2 failed:', e?.message || e);
     }
 
-// sort logs to strict chronological order
-logs.sort((a,b) => {
-  const ba = Number(a.blockNumber||0), bb = Number(b.blockNumber||0);
-  if (ba !== bb) return ba - bb;
-  const ia = Number(a.logIndex||0), ib = Number(b.logIndex||0);
-  return ia - ib;
-});
+    // sort logs chronological (blockNumber, logIndex)
+    logs.sort((a,b) => {
+      const ba = Number(a.blockNumber||0), bb = Number(b.blockNumber||0);
+      if (ba !== bb) return ba - bb;
+      const ia = Number(a.logIndex||0), ib = Number(b.logIndex||0);
+      return ia - ib;
+    });
 
-    
     // 3) Compute
     let holdersTop20 = [];
     let holdersCount = null;
@@ -459,8 +477,8 @@ logs.sort((a,b) => {
       }
       creatorPercent = (supply > 0n) ? Number((creatorBal * 1000000n) / supply) / 10000 : 0;
 
-      // Buyers only if we have a real AMM pair
-      first20Buyers = ammPair ? first20BuyersMatrix(logs, ammPair, balances) : [];
+      // Buyers: compute regardless of AMM pair (function handles pure-mint)
+      first20Buyers = first20BuyersMatrix(logs, ammPair, balances);
     } catch (e) {
       console.log('[WORKER] compute failed:', e?.message || e);
     }
