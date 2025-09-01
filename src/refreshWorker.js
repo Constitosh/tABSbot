@@ -412,12 +412,10 @@ export async function refreshToken(tokenAddress) {
     }
 
 // sort logs to strict chronological order
-logs.sort((a, b) => {
-  const ba = Number(a.blockNumber || 0);
-  const bb = Number(b.blockNumber || 0);
+logs.sort((a,b) => {
+  const ba = Number(a.blockNumber||0), bb = Number(b.blockNumber||0);
   if (ba !== bb) return ba - bb;
-  const ia = Number(a.logIndex || 0);
-  const ib = Number(b.logIndex || 0);
+  const ia = Number(a.logIndex||0), ib = Number(b.logIndex||0);
   return ia - ib;
 });
 
