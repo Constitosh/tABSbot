@@ -1,7 +1,7 @@
 // src/bot.js
 import './configEnv.js';
 import { Telegraf } from 'telegraf';
-import { queue } from './queueCore.js';          // only queue here
+import { queue } from './queueCore.js';
 import { getJSON, setJSON } from './cache.js';
 import { renderOverview, renderBuyers, renderHolders, renderAbout } from './renderers.js';
 import { isAddress } from './util.js';
@@ -28,15 +28,37 @@ const editHTML = async (ctx, text, extra = {}) => {
   }
 };
 
-// send overview with optional token logo photo (caption = overview text)
-const sendOverview = (ctx, { text, extra, photo }) => {
-  if (photo) {
-    return ctx.replyWithPhoto(photo, {
-      caption: text,
+// edit caption safely when the message is a photo
+const editCaptionHTML = async (ctx, caption, extra = {}) => {
+  try {
+    return await ctx.editMessageCaption(caption, {
       parse_mode: 'HTML',
       disable_web_page_preview: true,
       ...extra,
     });
+  } catch (err) {
+    const desc = err?.response?.description || '';
+    if (desc.includes('message is not modified')) {
+      return ctx.answerCbQuery('Already up to date');
+    }
+    throw err;
+  }
+};
+
+// send overview with optional token logo photo; fallback to text if photo fails
+const sendOverview = async (ctx, { text, extra, photo }) => {
+  if (photo) {
+    try {
+      return await ctx.replyWithPhoto(photo, {
+        caption: text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        ...extra,
+      });
+    } catch (e) {
+      // fallback to text
+      console.warn('[BOT] replyWithPhoto failed; falling back to text:', e?.message || e);
+    }
   }
   return sendHTML(ctx, text, extra);
 };
@@ -48,7 +70,6 @@ async function ensureData(ca) {
   const cache = await getJSON(key);
   if (cache) return cache;
 
-  // cold start: enqueue a refresh and return null so UI says "Initializing…"
   try {
     await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
   } catch (_) {}
@@ -87,33 +108,43 @@ bot.start((ctx) =>
 
 // /stats <ca>
 bot.command('stats', async (ctx) => {
-  const [, caRaw] = ctx.message.text.trim().split(/\s+/);
-  if (!isAddress(caRaw)) return ctx.reply('Send: /stats <contractAddress>');
+  try {
+    const [, caRaw] = ctx.message.text.trim().split(/\s+/);
+    if (!isAddress(caRaw)) return ctx.reply('Send: /stats <contractAddress>');
 
-  const ca = caRaw.toLowerCase();
-  const data = await ensureData(ca);
-  if (!data) return ctx.reply('Initializing… try again in a few seconds.');
+    const ca = caRaw.toLowerCase();
+    const data = await ensureData(ca);
+    if (!data) return ctx.reply('Initializing… try again in a few seconds.');
 
-  const { text, extra } = renderOverview(data);
-  const photo = data?.market?.info?.imageUrl || null; // use token logo if present
-  return sendOverview(ctx, { text, extra, photo });
+    const { text, extra } = renderOverview(data);
+    const photo = data?.market?.info?.imageUrl || null;
+    return await sendOverview(ctx, { text, extra, photo });
+  } catch (e) {
+    console.error('[BOT] /stats error:', e);
+    return ctx.reply('Error — try again.');
+  }
 });
 
 // /refresh <ca>
 bot.command('refresh', async (ctx) => {
-  const [, caRaw] = ctx.message.text.trim().split(/\s+/);
-  if (!isAddress(caRaw)) return ctx.reply('Send: /refresh <contractAddress>');
+  try {
+    const [, caRaw] = ctx.message.text.trim().split(/\s+/);
+    if (!isAddress(caRaw)) return ctx.reply('Send: /refresh <contractAddress>');
 
-  const ca = caRaw.toLowerCase();
-  const res = await requestRefresh(ca);
+    const ca = caRaw.toLowerCase();
+    const res = await requestRefresh(ca);
 
-  if (!res.ok) {
-    if (typeof res.age === 'number') {
-      return ctx.reply(`Recently refreshed (${res.age.toFixed(0)}s ago). Try again shortly.`);
+    if (!res.ok) {
+      if (typeof res.age === 'number') {
+        return ctx.reply(`Recently refreshed (${res.age.toFixed(0)}s ago). Try again shortly.`);
+      }
+      return ctx.reply(`Couldn't queue refresh. ${res.error ? 'Error: ' + res.error : ''}`);
     }
-    return ctx.reply(`Couldn't queue refresh. ${res.error ? 'Error: ' + res.error : ''}`);
+    return ctx.reply(`Refreshing ${ca}…`);
+  } catch (e) {
+    console.error('[BOT] /refresh error:', e);
+    return ctx.reply('Error — try again.');
   }
-  return ctx.reply(`Refreshing ${ca}…`);
 });
 
 // ----- Callback handlers -----
@@ -142,42 +173,68 @@ bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
       const { text, extra } = renderOverview(data);
       const photo = data?.market?.info?.imageUrl || null;
 
-      // if we have a photo, simplest UX is to replace the old message with a fresh photo+caption
-      if (photo) {
-        try { await ctx.deleteMessage(); } catch (_) {}
-        return sendOverview(ctx, { text, extra, photo });
+      // does the current message have a photo?
+      const hasPhoto =
+        !!ctx.callbackQuery?.message?.photo?.length ||
+        ctx.callbackQuery?.message?.caption?.length > 0;
+
+      if (hasPhoto && !photo) {
+        // message is a photo but we don't have a new one — just edit the caption
+        return await editCaptionHTML(ctx, text, extra);
       }
-      // otherwise just edit the text in place
-      return editHTML(ctx, text, extra);
+
+      if (!hasPhoto && photo) {
+        // current message is text-only, we want to show a photo — delete & send fresh
+        try { await ctx.deleteMessage(); } catch (_) {}
+        return await sendOverview(ctx, { text, extra, photo });
+      }
+
+      if (hasPhoto && photo) {
+        // keep existing image, update caption (simplest & fast)
+        return await editCaptionHTML(ctx, text, extra);
+      }
+
+      // both are text-only
+      return await editHTML(ctx, text, extra);
     }
 
     if (kind === 'buyers') {
       const page = Number(maybePage || 1);
       const { text, extra } = renderBuyers(data, page);
-      return editHTML(ctx, text, extra);
+      return await editHTML(ctx, text, extra);
     }
 
     if (kind === 'holders') {
       const page = Number(maybePage || 1);
       const { text, extra } = renderHolders(data, page);
-      return editHTML(ctx, text, extra);
+      return await editHTML(ctx, text, extra);
     }
   } catch (e) {
+    console.error('[BOT] action error:', e);
     return ctx.answerCbQuery('Error — try again', { show_alert: true });
   }
 });
 
 // About
 bot.action('about', async (ctx) => {
-  const { text, extra } = renderAbout();
-  return editHTML(ctx, text, extra);
+  try {
+    const { text, extra } = renderAbout();
+    return await editHTML(ctx, text, extra);
+  } catch (e) {
+    console.error('[BOT] about error:', e);
+    return ctx.answerCbQuery('Error — try again', { show_alert: true });
+  }
 });
 
-// Global error logging (helps when bot “does nothing”)
+// Global error logging
 bot.catch((err, ctx) => {
   console.error('[BOT] error for update', ctx?.update?.update_id, err);
 });
-bot.telegram.getMe().then(me => console.log(`[BOT] up as @${me.username} (${me.id})`)).catch(console.error);
+
+bot.telegram.getMe()
+  .then(me => console.log(`[BOT] up as @${me.username} (${me.id})`))
+  .catch(console.error);
+
 bot.launch().then(() => console.log('tABS Tools bot up (polling).'));
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
