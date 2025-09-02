@@ -5,32 +5,32 @@ import { getJSON, setJSON } from './cache.js';
 import { queue, refreshToken } from './queueCore.js';
 import { renderOverview, renderBuyers, renderHolders, renderAbout } from './renderers.js';
 import { isAddress } from './util.js';
+
+// PNL imports
 import { pnlQueue, refreshPnl } from './pnlWorker.js';
 import { renderPNL } from './renderers_pnl.js';
 
-
-
-
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
+// ----- PNL command -----
 bot.command('pnl', async (ctx) => {
-  try{
-    const parts = (ctx.message.text||'').trim().split(/\s+/);
-    const wallet = (parts[1]||'').toLowerCase();
+  try {
+    const parts = (ctx.message?.text || '').trim().split(/\s+/);
+    const wallet = (parts[1] || '').toLowerCase();
     if (!/^0x[a-f0-9]{40}$/.test(wallet)) {
       return ctx.reply('Usage: /pnl <walletAddress>');
     }
-    await pnlQueue.add('pnl', { wallet, window:'30d' }, { removeOnComplete:true, removeOnFail:true });
+    await pnlQueue.add('pnl', { wallet, window: '30d' }, { removeOnComplete: true, removeOnFail: true });
     const data = await refreshPnl(wallet, '30d');
     const { text, extra } = renderPNL(data, '30d');
     return ctx.replyWithHTML(text, extra);
-  }catch(e){
+  } catch (e) {
     console.error(e);
     return ctx.reply('PNL: something went wrong.');
   }
 });
 
-
+// ----- PNL callbacks (window switching / refresh) -----
 bot.on('callback_query', async (ctx) => {
   try {
     const d = ctx.callbackQuery?.data || '';
@@ -39,34 +39,26 @@ bot.on('callback_query', async (ctx) => {
       const [, wallet, window] = d.split(':');
       const data = await refreshPnl(wallet, window);
       const { text, extra } = renderPNL(data, window);
-      await ctx.editMessageText(text, { ...extra, parse_mode:'HTML' });
+      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML' });
       return ctx.answerCbQuery();
     }
+
     if (d.startsWith('pnl_refresh:')) {
       const [, wallet, window] = d.split(':');
-      await pnlQueue.add('pnl', { wallet, window }, { removeOnComplete:true, removeOnFail:true });
+      await pnlQueue.add('pnl', { wallet, window }, { removeOnComplete: true, removeOnFail: true });
       const data = await refreshPnl(wallet, window);
       const { text, extra } = renderPNL(data, window);
-      await ctx.editMessageText(text, { ...extra, parse_mode:'HTML' });
+      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML' });
       return ctx.answerCbQuery('Refreshed');
     }
 
-    // ... your other cases
+    // ...your other callback cases can live in bot.action() below
+
   } catch (e) {
     console.error(e);
     try { await ctx.answerCbQuery('Error'); } catch {}
   }
 });
-
-
-    // fall through to your other callbacks if any…
-  } catch (e) {
-    console.error(e);
-    try { await ctx.answerCbQuery('Error'); } catch {}
-  }
-});
-
-
 
 // ----- HTML helpers (ensure consistent parse_mode) -----
 const sendHTML = (ctx, text, extra = {}) =>
@@ -132,8 +124,9 @@ bot.start((ctx) =>
   ctx.reply(
     [
       'tABS Tools ready.',
-      'Use /stats <contract>  •  /refresh <contract>',
+      'Use /stats <contract>  •  /refresh <contract>  •  /pnl <wallet>',
       'Example: /stats 0x1234567890abcdef1234567890abcdef12345678',
+      'Example: /pnl   0x1234567890abcdef1234567890abcdef12345678',
     ].join('\n')
   )
 );
@@ -173,7 +166,7 @@ bot.command('refresh', async (ctx) => {
 // noop buttons: just close the spinner
 bot.action('noop', (ctx) => ctx.answerCbQuery(''));
 
-// Main action router
+// Main action router for stats/buyers/holders/refresh
 bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
   try {
     const [kind, ca, maybePage] = ctx.callbackQuery.data.split(':');
