@@ -3,7 +3,7 @@
 //  • Market + creator: Dexscreener (pair + /tokens/v1/abstract/<CA> for creator)
 //  • On-chain math: Etherscan V2 (chainid=2741)
 //      - Holders/top10/burn: logs.getLogs (fallback: synthesize from account.tokentx)
-//      - First 20 buyers: account.tokentx (primary, asc) with buySources = { ZERO, LP(if any), tokenCA(if Moonshot bonding) }
+//      - First 20 buyers: account.tokentx (primary, asc) with buySources = { ZERO, LP(if any), tokenCA(always) }
 //      - Totals: stats.tokensupply, account.tokenbalance
 // Queue: BullMQ
 
@@ -371,9 +371,12 @@ function first20BuyersFromTx(txAsc, { ca, ammPair, isMoonshotBonding }, balances
   if (!Array.isArray(txAsc) || txAsc.length === 0) return [];
 
   const pair = ammPair ? String(ammPair).toLowerCase() : null;
-  const buySources = new Set([ZERO]);
+  const caLower = String(ca).toLowerCase();
+
+  // IMPORTANT CHANGE: token CA is ALWAYS a buy source (mint-like sends may appear as from=CA)
+  const buySources = new Set([ZERO, caLower]);
   if (pair) buySources.add(pair);
-  if (isMoonshotBonding) buySources.add(String(ca).toLowerCase()); // pool == tokenCA during bonding
+  // (We keep isMoonshotBonding for holders exclusion; not needed for buySources anymore.)
 
   // 1) earliest unique recipients where from ∈ buySources
   const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
@@ -381,8 +384,8 @@ function first20BuyersFromTx(txAsc, { ca, ammPair, isMoonshotBonding }, balances
     const from = String(tx.from || '').toLowerCase();
     const to   = String(tx.to   || '').toLowerCase();
     if (!to || DEAD.has(to)) continue;
-    if (pair && to === pair) continue;               // never LP itself
-    if (to === String(ca).toLowerCase()) continue;   // never token contract as buyer
+    if (pair && to === pair) continue;   // never LP as buyer
+    if (to === caLower) continue;        // never token contract as buyer
 
     if (!buySources.has(from)) continue;
 
@@ -391,7 +394,7 @@ function first20BuyersFromTx(txAsc, { ca, ammPair, isMoonshotBonding }, balances
         firstBuyBlock: Number(tx.blockNumber || 0),
         firstBuyAmt: toBig(tx.value || '0'),
       });
-      if (firstSeen.size >= 20) break; // EXACTLY first 20
+      if (firstSeen.size >= 20) break; // exactly first 20
     }
   }
 
@@ -401,7 +404,7 @@ function first20BuyersFromTx(txAsc, { ca, ammPair, isMoonshotBonding }, balances
       const to = String(tx.to || '').toLowerCase();
       if (!to || DEAD.has(to)) continue;
       if (pair && to === pair) continue;
-      if (to === String(ca).toLowerCase()) continue;
+      if (to === caLower) continue;
 
       if (!firstSeen.has(to)) {
         firstSeen.set(to, {
@@ -566,6 +569,15 @@ export async function refreshToken(tokenAddress) {
     });
     console.log('[WORKER] logs sorted len=', logs.length);
 
+    // Optional: targeted debug for a specific CA
+    try {
+      if (process.env.DEBUG_FIRSTBUY === '1' && process.env.DEBUG_CA && process.env.DEBUG_CA.toLowerCase() === ca) {
+        console.log('[DEBUG_FIRSTBUY] first 30 tokentx asc:', txAsc.slice(0,30).map(t => ({
+          bn: Number(t.blockNumber), li: Number(t.logIndex), from: String(t.from).toLowerCase(), to: String(t.to).toLowerCase(), v: String(t.value)
+        })));
+      }
+    } catch {}
+
     // 3) Compute
     let holdersTop20 = [];
     let holdersCount = null;
@@ -615,6 +627,13 @@ export async function refreshToken(tokenAddress) {
         { ca, ammPair, isMoonshotBonding },
         balances
       );
+
+      // Optional: debug what we computed
+      try {
+        if (process.env.DEBUG_FIRSTBUY === '1' && process.env.DEBUG_CA && process.env.DEBUG_CA.toLowerCase() === ca) {
+          console.log('[DEBUG_FIRSTBUY] computed first20:', first20Buyers);
+        }
+      } catch {}
 
       console.log('[WORKER] compute sizes',
         'balances=', balancesSize,
