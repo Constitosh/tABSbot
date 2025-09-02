@@ -3,7 +3,7 @@
 //  • Market + creator: Dexscreener (pair + /tokens/v1/abstract/<CA> for creator)
 //  • On-chain math: Etherscan V2 (chainid=2741)
 //      - Holders/top10/burn: logs.getLogs (fallback: synthesize from account.tokentx)
-//      - First 20 buyers: account.tokentx (primary, asc) with buySources = { ZERO, LP(if any), tokenCA(always) }
+//      - First buyers (status): derived from logs (primary) using buySources { ZERO, token CA, LP }; Moonshot: collect 27 then drop 2
 //      - Totals: stats.tokensupply, account.tokenbalance
 // Queue: BullMQ
 
@@ -62,7 +62,7 @@ const ES_KEY   = process.env.ETHERSCAN_API_KEY;
 const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741'; // Abstract
 
 if (!ES_KEY) console.warn('[WORKER BOOT] ETHERSCAN_API_KEY is missing');
-// give Abstract a bit more room
+// Abstract can be slow -> 45s
 const httpES = axios.create({ baseURL: ES_BASE, timeout: 45_000 });
 
 // ---------- Etherscan rate limit ----------
@@ -118,7 +118,7 @@ const toBig = (x) => BigInt(String(x));
 const topicToAddr = (t) => ('0x' + String(t).slice(-40)).toLowerCase();
 const padAddrTopic = (addr) => '0x'.concat('0'.repeat(24), String(addr).toLowerCase().replace(/^0x/, ''));
 
-// ---------- Discover concrete block bounds ----------
+// ---------- Block bounds ----------
 async function getCreationBlock(token) {
   try {
     const res = await esGET(
@@ -167,7 +167,7 @@ async function getContractCreator(token) {
   }
 }
 
-// ---------- Block-windowed logs.getLogs (finite) with per-window retry ----------
+// ---------- logs.getLogs (finite) with retry ----------
 async function getAllTransferLogs(token, {
   fromBlock,
   toBlock,
@@ -235,7 +235,7 @@ async function getAllTransferLogs(token, {
   return all;
 }
 
-// ---------- Fallback: account.tokentx -> synthesize log-like entries ----------
+// ---------- Fallback: account.tokentx -> synthesize logs for balances ----------
 async function getAllTokenTxAsLogs(token, { startPage = 1, offset = 1000, maxPages = 300 } = {}) {
   const out = [];
   for (let page = startPage; page < startPage + maxPages; page++) {
@@ -259,7 +259,7 @@ async function getAllTokenTxAsLogs(token, { startPage = 1, offset = 1000, maxPag
     for (const tx of batch) {
       const from = String(tx.from || '').toLowerCase();
       const to   = String(tx.to || '').toLowerCase();
-      const value = String(tx.value || '0'); // decimal string (raw units)
+      const value = String(tx.value || '0'); // decimal string
       out.push({
         blockNumber: Number(tx.blockNumber || 0),
         logIndex: Number(tx.logIndex || 0),
@@ -277,39 +277,6 @@ async function getAllTokenTxAsLogs(token, { startPage = 1, offset = 1000, maxPag
   return out;
 }
 
-// ---------- Primary: account.tokentx (asc) list (for FIRST BUYERS) ----------
-async function getTokenTxAsc(token, { startPage = 1, offset = 1000, maxPages = 300 } = {}) {
-  const out = [];
-  for (let page = startPage; page < startPage + maxPages; page++) {
-    const params = {
-      module: 'account',
-      action: 'tokentx',
-      contractaddress: token,
-      page,
-      offset,
-      sort: 'asc'
-    };
-    let batch;
-    try {
-      batch = await esGET(params, { logOnce: page === startPage, tag: '[tokentx/raw]' });
-    } catch (e) {
-      console.warn('[ESV2] tokentx raw failed page', page, e.message || e);
-      break;
-    }
-    if (!Array.isArray(batch) || batch.length === 0) break;
-    out.push(...batch);
-    if (batch.length < offset) break;
-  }
-  // chronological safety
-  out.sort((a,b) => {
-    const ba = Number(a.blockNumber||0), bb = Number(b.blockNumber||0);
-    if (ba !== bb) return ba - bb;
-    const ia = Number(a.logIndex||0), ib = Number(b.logIndex||0);
-    return ia - ib;
-  });
-  return out;
-}
-
 // ---------- Totals ----------
 async function getTokenTotalSupply(token) {
   return String(await esGET(
@@ -317,7 +284,6 @@ async function getTokenTotalSupply(token) {
     { logOnce: true, tag: '[supply]' }
   ));
 }
-
 async function getCreatorTokenBalance(token, creator) {
   if (!creator) return '0';
   return String(await esGET(
@@ -366,23 +332,25 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
   return { holdersTop20: top20, top10CombinedPct, holdersCount: rows.length };
 }
 
-// ---------- FIRST BUYERS from tokentx (primary) ----------
-function first20BuyersFromTx(txAsc, { ca, ammPair, isMoonshotBonding }, balances) {
-  if (!Array.isArray(txAsc) || txAsc.length === 0) return [];
+// ---------- FIRST BUYERS from logs (primary) ----------
+function firstBuyersFromLogs(logs, { ca, ammPair, isMoonshot }, balances) {
+  if (!Array.isArray(logs) || logs.length === 0) return [];
 
-  const pair = ammPair ? String(ammPair).toLowerCase() : null;
   const caLower = String(ca).toLowerCase();
+  const pair    = ammPair ? String(ammPair).toLowerCase() : null;
 
-  // IMPORTANT CHANGE: token CA is ALWAYS a buy source (mint-like sends may appear as from=CA)
+  // Buy sources: ZERO, token CA, LP (when present)
   const buySources = new Set([ZERO, caLower]);
   if (pair) buySources.add(pair);
-  // (We keep isMoonshotBonding for holders exclusion; not needed for buySources anymore.)
 
-  // 1) earliest unique recipients where from ∈ buySources
+  // Collect earliest unique receivers where from ∈ buySources
+  const LIMIT = isMoonshot ? 27 : 20; // collect 27 for moonshot; drop 2 later
   const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
-  for (const tx of txAsc) {
-    const from = String(tx.from || '').toLowerCase();
-    const to   = String(tx.to   || '').toLowerCase();
+
+  for (const lg of logs) {
+    const from = topicToAddr(lg.topics[1]);
+    const to   = topicToAddr(lg.topics[2]);
+
     if (!to || DEAD.has(to)) continue;
     if (pair && to === pair) continue;   // never LP as buyer
     if (to === caLower) continue;        // never token contract as buyer
@@ -391,49 +359,49 @@ function first20BuyersFromTx(txAsc, { ca, ammPair, isMoonshotBonding }, balances
 
     if (!firstSeen.has(to)) {
       firstSeen.set(to, {
-        firstBuyBlock: Number(tx.blockNumber || 0),
-        firstBuyAmt: toBig(tx.value || '0'),
+        firstBuyBlock: Number(lg.blockNumber || 0),
+        firstBuyAmt: toBig(lg.data || '0'),
       });
-      if (firstSeen.size >= 20) break; // exactly first 20
+      if (firstSeen.size >= LIMIT) break;
     }
   }
 
-  // Fallback: if empty, allow any earliest receivers (still skip LP/contract/dead)
+  // If still empty (very odd), fallback to earliest unique receivers (skip LP/contract/dead)
   if (firstSeen.size === 0) {
-    for (const tx of txAsc) {
-      const to = String(tx.to || '').toLowerCase();
+    for (const lg of logs) {
+      const to = topicToAddr(lg.topics[2]);
       if (!to || DEAD.has(to)) continue;
       if (pair && to === pair) continue;
       if (to === caLower) continue;
 
       if (!firstSeen.has(to)) {
         firstSeen.set(to, {
-          firstBuyBlock: Number(tx.blockNumber || 0),
-          firstBuyAmt: toBig(tx.value || '0'),
+          firstBuyBlock: Number(lg.blockNumber || 0),
+          firstBuyAmt: toBig(lg.data || '0'),
         });
-        if (firstSeen.size >= 20) break;
+        if (firstSeen.size >= LIMIT) break;
       }
     }
   }
 
-  // 2) For those addresses, sum inbound from buySources only
+  // For those addresses, sum all inbound from buy sources (totalBought)
   const targets = new Set(firstSeen.keys());
   const totals  = new Map(); // addr -> { totalBought, buysN }
   for (const a of targets) totals.set(a, { totalBought: 0n, buysN: 0 });
 
-  for (const tx of txAsc) {
-    const from = String(tx.from || '').toLowerCase();
-    const to   = String(tx.to   || '').toLowerCase();
+  for (const lg of logs) {
+    const from = topicToAddr(lg.topics[1]);
+    const to   = topicToAddr(lg.topics[2]);
     if (!targets.has(to)) continue;
     if (!buySources.has(from)) continue;
 
     const t = totals.get(to);
-    t.totalBought += toBig(tx.value || '0');
+    t.totalBought += toBig(lg.data || '0');
     t.buysN += 1;
   }
 
-  // 3) Build ordered output + status using final balances
-  const ordered = [...firstSeen.entries()]
+  // Build ordered output + status
+  let ordered = [...firstSeen.entries()]
     .sort((a,b) => a[1].firstBuyBlock - b[1].firstBuyBlock)
     .map(([address, info]) => {
       const t = totals.get(address) || { totalBought: 0n, buysN: 0 };
@@ -450,7 +418,14 @@ function first20BuyersFromTx(txAsc, { ca, ammPair, isMoonshotBonding }, balances
       return { address, status };
     });
 
-  return ordered.slice(0, Math.min(20, ordered.length));
+  // Moonshot: drop first 2 bootstrap recipients -> keep next 20
+  if (isMoonshot) {
+    ordered = ordered.slice(2, 22);
+  } else {
+    ordered = ordered.slice(0, 20);
+  }
+
+  return ordered;
 }
 
 // ---------- Redis / BullMQ ----------
@@ -492,7 +467,7 @@ export async function refreshToken(tokenAddress) {
         market.launchPadPair = launchPadPair || null;
       }
 
-      // Preferred creator from tokens/v1
+      // Preferred creator
       creatorAddr = await getDexCreator(ca);
 
       // Moonshot flags
@@ -525,7 +500,6 @@ export async function refreshToken(tokenAddress) {
     let logs = [];
     let totalSupplyRaw = '0';
     let creatorBalRaw = '0';
-    let txAsc = [];
     try {
       const [creationBlock, latestBlock] = await Promise.all([
         getCreationBlock(ca),
@@ -537,14 +511,10 @@ export async function refreshToken(tokenAddress) {
 
       console.log('[WORKER] range', ca, fromB, '→', toB);
 
-      // logs for balances/holders
       [logs, totalSupplyRaw] = await Promise.all([
         getAllTransferLogs(ca, { fromBlock: fromB, toBlock: toB, window: 200_000, offset: 1000 }),
         getTokenTotalSupply(ca),
       ]);
-
-      // tokentx asc for first buyers (primary)
-      txAsc = await getTokenTxAsc(ca, { startPage: 1, offset: 1000, maxPages: 300 });
 
       if (!logs.length) {
         console.warn('[WORKER] getLogs returned 0 — falling back to account.tokentx synth logs for balances …');
@@ -555,7 +525,7 @@ export async function refreshToken(tokenAddress) {
       if (creatorAddr) {
         creatorBalRaw = await getCreatorTokenBalance(ca, creatorAddr);
       }
-      console.log('[WORKER] ESV2 ok', ca, 'logs=', logs.length, 'tokentx=', txAsc.length, 'supply=', totalSupplyRaw, 'creatorBal=', creatorBalRaw);
+      console.log('[WORKER] ESV2 ok', ca, 'logs=', logs.length, 'supply=', totalSupplyRaw, 'creatorBal=', creatorBalRaw);
     } catch (e) {
       console.log('[WORKER] ESV2 failed:', e?.message || e);
     }
@@ -567,16 +537,7 @@ export async function refreshToken(tokenAddress) {
       const ia = Number(a.logIndex||0), ib = Number(b.logIndex||0);
       return ia - ib;
     });
-    console.log('[WORKER] logs sorted len=', logs.length);
-
-    // Optional: targeted debug for a specific CA
-    try {
-      if (process.env.DEBUG_FIRSTBUY === '1' && process.env.DEBUG_CA && process.env.DEBUG_CA.toLowerCase() === ca) {
-        console.log('[DEBUG_FIRSTBUY] first 30 tokentx asc:', txAsc.slice(0,30).map(t => ({
-          bn: Number(t.blockNumber), li: Number(t.logIndex), from: String(t.from).toLowerCase(), to: String(t.to).toLowerCase(), v: String(t.value)
-        })));
-      }
-    } catch {}
+    console.log('[WORKER] logs sorted. len=', logs.length);
 
     // 3) Compute
     let holdersTop20 = [];
@@ -621,19 +582,12 @@ export async function refreshToken(tokenAddress) {
       }
       creatorPercent = (supply > 0n) ? Number((creatorBal * 1000000n) / supply) / 10000 : 0;
 
-      // FIRST BUYERS from tokentx (primary)
-      first20Buyers = first20BuyersFromTx(
-        txAsc,
-        { ca, ammPair, isMoonshotBonding },
+      // FIRST BUYERS from logs
+      first20Buyers = firstBuyersFromLogs(
+        logs,
+        { ca, ammPair, isMoonshot: isMoonshotBonding || isMoonshot },
         balances
       );
-
-      // Optional: debug what we computed
-      try {
-        if (process.env.DEBUG_FIRSTBUY === '1' && process.env.DEBUG_CA && process.env.DEBUG_CA.toLowerCase() === ca) {
-          console.log('[DEBUG_FIRSTBUY] computed first20:', first20Buyers);
-        }
-      } catch {}
 
       console.log('[WORKER] compute sizes',
         'balances=', balancesSize,
