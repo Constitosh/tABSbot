@@ -30,37 +30,38 @@ bot.command('pnl', async (ctx) => {
   }
 });
 
-// ----- PNL callbacks (window switching / refresh) -----
-bot.on('callback_query', async (ctx) => {
+/* ====== PNL callbacks (Option A: specific bot.action handlers) ====== */
+
+// window switcher: pnl:<wallet>:(24h|7d|30d|365d|all)
+bot.action(/^pnl:0x[a-f0-9]{40}:(24h|7d|30d|365d|all)$/i, async (ctx) => {
   try {
-    const d = ctx.callbackQuery?.data || '';
-
-    if (d.startsWith('pnl:')) {
-      const [, wallet, window] = d.split(':');
-      const data = await refreshPnl(wallet, window);
-      const { text, extra } = renderPNL(data, window);
-      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML' });
-      return ctx.answerCbQuery();
-    }
-
-    if (d.startsWith('pnl_refresh:')) {
-      const [, wallet, window] = d.split(':');
-      await pnlQueue.add('pnl', { wallet, window }, { removeOnComplete: true, removeOnFail: true });
-      const data = await refreshPnl(wallet, window);
-      const { text, extra } = renderPNL(data, window);
-      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML' });
-      return ctx.answerCbQuery('Refreshed');
-    }
-
-    // ...your other callback cases can live in bot.action() below
-
+    const [, wallet, window] = ctx.callbackQuery.data.split(':');
+    const data = await refreshPnl(wallet, window);
+    const { text, extra } = renderPNL(data, window);
+    await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML' });
+    return ctx.answerCbQuery();
   } catch (e) {
     console.error(e);
     try { await ctx.answerCbQuery('Error'); } catch {}
   }
 });
 
-// ----- HTML helpers (ensure consistent parse_mode) -----
+// refresh button: pnl_refresh:<wallet>:(24h|7d|30d|365d|all)
+bot.action(/^pnl_refresh:0x[a-f0-9]{40}:(24h|7d|30d|365d|all)$/i, async (ctx) => {
+  try {
+    const [, wallet, window] = ctx.callbackQuery.data.split(':');
+    await pnlQueue.add('pnl', { wallet, window }, { removeOnComplete: true, removeOnFail: true });
+    const data = await refreshPnl(wallet, window);
+    const { text, extra } = renderPNL(data, window);
+    await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML' });
+    return ctx.answerCbQuery('Refreshed');
+  } catch (e) {
+    console.error(e);
+    try { await ctx.answerCbQuery('Error'); } catch {}
+  }
+});
+
+/* ====== HTML helpers (ensure consistent parse_mode) ====== */
 const sendHTML = (ctx, text, extra = {}) =>
   ctx.replyWithHTML(text, { disable_web_page_preview: true, ...extra });
 
@@ -81,7 +82,7 @@ const editHTML = async (ctx, text, extra = {}) => {
   }
 };
 
-// ----- Data helpers -----
+/* ====== Data helpers ====== */
 async function ensureData(ca) {
   try {
     const key = `token:${ca}:summary`;
@@ -119,7 +120,7 @@ async function requestRefresh(ca) {
   }
 }
 
-// ----- Commands -----
+/* ====== Commands ====== */
 bot.start((ctx) =>
   ctx.reply(
     [
@@ -161,7 +162,7 @@ bot.command('refresh', async (ctx) => {
   return ctx.reply(`Refreshing ${ca}…`);
 });
 
-// ----- Callback handlers -----
+/* ====== Callback handlers ====== */
 
 // noop buttons: just close the spinner
 bot.action('noop', (ctx) => ctx.answerCbQuery(''));
