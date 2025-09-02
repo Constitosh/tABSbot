@@ -1,7 +1,7 @@
 // src/refreshWorker.js
 // Sources:
 //  • Market + creator: Dexscreener (pair + /tokens/v1/abstract/<CA> for creator)
-//  • On-chain math: Etherscan V2 (chainid=2741) — logs.getLogs, stats.tokensupply, account.tokenbalance
+//  • On-chain math: Etherscan V2 (chainid=2741) — logs.getLogs (primary), account.tokentx (fallback), stats.tokensupply, account.tokenbalance
 // Queue: BullMQ
 
 import './configEnv.js';
@@ -25,9 +25,6 @@ async function getDexCreator(ca) {
   }
 }
 
-/**
- * Detect both AMM pair (real on-chain 0x...) and Moonshot pair (pseudo ":moon")
- */
 async function getDexPairAddresses(ca) {
   try {
     const url = `https://api.dexscreener.com/latest/dex/tokens/${ca}`;
@@ -35,10 +32,8 @@ async function getDexPairAddresses(ca) {
 
     const dsPairs = Array.isArray(data?.pairs) ? data.pairs : [];
     const abstractPairs = dsPairs.filter(p => p?.chainId === 'abstract');
-
     const isMoon = (p) => String(p?.pairAddress || '').includes(':moon');
 
-    // Best AMM candidate (not :moon)
     const ammCandidates = abstractPairs.filter(p => !isMoon(p));
     ammCandidates.sort((a, b) => {
       const vA = Number(a?.volume?.h24 || 0), vB = Number(b?.volume?.h24 || 0);
@@ -64,7 +59,8 @@ const ES_KEY   = process.env.ETHERSCAN_API_KEY;
 const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741'; // Abstract
 
 if (!ES_KEY) console.warn('[WORKER BOOT] ETHERSCAN_API_KEY is missing');
-const httpES = axios.create({ baseURL: ES_BASE, timeout: 25_000 });
+// bump timeout to 45s — Abstract can be slow
+const httpES = axios.create({ baseURL: ES_BASE, timeout: 45_000 });
 
 // ---------- Etherscan rate limit (≤ 5 req/s by default) ----------
 const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
@@ -108,18 +104,19 @@ async function esGET(params, { logOnce = false, tag = '' } = {}) {
 
 // ---------- Constants & utils ----------
 const TOPIC_TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const ZERO = '0x0000000000000000000000000000000000000000';
 const DEAD = new Set([
-  '0x0000000000000000000000000000000000000000',
+  ZERO,
   '0x000000000000000000000000000000000000dEaD',
   '0x000000000000000000000000000000000000dead',
 ].map(s => s.toLowerCase()));
 
 const toBig = (x) => BigInt(String(x));
 const topicToAddr = (t) => ('0x' + String(t).slice(-40)).toLowerCase();
+const padAddrTopic = (addr) => '0x'.concat('0'.repeat(24), String(addr).toLowerCase().replace(/^0x/, ''));
 
 // ---------- Discover concrete block bounds (finite crawl) ----------
 async function getCreationBlock(token) {
-  // Try contract creation first (param name is plural)
   try {
     const res = await esGET(
       { module: 'contract', action: 'getcontractcreation', contractaddresses: token },
@@ -129,7 +126,6 @@ async function getCreationBlock(token) {
     const n = Number(first?.blockNumber || first?.blocknumber || first);
     if (Number.isFinite(n) && n > 0) return n;
   } catch {}
-  // Fallback: earliest token tx
   try {
     const r = await esGET(
       { module: 'account', action: 'tokentx', contractaddress: token, page: 1, offset: 1, sort: 'asc' },
@@ -151,11 +147,9 @@ async function getLatestBlock() {
     const n = Number(r?.blockNumber || r?.BlockNumber || r);
     if (Number.isFinite(n) && n > 0) return n;
   } catch {}
-  // hard fallback (shouldn't be hit)
   return 9_223_372_036;
 }
 
-// ---------- Contract creator fallback ----------
 async function getContractCreator(token) {
   try {
     const res = await esGET(
@@ -170,13 +164,13 @@ async function getContractCreator(token) {
   }
 }
 
-// ---------- Block-windowed Transfer log crawler (finite) ----------
+// ---------- Block-windowed Transfer log crawler (finite) with per-window retry ----------
 async function getAllTransferLogs(token, {
   fromBlock,
   toBlock,
-  window = 300_000,
+  window = 200_000,     // slightly smaller to reduce timeouts
   offset = 1000,
-  maxWindows = 200,
+  maxWindows = 300,
 } = {}) {
   if (!Number.isFinite(fromBlock) || !Number.isFinite(toBlock) || fromBlock > toBlock) {
     throw new Error(`bad block range ${fromBlock}..${toBlock}`);
@@ -185,10 +179,12 @@ async function getAllTransferLogs(token, {
   const all = [];
   let start = fromBlock;
   let windows = 0;
+  let failedWindows = 0;
 
   while (start <= toBlock) {
     const end = Math.min(start + window, toBlock);
 
+    // page within window, with retry per page
     for (let page = 1; ; page++) {
       const params = {
         module: 'logs',
@@ -200,7 +196,24 @@ async function getAllTransferLogs(token, {
         page,
         offset,
       };
-      const batch = await esGET(params, { logOnce: page === 1, tag: `[logs ${start}-${end}]` });
+
+      let batch = null;
+      let ok = false;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          batch = await esGET(params, { logOnce: page === 1 && attempt === 1, tag: `[logs ${start}-${end}]` });
+          ok = true;
+          break;
+        } catch (e) {
+          if (attempt === 3) {
+            console.warn(`[ESV2] window ${start}-${end} page ${page} failed after retries: ${e.message || e}`);
+          } else {
+            await new Promise(r => setTimeout(r, 500 * attempt));
+          }
+        }
+      }
+      if (!ok) { failedWindows++; break; }
+
       if (!Array.isArray(batch) || batch.length === 0) break;
       all.push(...batch);
       if (batch.length < offset) break; // no more pages for this window
@@ -213,7 +226,54 @@ async function getAllTransferLogs(token, {
       break;
     }
   }
+
+  if (failedWindows) {
+    console.warn(`[ESV2] getLogs had ${failedWindows} failed window(s).`);
+  }
   return all;
+}
+
+// ---------- Fallback: account.tokentx (asc) and synthesize log-like entries ----------
+async function getAllTokenTxAsLogs(token, { startPage = 1, offset = 1000, maxPages = 200 } = {}) {
+  const out = [];
+  for (let page = startPage; page < startPage + maxPages; page++) {
+    const params = {
+      module: 'account',
+      action: 'tokentx',
+      contractaddress: token,
+      page,
+      offset,
+      sort: 'asc'
+    };
+    let batch;
+    try {
+      batch = await esGET(params, { logOnce: page === startPage, tag: '[tokentx]' });
+    } catch (e) {
+      console.warn('[ESV2] tokentx failed page', page, e.message || e);
+      break;
+    }
+    if (!Array.isArray(batch) || batch.length === 0) break;
+
+    // synthesize into the same shape expected by our builders
+    for (const tx of batch) {
+      const from = String(tx.from || '').toLowerCase();
+      const to   = String(tx.to || '').toLowerCase();
+      const value = String(tx.value || '0'); // decimal
+      out.push({
+        blockNumber: Number(tx.blockNumber || 0),
+        logIndex: Number(tx.logIndex || 0),
+        topics: [
+          TOPIC_TRANSFER,
+          padAddrTopic(from),
+          padAddrTopic(to),
+        ],
+        data: value
+      });
+    }
+
+    if (batch.length < offset) break;
+  }
+  return out;
 }
 
 // ---------- Etherscan helpers ----------
@@ -274,15 +334,12 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
 // First 20 recipients (mint or LP), status from final balance vs total bought.
 // On Moonshot: collect first 22, then drop the first 2 (LP + distributor), keep next 20.
 function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false } = {}) {
-  const ZERO = '0x0000000000000000000000000000000000000000';
   const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
-
   if (!Array.isArray(logs) || logs.length === 0) return [];
 
   const LIMIT = isMoonshot ? 22 : 20;
+  const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
 
-  // 1) earliest unique recipients from mint OR LP. Exclude LP itself and dead.
-  const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt, from }
   for (const lg of logs) {
     const from = topicToAddr(lg.topics[1]);
     const to   = topicToAddr(lg.topics[2]);
@@ -297,13 +354,12 @@ function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false }
       firstSeen.set(to, {
         firstBuyBlock: Number(lg.blockNumber),
         firstBuyAmt: toBig(lg.data),
-        from
       });
       if (firstSeen.size >= LIMIT) break;
     }
   }
 
-  // Fallback: if we somehow have nothing, take first 20 receivers (excluding dead)
+  // Fallback: take earliest receivers if nothing matched
   if (firstSeen.size === 0) {
     for (const lg of logs) {
       const to = topicToAddr(lg.topics[2]);
@@ -312,14 +368,12 @@ function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false }
         firstSeen.set(to, {
           firstBuyBlock: Number(lg.blockNumber),
           firstBuyAmt: toBig(lg.data),
-          from: topicToAddr(lg.topics[1]),
         });
         if (firstSeen.size >= LIMIT) break;
       }
     }
   }
 
-  // 2) For those addresses, sum ALL inbound transfers from mint/LP as "totalBought"
   const targets = new Set(firstSeen.keys());
   const totals  = new Map(); // addr -> { totalBought, buysN }
   for (const a of targets) totals.set(a, { totalBought: 0n, buysN: 0 });
@@ -328,7 +382,6 @@ function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false }
     const from = topicToAddr(lg.topics[1]);
     const to   = topicToAddr(lg.topics[2]);
     if (!targets.has(to)) continue;
-
     const isMintIn = from === ZERO;
     const isLPIn   = pair && from === pair;
     if (!isMintIn && !isLPIn) continue;
@@ -338,7 +391,6 @@ function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false }
     t.buysN += 1;
   }
 
-  // 3) Build ordered output + status
   let ordered = [...firstSeen.entries()]
     .sort((a,b) => a[1].firstBuyBlock - b[1].firstBuyBlock)
     .map(([address, info]) => {
@@ -353,11 +405,10 @@ function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false }
       } else if (t.buysN > 1 || t.totalBought > info.firstBuyAmt) {
         status = 'bought more';
       }
-
       return { address, status };
     });
 
-  // 4) Moonshot: drop the first 2 bootstrap recipients, keep next 20
+  // Moonshot: drop first 2 bootstrap recipients
   if (isMoonshot) {
     ordered = ordered.slice(2, Math.min(22, ordered.length));
   } else {
@@ -387,8 +438,8 @@ export async function refreshToken(tokenAddress) {
 
     // 1) Dexscreener (market + pair + creator)
     let market = null;
-    let ammPair = null;        // real on-chain LP (0x…)
-    let launchPadPair = null;  // ":moon" pseudo-id (for UI only)
+    let ammPair = null;
+    let launchPadPair = null;
     let creatorAddr = null;
     let isMoonshot = false;
 
@@ -396,37 +447,30 @@ export async function refreshToken(tokenAddress) {
       const { summary } = await getDexscreenerTokenStats(ca);
       market = summary || null;
 
-      // Detect pairs robustly (AMM vs Moonshot)
       const pairInfo = await getDexPairAddresses(ca);
       ammPair = pairInfo.ammPair || null;
       launchPadPair = pairInfo.launchPadPair || null;
 
-      // Keep market as-is but annotate discovered pairs
       if (market) {
-        market.pairAddress   = ammPair || market.pairAddress || null;  // prefer AMM
+        market.pairAddress   = ammPair || market.pairAddress || null;
         market.launchPadPair = launchPadPair || null;
       }
 
       console.log('[WORKER] Dexscreener ok', ca, 'ammPair=', ammPair, 'moonPair=', launchPadPair, 'cap=', market?.marketCap ?? market?.fdv ?? 0);
 
-      // Preferred creator: tokens/v1
       creatorAddr = await getDexCreator(ca);
 
-      // Flag if this token is Moonshot (used in buyers function)
       isMoonshot =
         !!market?.launchPadPair ||
         String(market?.dexId || '').toLowerCase() === 'moonshot' ||
         !!market?.moonshot;
 
-      // Fallback 1: dexscreener moonshot.creator (string address when present)
       if (!creatorAddr) {
         const dsMoonCreator = market?.moonshot?.creator;
         if (dsMoonCreator && /^0x[a-fA-F0-9]{40}$/.test(dsMoonCreator)) {
           creatorAddr = String(dsMoonCreator).toLowerCase();
         }
       }
-
-      // Fallback 2: explorer contract creation creator
       if (!creatorAddr) {
         creatorAddr = await getContractCreator(ca);
       }
@@ -436,7 +480,7 @@ export async function refreshToken(tokenAddress) {
       console.log('[WORKER] Dexscreener failed:', e?.message || e);
     }
 
-    // 2) Etherscan V2 pulls (finite windowed logs + totals)
+    // 2) Etherscan pulls
     let logs = [];
     let totalSupplyRaw = '0';
     let creatorBalRaw = '0';
@@ -446,15 +490,21 @@ export async function refreshToken(tokenAddress) {
         getLatestBlock(),
       ]);
 
-      const fromB = Math.max(0, creationBlock - 1); // include mint
+      const fromB = Math.max(0, creationBlock - 1);
       const toB   = latestBlock;
 
       console.log('[WORKER] range', ca, fromB, '→', toB);
 
       [logs, totalSupplyRaw] = await Promise.all([
-        getAllTransferLogs(ca, { fromBlock: fromB, toBlock: toB, window: 300_000, offset: 1000 }),
+        getAllTransferLogs(ca, { fromBlock: fromB, toBlock: toB, window: 200_000, offset: 1000 }),
         getTokenTotalSupply(ca),
       ]);
+
+      if (!logs.length) {
+        console.warn('[WORKER] getLogs returned 0 — falling back to account.tokentx …');
+        logs = await getAllTokenTxAsLogs(ca, { startPage: 1, offset: 1000, maxPages: 250 });
+        console.log('[WORKER] tokentx synthesized logs:', logs.length);
+      }
 
       if (creatorAddr) {
         creatorBalRaw = await getCreatorTokenBalance(ca, creatorAddr);
@@ -494,7 +544,6 @@ export async function refreshToken(tokenAddress) {
 
       const supply = toBig(totalSupplyRaw || '0');
 
-      // Exclude AMM pair from holders/top10 (DO NOT exclude ":moon")
       const excludeList = [];
       if (ammPair) excludeList.push(String(ammPair).toLowerCase());
 
@@ -505,7 +554,7 @@ export async function refreshToken(tokenAddress) {
 
       burnedPct = supply > 0n ? Number((burned * 1000000n) / supply) / 10000 : 0;
 
-      // creator percent: prefer direct tokenbalance; fallback to computed balance
+      // creator percent
       let creatorBal = 0n;
       try { creatorBal = toBig(creatorBalRaw || '0'); } catch {}
       if (creatorBal === 0n && creatorAddr) {
@@ -513,7 +562,6 @@ export async function refreshToken(tokenAddress) {
       }
       creatorPercent = (supply > 0n) ? Number((creatorBal * 1000000n) / supply) / 10000 : 0;
 
-      // Buyers: compute regardless of AMM pair (function handles pure-mint / distributor)
       first20Buyers = first20BuyersMatrix(logs, ammPair, balances, { isMoonshot });
 
       console.log('[WORKER] compute sizes',
@@ -525,12 +573,12 @@ export async function refreshToken(tokenAddress) {
       console.log('[WORKER] compute failed:', e?.message || e);
     }
 
-    // 4) Final payload for your renderers
+    // 4) Final payload
     const payload = {
       tokenAddress: ca,
       updatedAt: Date.now(),
 
-      market, // includes price/volume/change/cap/socials AND now { pairAddress, launchPadPair }
+      market,
 
       holdersTop20,
       top10CombinedPct,
@@ -542,7 +590,7 @@ export async function refreshToken(tokenAddress) {
       creator: { address: creatorAddr, percent: creatorPercent },
     };
 
-    // 5) Cache (3m TTL; refresh gate 10m)
+    // 5) Cache
     const sumKey  = `token:${ca}:summary`;
     const gateKey = `token:${ca}:last_refresh`;
     try {
