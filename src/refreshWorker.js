@@ -377,37 +377,87 @@ function detectDistributorAddress(logs, { pairAddress = null, scanLimit = 2000, 
 // First 20 recipients sourced from ZERO, LP, or DISTRIBUTOR.
 // Status from final balance vs total bought.
 // We exclude LP & distributor from the displayed list (but still use them as sources).
-function first20BuyersMatrix(logs, { pairAddress = null, distributor = null, isMoonshot = false }, balances) {
+// First 20 recipients (from ANY sender), status from final balance vs total inbound.
+// On Moonshot: collect first 22, then drop the first 2 (LP + distributor), keep next 20.
+function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false } = {}) {
   if (!Array.isArray(logs) || logs.length === 0) return [];
 
   const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
-  const dist = distributor ? String(distributor).toLowerCase() : null;
-  const SOURCES = new Set([ZERO]);
-  if (pair) SOURCES.add(pair);
-  if (dist) SOURCES.add(dist);
 
-  const LIMIT = isMoonshot ? 30 : 22; // collect a bit more for safety
-
-  // 1) earliest unique recipients from valid sources
+  // 1) take the earliest unique recipients from ANY sender
+  //    (exclude LP itself and dead/burn addresses)
+  const LIMIT = isMoonshot ? 22 : 20;
   const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
-  for (const lg of logs) {
-    const from = topicToAddr(lg.topics[1]);
-    const to   = topicToAddr(lg.topics[2]);
-    if (DEAD.has(to)) continue;
 
-    if (!SOURCES.has(from)) continue;   // only ZERO/LP/DISTRIBUTOR sends count as "buys"
-    if (pair && to === pair) continue;  // never count LP itself
-    if (dist && to === dist) continue;  // never count distributor itself
+  for (const lg of logs) {
+    const to = ('0x' + String(lg.topics[2]).slice(-40)).toLowerCase();
+    if (!to) continue;
+    if (DEAD.has(to)) continue;
+    if (pair && to === pair) continue; // never count LP as a "buyer"
 
     if (!firstSeen.has(to)) {
       firstSeen.set(to, {
-        firstBuyBlock: Number(lg.blockNumber),
-        firstBuyAmt: toBig(lg.data),
+        firstBuyBlock: Number(lg.blockNumber) || 0,
+        firstBuyAmt: BigInt(String(lg.data)) // works for 0x-hex or decimal
       });
       if (firstSeen.size >= LIMIT) break;
     }
   }
 
+  // If nothing matched (edge case), still take earliest unique receivers from ANY sender
+  if (firstSeen.size === 0) {
+    for (const lg of logs) {
+      const to = ('0x' + String(lg.topics[2]).slice(-40)).toLowerCase();
+      if (!to) continue;
+      if (DEAD.has(to)) continue;
+      if (!firstSeen.has(to)) {
+        firstSeen.set(to, {
+          firstBuyBlock: Number(lg.blockNumber) || 0,
+          firstBuyAmt: BigInt(String(lg.data)),
+        });
+        if (firstSeen.size >= LIMIT) break;
+      }
+    }
+  }
+
+  // 2) For those addresses, sum ALL inbound transfers (from ANY sender) as "totalBought"
+  const targets = new Set(firstSeen.keys());
+  const totals  = new Map(); // addr -> { totalBought, buysN }
+  for (const a of targets) totals.set(a, { totalBought: 0n, buysN: 0 });
+
+  for (const lg of logs) {
+    const to = ('0x' + String(lg.topics[2]).slice(-40)).toLowerCase();
+    if (!targets.has(to)) continue;
+    const t = totals.get(to);
+    t.totalBought += BigInt(String(lg.data));
+    t.buysN += 1;
+  }
+
+  // 3) Order by earliest first buy and label by comparing final balance vs totalBought
+  let ordered = [...firstSeen.entries()]
+    .sort((a, b) => a[1].firstBuyBlock - b[1].firstBuyBlock)
+    .map(([address, info]) => {
+      const t = totals.get(address) || { totalBought: 0n, buysN: 0 };
+      const balNow = balances.get(address) || balances.get(address.toLowerCase()) || 0n;
+
+      let status = 'hold';
+      if (balNow === 0n) {
+        status = 'sold all';
+      } else if (balNow < t.totalBought) {
+        status = 'sold some';
+      } else if (t.buysN > 1 || t.totalBought > info.firstBuyAmt) {
+        status = 'bought more';
+      }
+      return { address, status };
+    });
+
+  // 4) Moonshot: drop the first 2 bootstrap recipients (LP + distributor), keep next 20
+  ordered = isMoonshot
+    ? ordered.slice(2, Math.min(22, ordered.length))
+    : ordered.slice(0, Math.min(20, ordered.length));
+
+  return ordered;
+}
   // Fallback: if nothing matched (edge cases), take earliest receivers (still excluding LP/dist/dead)
   if (firstSeen.size === 0) {
     for (const lg of logs) {
