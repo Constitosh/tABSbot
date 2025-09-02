@@ -9,6 +9,8 @@ import { pnlQueue, refreshPnl } from './pnlWorker.js';
 import { renderPNL } from './renderers_pnl.js';
 
 
+
+
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
 bot.command('pnl', async (ctx) => {
