@@ -5,8 +5,58 @@ import { getJSON, setJSON } from './cache.js';
 import { queue, refreshToken } from './queueCore.js';
 import { renderOverview, renderBuyers, renderHolders, renderAbout } from './renderers.js';
 import { isAddress } from './util.js';
+import { pnlQueue, refreshPnl } from './pnlWorker.js';
+import { renderPNL } from './renderers_pnl.js';
+
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
+
+bot.command('pnl', async (ctx) => {
+  try {
+    const parts = (ctx.message.text || '').trim().split(/\s+/);
+    const wallet = (parts[1] || '').toLowerCase();
+    if (!/^0x[a-f0-9]{40}$/.test(wallet)) {
+      return ctx.reply('Usage: /pnl <walletAddress>');
+    }
+    await pnlQueue.add('pnl', { wallet, window: '30d' }, { removeOnComplete: true, removeOnFail: true });
+    const data = await refreshPnl(wallet, '30d');
+    const { text, extra } = renderPNL(data, '30d');
+    return ctx.replyWithHTML(text, extra);
+  } catch (e) {
+    console.error(e);
+    return ctx.reply('PNL: something went wrong.');
+  }
+});
+
+bot.on('callback_query', async (ctx) => {
+  try {
+    const d = ctx.callbackQuery?.data || '';
+
+    if (d.startsWith('pnl:')) {
+      const [, wallet, window] = d.split(':');
+      const data = await refreshPnl(wallet, window);
+      const { text, extra } = renderPNL(data, window);
+      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML' });
+      return ctx.answerCbQuery();
+    }
+
+    if (d.startsWith('pnl_refresh:')) {
+      const [, wallet, window] = d.split(':');
+      await pnlQueue.add('pnl', { wallet, window }, { removeOnComplete: true, removeOnFail: true });
+      const data = await refreshPnl(wallet, window);
+      const { text, extra } = renderPNL(data, window);
+      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML' });
+      return ctx.answerCbQuery('Refreshed');
+    }
+
+    // fall through to your other callbacks if any…
+  } catch (e) {
+    console.error(e);
+    try { await ctx.answerCbQuery('Error'); } catch {}
+  }
+});
+
+
 
 // ----- HTML helpers (ensure consistent parse_mode) -----
 const sendHTML = (ctx, text, extra = {}) =>
