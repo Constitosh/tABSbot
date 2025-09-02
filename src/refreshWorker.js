@@ -271,38 +271,68 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
   return { holdersTop20: top20, top10CombinedPct, holdersCount: rows.length };
 }
 
-// First recipients (any sender), status from final balance vs total bought.
+// First 20 recipients (mint or LP), status from final balance vs total bought.
 // On Moonshot: collect first 22, then drop the first 2 (LP + distributor), keep next 20.
 function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false } = {}) {
+  const ZERO = '0x0000000000000000000000000000000000000000';
   const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
+
+  if (!Array.isArray(logs) || logs.length === 0) return [];
 
   const LIMIT = isMoonshot ? 22 : 20;
 
-  // 1) Earliest unique recipients (exclude LP + dead)
-  const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
+  // 1) earliest unique recipients from mint OR LP. Exclude LP itself and dead.
+  const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt, from }
   for (const lg of logs) {
-    const to = topicToAddr(lg.topics[2]);
-
+    const from = topicToAddr(lg.topics[1]);
+    const to   = topicToAddr(lg.topics[2]);
     if (DEAD.has(to)) continue;
-    if (pair && to === pair) continue; // never count the LP itself
+    if (pair && to === pair) continue;
+
+    const isMintIn = from === ZERO;
+    const isLPIn   = pair && from === pair;
+    if (!isMintIn && !isLPIn) continue;
 
     if (!firstSeen.has(to)) {
       firstSeen.set(to, {
         firstBuyBlock: Number(lg.blockNumber),
         firstBuyAmt: toBig(lg.data),
+        from
       });
       if (firstSeen.size >= LIMIT) break;
     }
   }
 
-  // 2) For those addresses, sum ALL inbound transfers as "totalBought"
+  // Fallback: if we somehow have nothing, take first 20 receivers (excluding dead)
+  if (firstSeen.size === 0) {
+    for (const lg of logs) {
+      const to = topicToAddr(lg.topics[2]);
+      if (DEAD.has(to)) continue;
+      if (!firstSeen.has(to)) {
+        firstSeen.set(to, {
+          firstBuyBlock: Number(lg.blockNumber),
+          firstBuyAmt: toBig(lg.data),
+          from: topicToAddr(lg.topics[1]),
+        });
+        if (firstSeen.size >= LIMIT) break;
+      }
+    }
+  }
+
+  // 2) For those addresses, sum ALL inbound transfers from mint/LP as "totalBought"
   const targets = new Set(firstSeen.keys());
   const totals  = new Map(); // addr -> { totalBought, buysN }
   for (const a of targets) totals.set(a, { totalBought: 0n, buysN: 0 });
 
   for (const lg of logs) {
-    const to = topicToAddr(lg.topics[2]);
+    const from = topicToAddr(lg.topics[1]);
+    const to   = topicToAddr(lg.topics[2]);
     if (!targets.has(to)) continue;
+
+    const isMintIn = from === ZERO;
+    const isLPIn   = pair && from === pair;
+    if (!isMintIn && !isLPIn) continue;
+
     const t = totals.get(to);
     t.totalBought += toBig(lg.data);
     t.buysN += 1;
@@ -322,16 +352,16 @@ function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false }
         status = 'sold some';
       } else if (t.buysN > 1 || t.totalBought > info.firstBuyAmt) {
         status = 'bought more';
-      } // else keep 'hold'
+      }
 
       return { address, status };
     });
 
   // 4) Moonshot: drop the first 2 bootstrap recipients, keep next 20
   if (isMoonshot) {
-    ordered = ordered.slice(2, 22);
+    ordered = ordered.slice(2, Math.min(22, ordered.length));
   } else {
-    ordered = ordered.slice(0, 20);
+    ordered = ordered.slice(0, Math.min(20, ordered.length));
   }
 
   return ordered;
@@ -360,7 +390,7 @@ export async function refreshToken(tokenAddress) {
     let ammPair = null;        // real on-chain LP (0x…)
     let launchPadPair = null;  // ":moon" pseudo-id (for UI only)
     let creatorAddr = null;
-    let isMoonshot = false;    // << declare here for later use
+    let isMoonshot = false;
 
     try {
       const { summary } = await getDexscreenerTokenStats(ca);
@@ -388,7 +418,7 @@ export async function refreshToken(tokenAddress) {
         String(market?.dexId || '').toLowerCase() === 'moonshot' ||
         !!market?.moonshot;
 
-      // Fallback 1: dexscreener moonshot.creator
+      // Fallback 1: dexscreener moonshot.creator (string address when present)
       if (!creatorAddr) {
         const dsMoonCreator = market?.moonshot?.creator;
         if (dsMoonCreator && /^0x[a-fA-F0-9]{40}$/.test(dsMoonCreator)) {
@@ -401,7 +431,7 @@ export async function refreshToken(tokenAddress) {
         creatorAddr = await getContractCreator(ca);
       }
 
-      console.log('[WORKER] Creator address', creatorAddr || 'unknown');
+      console.log('[WORKER] Creator address', creatorAddr || 'unknown', 'isMoonshot=', isMoonshot);
     } catch (e) {
       console.log('[WORKER] Dexscreener failed:', e?.message || e);
     }
@@ -441,6 +471,7 @@ export async function refreshToken(tokenAddress) {
       const ia = Number(a.logIndex||0), ib = Number(b.logIndex||0);
       return ia - ib;
     });
+    console.log('[WORKER] logs sorted. len=', logs.length);
 
     // 3) Compute
     let holdersTop20 = [];
@@ -452,6 +483,7 @@ export async function refreshToken(tokenAddress) {
 
     try {
       const balances = buildBalancesFromLogs(logs);
+      const balancesSize = balances.size;
 
       // burned supply (sum transfers to dead addresses)
       let burned = 0n;
@@ -483,6 +515,12 @@ export async function refreshToken(tokenAddress) {
 
       // Buyers: compute regardless of AMM pair (function handles pure-mint / distributor)
       first20Buyers = first20BuyersMatrix(logs, ammPair, balances, { isMoonshot });
+
+      console.log('[WORKER] compute sizes',
+        'balances=', balancesSize,
+        'holdersTop20=', holdersTop20?.length || 0,
+        'buyers=', first20Buyers?.length || 0
+      );
     } catch (e) {
       console.log('[WORKER] compute failed:', e?.message || e);
     }
