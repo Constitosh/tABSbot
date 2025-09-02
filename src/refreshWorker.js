@@ -458,67 +458,6 @@ function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false }
 
   return ordered;
 }
-  // Fallback: if nothing matched (edge cases), take earliest receivers (still excluding LP/dist/dead)
-  if (firstSeen.size === 0) {
-    for (const lg of logs) {
-      const to = topicToAddr(lg.topics[2]);
-      if (DEAD.has(to)) continue;
-      if (pair && to === pair) continue;
-      if (dist && to === dist) continue;
-      if (!firstSeen.has(to)) {
-        firstSeen.set(to, {
-          firstBuyBlock: Number(lg.blockNumber),
-          firstBuyAmt: toBig(lg.data),
-        });
-        if (firstSeen.size >= 22) break;
-      }
-    }
-  }
-
-  // 2) For those addresses, sum all inbound from the defined SOURCES as "totalBought"
-  const targets = new Set(firstSeen.keys());
-  const totals  = new Map(); // addr -> { totalBought, buysN }
-  for (const a of targets) totals.set(a, { totalBought: 0n, buysN: 0 });
-
-  for (const lg of logs) {
-    const from = topicToAddr(lg.topics[1]);
-    const to   = topicToAddr(lg.topics[2]);
-    if (!targets.has(to)) continue;
-    if (!SOURCES.has(from)) continue;
-
-    const t = totals.get(to);
-    t.totalBought += toBig(lg.data);
-    t.buysN += 1;
-  }
-
-  // 3) order & label
-  let ordered = [...firstSeen.entries()]
-    .sort((a,b) => a[1].firstBuyBlock - b[1].firstBuyBlock)
-    .map(([address, info]) => {
-      const t = totals.get(address) || { totalBought: 0n, buysN: 0 };
-      const balNow = balances.get(address.toLowerCase()) || 0n;
-
-      let status = 'hold';
-      if (balNow === 0n) {
-        status = 'sold all';
-      } else if (balNow < t.totalBought) {
-        status = 'sold some';
-      } else if (t.buysN > 1 || t.totalBought > info.firstBuyAmt) {
-        status = 'bought more';
-      }
-      return { address, status };
-    });
-
-  // 4) Explicitly exclude LP & distributor from display; then show first 20
-  ordered = ordered.filter(r => {
-    const a = r.address.toLowerCase();
-    if (pair && a === pair) return false;
-    if (dist && a === dist) return false;
-    return true;
-  });
-
-  return ordered.slice(0, 20);
-}
 
 // ---------- Redis / BullMQ ----------
 const bullRedis = new Redis(process.env.REDIS_URL, {
