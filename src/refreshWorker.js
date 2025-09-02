@@ -201,7 +201,7 @@ async function getAllTransferLogs(token, {
       let ok = false;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          batch = await esGET(params, { logOnce: page === 1 && attempt === 1, tag: `[logs ${start}-${end}]` });
+          batch = await esGET(params, { logOnce: (page === 1 && attempt === 1), tag: `[logs ${start}-${end}]` });
           ok = true;
           break;
         } catch (e) {
@@ -331,24 +331,73 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
   return { holdersTop20: top20, top10CombinedPct, holdersCount: rows.length };
 }
 
-// First 20 recipients (mint or LP), status from final balance vs total bought.
-// On Moonshot: collect first 22, then drop the first 2 (LP + distributor), keep next 20.
-function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false } = {}) {
+/* ========================= NEW: Distributor detection ========================= */
+// Heuristic: detect a "distributor" (fan-out) address in early history.
+// Finds the non-LP, non-dead, non-zero sender with the largest number of unique recipients,
+// that also received from ZERO before it started sending.
+function detectDistributorAddress(logs, { pairAddress = null, scanLimit = 2000, minFanout = 8 }) {
+  if (!Array.isArray(logs) || logs.length === 0) return null;
   const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
+
+  const sendCounts = new Map();          // sender -> Set(unique recipients)
+  const inboundFromZero = new Set();     // addrs that ever received from ZERO in early window
+
+  const L = Math.min(scanLimit, logs.length);
+  for (let i = 0; i < L; i++) {
+    const lg = logs[i];
+    const from = topicToAddr(lg.topics[1]);
+    const to   = topicToAddr(lg.topics[2]);
+
+    if (from === ZERO && !DEAD.has(to)) inboundFromZero.add(to);
+
+    // track fan-out per sender (skip bad senders)
+    if (DEAD.has(from) || from === ZERO) continue;
+    if (pair && from === pair) continue;
+
+    if (!sendCounts.has(from)) sendCounts.set(from, new Set());
+    if (!DEAD.has(to) && (!pair || to !== pair)) {
+      sendCounts.get(from).add(to);
+    }
+  }
+
+  let best = null;
+  let bestCount = 0;
+  for (const [sender, recips] of sendCounts.entries()) {
+    const c = recips.size;
+    if (c > bestCount && inboundFromZero.has(sender)) {
+      best = sender;
+      bestCount = c;
+    }
+  }
+  if (best && bestCount >= minFanout) return best;
+  return null;
+}
+
+/* ========================= UPDATED: buyers matrix ========================= */
+// First 20 recipients sourced from ZERO, LP, or DISTRIBUTOR.
+// Status from final balance vs total bought.
+// We exclude LP & distributor from the displayed list (but still use them as sources).
+function first20BuyersMatrix(logs, { pairAddress = null, distributor = null, isMoonshot = false }, balances) {
   if (!Array.isArray(logs) || logs.length === 0) return [];
 
-  const LIMIT = isMoonshot ? 22 : 20;
-  const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
+  const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
+  const dist = distributor ? String(distributor).toLowerCase() : null;
+  const SOURCES = new Set([ZERO]);
+  if (pair) SOURCES.add(pair);
+  if (dist) SOURCES.add(dist);
 
+  const LIMIT = isMoonshot ? 30 : 22; // collect a bit more for safety
+
+  // 1) earliest unique recipients from valid sources
+  const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
   for (const lg of logs) {
     const from = topicToAddr(lg.topics[1]);
     const to   = topicToAddr(lg.topics[2]);
     if (DEAD.has(to)) continue;
-    if (pair && to === pair) continue;
 
-    const isMintIn = from === ZERO;
-    const isLPIn   = pair && from === pair;
-    if (!isMintIn && !isLPIn) continue;
+    if (!SOURCES.has(from)) continue;   // only ZERO/LP/DISTRIBUTOR sends count as "buys"
+    if (pair && to === pair) continue;  // never count LP itself
+    if (dist && to === dist) continue;  // never count distributor itself
 
     if (!firstSeen.has(to)) {
       firstSeen.set(to, {
@@ -359,21 +408,24 @@ function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false }
     }
   }
 
-  // Fallback: take earliest receivers if nothing matched
+  // Fallback: if nothing matched (edge cases), take earliest receivers (still excluding LP/dist/dead)
   if (firstSeen.size === 0) {
     for (const lg of logs) {
       const to = topicToAddr(lg.topics[2]);
       if (DEAD.has(to)) continue;
+      if (pair && to === pair) continue;
+      if (dist && to === dist) continue;
       if (!firstSeen.has(to)) {
         firstSeen.set(to, {
           firstBuyBlock: Number(lg.blockNumber),
           firstBuyAmt: toBig(lg.data),
         });
-        if (firstSeen.size >= LIMIT) break;
+        if (firstSeen.size >= 22) break;
       }
     }
   }
 
+  // 2) For those addresses, sum all inbound from the defined SOURCES as "totalBought"
   const targets = new Set(firstSeen.keys());
   const totals  = new Map(); // addr -> { totalBought, buysN }
   for (const a of targets) totals.set(a, { totalBought: 0n, buysN: 0 });
@@ -382,15 +434,14 @@ function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false }
     const from = topicToAddr(lg.topics[1]);
     const to   = topicToAddr(lg.topics[2]);
     if (!targets.has(to)) continue;
-    const isMintIn = from === ZERO;
-    const isLPIn   = pair && from === pair;
-    if (!isMintIn && !isLPIn) continue;
+    if (!SOURCES.has(from)) continue;
 
     const t = totals.get(to);
     t.totalBought += toBig(lg.data);
     t.buysN += 1;
   }
 
+  // 3) order & label
   let ordered = [...firstSeen.entries()]
     .sort((a,b) => a[1].firstBuyBlock - b[1].firstBuyBlock)
     .map(([address, info]) => {
@@ -408,14 +459,15 @@ function first20BuyersMatrix(logs, pairAddress, balances, { isMoonshot = false }
       return { address, status };
     });
 
-  // Moonshot: drop first 2 bootstrap recipients
-  if (isMoonshot) {
-    ordered = ordered.slice(2, Math.min(22, ordered.length));
-  } else {
-    ordered = ordered.slice(0, Math.min(20, ordered.length));
-  }
+  // 4) Explicitly exclude LP & distributor from display; then show first 20
+  ordered = ordered.filter(r => {
+    const a = r.address.toLowerCase();
+    if (pair && a === pair) return false;
+    if (dist && a === dist) return false;
+    return true;
+  });
 
-  return ordered;
+  return ordered.slice(0, 20);
 }
 
 // ---------- Redis / BullMQ ----------
@@ -562,7 +614,15 @@ export async function refreshToken(tokenAddress) {
       }
       creatorPercent = (supply > 0n) ? Number((creatorBal * 1000000n) / supply) / 10000 : 0;
 
-      first20Buyers = first20BuyersMatrix(logs, ammPair, balances, { isMoonshot });
+      // NEW: detect distributor and compute buyers from ZERO/LP/DISTRIBUTOR
+      const distributorAddr = detectDistributorAddress(logs, { pairAddress: ammPair, scanLimit: 2000, minFanout: 8 });
+      if (distributorAddr) console.log('[WORKER] distributor detected:', distributorAddr);
+
+      first20Buyers = first20BuyersMatrix(
+        logs,
+        { pairAddress: ammPair, distributor: distributorAddr, isMoonshot },
+        balances
+      );
 
       console.log('[WORKER] compute sizes',
         'balances=', balancesSize,
