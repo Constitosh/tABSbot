@@ -1,10 +1,7 @@
 // src/refreshWorker.js
 // Sources:
 //  • Market + creator: Dexscreener (pair + /tokens/v1/abstract/<CA> for creator)
-//  • On-chain math: Etherscan V2 (chainid=2741)
-//      - Holders/top10/burn: logs.getLogs (fallback: synthesize from account.tokentx)
-//      - First buyers (status): derived from logs (primary) using buySources { ZERO, token CA, LP }; Moonshot: collect 27 then drop 2
-//      - Totals: stats.tokensupply, account.tokenbalance
+//  • On-chain math: Etherscan V2 (chainid=2741) — logs.getLogs (primary), account.tokentx (fallback), stats.tokensupply, account.tokenbalance
 // Queue: BullMQ
 
 import './configEnv.js';
@@ -62,10 +59,10 @@ const ES_KEY   = process.env.ETHERSCAN_API_KEY;
 const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741'; // Abstract
 
 if (!ES_KEY) console.warn('[WORKER BOOT] ETHERSCAN_API_KEY is missing');
-// Abstract can be slow -> 45s
+// Slightly higher timeout for Abstract
 const httpES = axios.create({ baseURL: ES_BASE, timeout: 45_000 });
 
-// ---------- Etherscan rate limit ----------
+// ---------- Etherscan rate limit (≤ 5 req/s by default) ----------
 const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
 const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS);
 
@@ -118,7 +115,7 @@ const toBig = (x) => BigInt(String(x));
 const topicToAddr = (t) => ('0x' + String(t).slice(-40)).toLowerCase();
 const padAddrTopic = (addr) => '0x'.concat('0'.repeat(24), String(addr).toLowerCase().replace(/^0x/, ''));
 
-// ---------- Block bounds ----------
+// ---------- Discover block bounds ----------
 async function getCreationBlock(token) {
   try {
     const res = await esGET(
@@ -167,7 +164,7 @@ async function getContractCreator(token) {
   }
 }
 
-// ---------- logs.getLogs (finite) with retry ----------
+// ---------- Windowed Transfer log crawler ----------
 async function getAllTransferLogs(token, {
   fromBlock,
   toBlock,
@@ -235,8 +232,8 @@ async function getAllTransferLogs(token, {
   return all;
 }
 
-// ---------- Fallback: account.tokentx -> synthesize logs for balances ----------
-async function getAllTokenTxAsLogs(token, { startPage = 1, offset = 1000, maxPages = 300 } = {}) {
+// ---------- Fallback: account.tokentx -> synthesize "log-like" ----------
+async function getAllTokenTxAsLogs(token, { startPage = 1, offset = 1000, maxPages = 250 } = {}) {
   const out = [];
   for (let page = startPage; page < startPage + maxPages; page++) {
     const params = {
@@ -277,13 +274,14 @@ async function getAllTokenTxAsLogs(token, { startPage = 1, offset = 1000, maxPag
   return out;
 }
 
-// ---------- Totals ----------
+// ---------- Etherscan helpers ----------
 async function getTokenTotalSupply(token) {
   return String(await esGET(
     { module: 'stats', action: 'tokensupply', contractaddress: token },
     { logOnce: true, tag: '[supply]' }
   ));
 }
+
 async function getCreatorTokenBalance(token, creator) {
   if (!creator) return '0';
   return String(await esGET(
@@ -292,7 +290,6 @@ async function getCreatorTokenBalance(token, creator) {
   ));
 }
 
-// ---------- Balances from logs ----------
 function buildBalancesFromLogs(logs) {
   const balances = new Map(); // addr -> bigint
   for (const lg of logs) {
@@ -306,7 +303,7 @@ function buildBalancesFromLogs(logs) {
   return balances;
 }
 
-// ---------- Top holders ----------
+// Compute holders & top10, excluding specified addresses (e.g., LP)
 function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
   const ex = new Set((exclude || []).map(s => String(s || '').toLowerCase()));
   const rows = [];
@@ -332,100 +329,81 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
   return { holdersTop20: top20, top10CombinedPct, holdersCount: rows.length };
 }
 
-// ---------- FIRST BUYERS from logs (primary) ----------
-function firstBuyersFromLogs(logs, { ca, ammPair, isMoonshot }, balances) {
+/**
+ * NEW: First 20 buyers logic (creator-anchored)
+ * - Find the first log where the CREATOR receives tokens FROM { tokenCA, ZERO, ammPair }.
+ * - From that point forward, collect the next unique inbound recipients meeting the same source rule,
+ *   until we have 20 recipients (including the creator as #1).
+ * - Status is derived from balanceNow vs firstBuyAmt only (hold / sold some / sold all / bought more).
+ */
+function first20BuyersByCreatorStart(logs, tokenCA, creator, pairAddress, balances) {
   if (!Array.isArray(logs) || logs.length === 0) return [];
+  const token = String(tokenCA || '').toLowerCase();
+  const creatorAddr = creator ? String(creator).toLowerCase() : null;
+  const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
 
-  const caLower = String(ca).toLowerCase();
-  const pair    = ammPair ? String(ammPair).toLowerCase() : null;
-
-  // Buy sources: ZERO, token CA, LP (when present)
-  const buySources = new Set([ZERO, caLower]);
-  if (pair) buySources.add(pair);
-
-  // Collect earliest unique receivers where from ∈ buySources
-  const LIMIT = isMoonshot ? 27 : 20; // collect 27 for moonshot; drop 2 later
-  const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
-
-  for (const lg of logs) {
+  // 1) find anchor index where creator receives from token||zero||pair
+  let startIdx = -1;
+  for (let i = 0; i < logs.length; i++) {
+    const lg = logs[i];
     const from = topicToAddr(lg.topics[1]);
     const to   = topicToAddr(lg.topics[2]);
+    if (!creatorAddr || to !== creatorAddr) continue;
 
-    if (!to || DEAD.has(to)) continue;
-    if (pair && to === pair) continue;   // never LP as buyer
-    if (to === caLower) continue;        // never token contract as buyer
+    const fromIsSource = (from === token) || (from === ZERO) || (pair && from === pair);
+    if (fromIsSource) { startIdx = i; break; }
+  }
 
-    if (!buySources.has(from)) continue;
+  // If we can't find that anchor, bail to empty (your UI can say N/A)
+  if (startIdx < 0) return [];
+
+  // 2) walk forward and collect earliest unique recipients from the same sources
+  const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
+  const addIfEligible = (lg) => {
+    const from = topicToAddr(lg.topics[1]);
+    const to   = topicToAddr(lg.topics[2]);
+    if (DEAD.has(to)) return false;
+    if (pair && to === pair) return false; // ignore LP address as a receiver
+
+    const fromIsSource = (from === token) || (from === ZERO) || (pair && from === pair);
+    if (!fromIsSource) return false;
 
     if (!firstSeen.has(to)) {
       firstSeen.set(to, {
-        firstBuyBlock: Number(lg.blockNumber || 0),
-        firstBuyAmt: toBig(lg.data || '0'),
+        firstBuyBlock: Number(lg.blockNumber),
+        firstBuyAmt: toBig(lg.data),
       });
-      if (firstSeen.size >= LIMIT) break;
+      return true;
     }
+    return false;
+  };
+
+  // Include creator first (anchor log will satisfy it)
+  addIfEligible(logs[startIdx]);
+
+  // keep scanning forward until we have 20 unique recipients total
+  for (let i = startIdx + 1; i < logs.length && firstSeen.size < 20; i++) {
+    addIfEligible(logs[i]);
   }
 
-  // If still empty (very odd), fallback to earliest unique receivers (skip LP/contract/dead)
-  if (firstSeen.size === 0) {
-    for (const lg of logs) {
-      const to = topicToAddr(lg.topics[2]);
-      if (!to || DEAD.has(to)) continue;
-      if (pair && to === pair) continue;
-      if (to === caLower) continue;
-
-      if (!firstSeen.has(to)) {
-        firstSeen.set(to, {
-          firstBuyBlock: Number(lg.blockNumber || 0),
-          firstBuyAmt: toBig(lg.data || '0'),
-        });
-        if (firstSeen.size >= LIMIT) break;
-      }
-    }
-  }
-
-  // For those addresses, sum all inbound from buy sources (totalBought)
-  const targets = new Set(firstSeen.keys());
-  const totals  = new Map(); // addr -> { totalBought, buysN }
-  for (const a of targets) totals.set(a, { totalBought: 0n, buysN: 0 });
-
-  for (const lg of logs) {
-    const from = topicToAddr(lg.topics[1]);
-    const to   = topicToAddr(lg.topics[2]);
-    if (!targets.has(to)) continue;
-    if (!buySources.has(from)) continue;
-
-    const t = totals.get(to);
-    t.totalBought += toBig(lg.data || '0');
-    t.buysN += 1;
-  }
-
-  // Build ordered output + status
-  let ordered = [...firstSeen.entries()]
-    .sort((a,b) => a[1].firstBuyBlock - b[1].firstBuyBlock)
+  // 3) render ordered list (by firstBuyBlock) + status vs firstBuyAmt
+  const ordered = [...firstSeen.entries()]
+    .sort((a, b) => a[1].firstBuyBlock - b[1].firstBuyBlock)
     .map(([address, info]) => {
-      const t = totals.get(address) || { totalBought: 0n, buysN: 0 };
       const balNow = balances.get(address.toLowerCase()) || 0n;
-
       let status = 'hold';
       if (balNow === 0n) {
         status = 'sold all';
-      } else if (balNow < t.totalBought) {
+      } else if (balNow < info.firstBuyAmt) {
         status = 'sold some';
-      } else if (t.buysN > 1 || t.totalBought > info.firstBuyAmt) {
+      } else if (balNow > info.firstBuyAmt) {
         status = 'bought more';
-      }
+      } // else exactly equal => 'hold'
       return { address, status };
     });
 
-  // Moonshot: drop first 2 bootstrap recipients -> keep next 20
-  if (isMoonshot) {
-    ordered = ordered.slice(2, 22);
-  } else {
-    ordered = ordered.slice(0, 20);
-  }
-
-  return ordered;
+  // exactly first 20 (or fewer if not enough recipients)
+  return ordered.slice(0, Math.min(20, ordered.length));
 }
 
 // ---------- Redis / BullMQ ----------
@@ -452,7 +430,6 @@ export async function refreshToken(tokenAddress) {
     let launchPadPair = null;
     let creatorAddr = null;
     let isMoonshot = false;
-    let isMoonshotBonding = false;
 
     try {
       const { summary } = await getDexscreenerTokenStats(ca);
@@ -467,19 +444,15 @@ export async function refreshToken(tokenAddress) {
         market.launchPadPair = launchPadPair || null;
       }
 
-      // Preferred creator
+      console.log('[WORKER] Dexscreener ok', ca, 'ammPair=', ammPair, 'moonPair=', launchPadPair, 'cap=', market?.marketCap ?? market?.fdv ?? 0);
+
       creatorAddr = await getDexCreator(ca);
 
-      // Moonshot flags
       isMoonshot =
         !!market?.launchPadPair ||
         String(market?.dexId || '').toLowerCase() === 'moonshot' ||
         !!market?.moonshot;
 
-      const progress = Number(market?.moonshot?.progress ?? NaN);
-      isMoonshotBonding = isMoonshot && Number.isFinite(progress) && progress < 100;
-
-      // Fallbacks for creator
       if (!creatorAddr) {
         const dsMoonCreator = market?.moonshot?.creator;
         if (dsMoonCreator && /^0x[a-fA-F0-9]{40}$/.test(dsMoonCreator)) {
@@ -490,8 +463,7 @@ export async function refreshToken(tokenAddress) {
         creatorAddr = await getContractCreator(ca);
       }
 
-      console.log('[WORKER] Dex ok', { ca, ammPair, moonPair: launchPadPair, cap: market?.marketCap ?? market?.fdv ?? 0, progress, isMoonshotBonding });
-      console.log('[WORKER] Creator', creatorAddr || 'unknown');
+      console.log('[WORKER] Creator address', creatorAddr || 'unknown', 'isMoonshot=', isMoonshot);
     } catch (e) {
       console.log('[WORKER] Dexscreener failed:', e?.message || e);
     }
@@ -517,8 +489,8 @@ export async function refreshToken(tokenAddress) {
       ]);
 
       if (!logs.length) {
-        console.warn('[WORKER] getLogs returned 0 — falling back to account.tokentx synth logs for balances …');
-        logs = await getAllTokenTxAsLogs(ca, { startPage: 1, offset: 1000, maxPages: 300 });
+        console.warn('[WORKER] getLogs returned 0 — falling back to account.tokentx …');
+        logs = await getAllTokenTxAsLogs(ca, { startPage: 1, offset: 1000, maxPages: 250 });
         console.log('[WORKER] tokentx synthesized logs:', logs.length);
       }
 
@@ -530,7 +502,7 @@ export async function refreshToken(tokenAddress) {
       console.log('[WORKER] ESV2 failed:', e?.message || e);
     }
 
-    // strict chronological
+    // sort logs chronological (blockNumber, logIndex)
     logs.sort((a,b) => {
       const ba = Number(a.blockNumber||0), bb = Number(b.blockNumber||0);
       if (ba !== bb) return ba - bb;
@@ -551,7 +523,7 @@ export async function refreshToken(tokenAddress) {
       const balances = buildBalancesFromLogs(logs);
       const balancesSize = balances.size;
 
-      // burned supply
+      // burned supply (sum transfers to dead addresses)
       let burned = 0n;
       for (const lg of logs) {
         const to = topicToAddr(lg.topics[2]);
@@ -560,12 +532,13 @@ export async function refreshToken(tokenAddress) {
 
       const supply = toBig(totalSupplyRaw || '0');
 
-      // Exclusions for holders:
-      //  - always LP (ammPair)
-      //  - if Moonshot bonding: also exclude token CA (pool == token CA)
+      // Exclude AMM pair; and during Moonshot bonding (<100%), also exclude token CA (pool == token)
       const excludeList = [];
       if (ammPair) excludeList.push(String(ammPair).toLowerCase());
-      if (isMoonshotBonding) excludeList.push(String(ca).toLowerCase());
+      const moonProg = Number(market?.moonshot?.progress || 0);
+      if (isMoonshot && moonProg > 0 && moonProg < 100) {
+        excludeList.push(ca); // pool equals token address while bonding
+      }
 
       const holders = computeTopHolders(balances, supply, { exclude: excludeList });
       holdersTop20 = holders.holdersTop20;
@@ -582,12 +555,8 @@ export async function refreshToken(tokenAddress) {
       }
       creatorPercent = (supply > 0n) ? Number((creatorBal * 1000000n) / supply) / 10000 : 0;
 
-      // FIRST BUYERS from logs
-      first20Buyers = firstBuyersFromLogs(
-        logs,
-        { ca, ammPair, isMoonshot: isMoonshotBonding || isMoonshot },
-        balances
-      );
+      // NEW buyers logic (creator-anchored)
+      first20Buyers = first20BuyersByCreatorStart(logs, ca, creatorAddr, ammPair, balances);
 
       console.log('[WORKER] compute sizes',
         'balances=', balancesSize,
