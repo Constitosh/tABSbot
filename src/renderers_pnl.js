@@ -14,7 +14,7 @@ const fmtQty = (units, decimals) => {
 
 // UI: window chips + views
 function headerChips(wallet, window, view){
-  const windows = ['24h','7d','30d','365d','all'];
+  const windows = ['24h','7d','30d','90d','all'];
   const viewBtns1 = [
     { text: view==='overview' ? '· Overview ·' : 'Overview', callback_data:`pnlview:${wallet}:${window}:overview` },
     { text: view==='profits'  ? '· Profits ·'  : 'Profits',  callback_data:`pnlview:${wallet}:${window}:profits` },
