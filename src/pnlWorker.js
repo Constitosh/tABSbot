@@ -301,15 +301,12 @@ async function computePnL(wallet, { sinceTs=0 }) {
     const airdropQtyFloat = Number(airdropUnits) / Number(scale || 1n);
     const airdropUsd = airdropQtyFloat * Number(priceUsd || 0);
 
-    // ... you are inside computePnL(), per-token loop, after you already have:
-//   txs (sorted), token, tokenDecimals, qty (BigInt), costWeth, realizedWeth,
-//   priceUsd, priceWeth, airdrops[], scale = 10n ** BigInt(tokenDecimals)
-
-// Mark-to-market (unchanged)
-const qtyFloatTokens   = Number(qty) / Number(scale || 1n);
-const invCostFloatWeth = Number(costWeth) / 1e18;
-const mtmValueWeth     = qtyFloatTokens * Number(priceWeth || 0);
-const unrealizedWeth   = mtmValueWeth - invCostFloatWeth;
+// You already have these above in your loop:
+// const qty = ...
+// const costWeth = ...
+// const realizedWeth = ...
+// const tokenDecimals = ...
+// const scale = 10n ** BigInt(tokenDecimals);
 
 // ---------- NEW: hide dust < 5 tokens (but NOT ETH/WETH) ----------
 const symUp     = String(txs[0]?.tokenSymbol || '').toUpperCase();
@@ -320,13 +317,16 @@ const MIN_UNITS = 5n * (10n ** BigInt(tokenDecimals));
 
 // If there's a remaining balance and it's below 5 tokens, skip (unless ETH/WETH)
 if (qty > 0n && !isEthLike && qty < MIN_UNITS) {
-  // Skip emitting this tiny open position
-  continue;
+  continue; // skip pushing this token to perToken[]
 }
 
-// (Optional) if you compute an airdrop value/qty, keep your existing code…
+// ----- mark-to-market (only once now) -----
+const qtyFloatTokens   = Number(qty) / Number(scale || 1n);
+const invCostFloatWeth = Number(costWeth) / 1e18;
+const mtmValueWeth     = qtyFloatTokens * Number(priceWeth || 0);
+const unrealizedWeth   = mtmValueWeth - invCostFloatWeth;
 
-// Push the row (as you already do)
+// Push the row
 perToken.push({
   token,
   symbol: txs[0]?.tokenSymbol || '',
@@ -334,21 +334,18 @@ perToken.push({
   buys: buys.toString(),
   sells: sells.toString(),
   remaining: qty.toString(),
-
-  // I recommend storing as numbers for the renderer (you already do some of this)
-  realizedWeth: Number(realizedWeth) / 1e18,   // WETH float
-  inventoryCostWeth: Number(costWeth) / 1e18,  // WETH float
+  realizedWeth: Number(realizedWeth) / 1e18,
+  inventoryCostWeth: Number(costWeth) / 1e18,
   priceUsd: Number(priceUsd || 0),
   priceWeth: Number(priceWeth || 0),
-  unrealizedWeth,                               // WETH float
-
-  // keep your airdrops structure if you like
+  unrealizedWeth,
   airdrops: {
     count: airdrops.length,
     units: airdropUnits.toString(),
     estUsd: (Number(airdropUnits) / Number(scale || 1n)) * Number(priceUsd || 0),
   },
 });
+
 
 
     perToken.push({
