@@ -12,7 +12,7 @@ import { renderPNL } from './renderers_pnl.js';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-// ----- PNL command -----
+/* ====== PNL command ====== */
 bot.command('pnl', async (ctx) => {
   try {
     const parts = (ctx.message?.text || '').trim().split(/\s+/);
@@ -27,78 +27,6 @@ bot.command('pnl', async (ctx) => {
   } catch (e) {
     console.error(e);
     return ctx.reply('PNL: something went wrong.');
-  }
-});
-
-// ----- PNL callbacks (windows / views / refresh) -----
-bot.on('callback_query', async (ctx) => {
-  try {
-    const d = ctx.callbackQuery?.data || '';
-
-    // NEW: window + view switcher
-    // pnlv:<wallet>:<window>:<view>
-    if (d.startsWith('pnlv:')) {
-      const [, wallet, window, view] = d.split(':');
-      const data = await refreshPnl(wallet, window);
-      const { text, extra } = renderPNL(data, window, view);
-      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
-      return ctx.answerCbQuery();
-    }
-
-    // Backward compatibility: old window switcher kept working
-    // pnl:<wallet>:<window>
-    if (d.startsWith('pnl:')) {
-      const [, wallet, window] = d.split(':');
-      const data = await refreshPnl(wallet, window);
-      const { text, extra } = renderPNL(data, window, 'overview');
-      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
-      return ctx.answerCbQuery();
-    }
-
-    // Refresh keeps the current window; default to overview view
-    if (d.startsWith('pnl_refresh:')) {
-      const [, wallet, window] = d.split(':');
-      await pnlQueue.add('pnl', { wallet, window }, { removeOnComplete: true, removeOnFail: true });
-      const data = await refreshPnl(wallet, window);
-      const { text, extra } = renderPNL(data, window, 'overview');
-      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
-      return ctx.answerCbQuery('Refreshed');
-    }
-
-  } catch (e) {
-    console.error(e);
-    try { await ctx.answerCbQuery('Error'); } catch {}
-  }
-});
-
-/* ====== PNL callbacks (Option A: specific bot.action handlers) ====== */
-
-// window switcher: pnl:<wallet>:(24h|7d|30d|365d|all)
-bot.action(/^pnl:0x[a-f0-9]{40}:(24h|7d|30d|365d|all)$/i, async (ctx) => {
-  try {
-    const [, wallet, window] = ctx.callbackQuery.data.split(':');
-    const data = await refreshPnl(wallet, window);
-    const { text, extra } = renderPNL(data, window);
-    await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML' });
-    return ctx.answerCbQuery();
-  } catch (e) {
-    console.error(e);
-    try { await ctx.answerCbQuery('Error'); } catch {}
-  }
-});
-
-// refresh button: pnl_refresh:<wallet>:(24h|7d|30d|365d|all)
-bot.action(/^pnl_refresh:0x[a-f0-9]{40}:(24h|7d|30d|365d|all)$/i, async (ctx) => {
-  try {
-    const [, wallet, window] = ctx.callbackQuery.data.split(':');
-    await pnlQueue.add('pnl', { wallet, window }, { removeOnComplete: true, removeOnFail: true });
-    const data = await refreshPnl(wallet, window);
-    const { text, extra } = renderPNL(data, window);
-    await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML' });
-    return ctx.answerCbQuery('Refreshed');
-  } catch (e) {
-    console.error(e);
-    try { await ctx.answerCbQuery('Error'); } catch {}
   }
 });
 
@@ -175,7 +103,7 @@ bot.start((ctx) =>
 
 // /stats <ca>
 bot.command('stats', async (ctx) => {
-  const [, caRaw] = ctx.message.text.trim().split(/\s+/);
+  const [, caRaw] = (ctx.message?.text || '').trim().split(/\s+/);
   if (!isAddress(caRaw)) return ctx.reply('Send: /stats <contractAddress>');
 
   const ca = caRaw.toLowerCase();
@@ -188,7 +116,7 @@ bot.command('stats', async (ctx) => {
 
 // /refresh <ca>
 bot.command('refresh', async (ctx) => {
-  const [, caRaw] = ctx.message.text.trim().split(/\s+/);
+  const [, caRaw] = (ctx.message?.text || '').trim().split(/\s+/);
   if (!isAddress(caRaw)) return ctx.reply('Send: /refresh <contractAddress>');
 
   const ca = caRaw.toLowerCase();
@@ -246,6 +174,49 @@ bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
     }
   } catch (e) {
     return ctx.answerCbQuery('Error — try again', { show_alert: true });
+  }
+});
+
+// ----- PNL view/window router: pnlview:<wallet>:<window>:<view>
+bot.action(/^pnlview:0x[a-f0-9]{40}:(24h|7d|30d|365d|all):(overview|profits|losses|open|airdrops)$/i, async (ctx) => {
+  try {
+    const [, wallet, window, view] = ctx.callbackQuery.data.split(':');
+    const data = await refreshPnl(wallet, window);
+    const { text, extra } = renderPNL(data, window, view);
+    await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
+    return ctx.answerCbQuery();
+  } catch (e) {
+    console.error(e);
+    try { await ctx.answerCbQuery('Error'); } catch {}
+  }
+});
+
+// ----- PNL legacy window switcher: pnl:<wallet>:<window>  (kept for backward-compat)
+bot.action(/^pnl:0x[a-f0-9]{40}:(24h|7d|30d|365d|all)$/i, async (ctx) => {
+  try {
+    const [, wallet, window] = ctx.callbackQuery.data.split(':');
+    const data = await refreshPnl(wallet, window);
+    const { text, extra } = renderPNL(data, window, 'overview');
+    await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
+    return ctx.answerCbQuery();
+  } catch (e) {
+    console.error(e);
+    try { await ctx.answerCbQuery('Error'); } catch {}
+  }
+});
+
+// ----- PNL refresh: pnl_refresh:<wallet>:<window>
+bot.action(/^pnl_refresh:0x[a-f0-9]{40}:(24h|7d|30d|365d|all)$/i, async (ctx) => {
+  try {
+    const [, wallet, window] = ctx.callbackQuery.data.split(':');
+    await pnlQueue.add('pnl', { wallet, window }, { removeOnComplete: true, removeOnFail: true });
+    const data = await refreshPnl(wallet, window);
+    const { text, extra } = renderPNL(data, window, 'overview');
+    await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
+    return ctx.answerCbQuery('Refreshed');
+  } catch (e) {
+    console.error(e);
+    try { await ctx.answerCbQuery('Error'); } catch {}
   }
 });
 
