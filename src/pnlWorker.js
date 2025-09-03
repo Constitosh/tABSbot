@@ -21,7 +21,7 @@ if (!ES_KEY) console.warn('[PNL BOOT] ETHERSCAN_API_KEY missing');
 
 const WETH = '0x3439153eb7af838ad19d56e1571fbd09333c2809'.toLowerCase();
 
-// Router/forwarders we want to treat as swaps/settlement in bonding/proxy flows
+// Router/forwarders treated as swaps/settlement in bonding/proxy flows
 const KNOWN_ROUTERS = new Set([
   '0x0d6848e39114abe69054407452b8aab82f8a44ba'.toLowerCase(), // Moonshot router seen in bonding
 ]);
@@ -141,13 +141,12 @@ async function getWalletNormalTxs(wallet, { fromTs=0 }={}) {
   }
   return out;
 }
-async function getEthBalance(wallet) {
+async function getEthBalanceWei(address) {
   try {
-    const r = await esGET({ module: 'account', action: 'balance', address: wallet, tag: 'latest' }, { tag:'[balance]' });
-    // Etherscan v2 returns just a number string or {result:string}; normalize to string
-    const s = typeof r === 'string' ? r : (r?.result || '0');
-    return s;
-  } catch { return '0'; }
+    const res = await esGET({ module: 'account', action: 'balance', address, tag: 'latest' }, { tag:'[PNL eth balance]' });
+    const weiStr = typeof res === 'string' ? res : (res?.result || '0');
+    return BigInt(weiStr);
+  } catch { return 0n; }
 }
 
 // ---------- Math helpers ----------
@@ -158,13 +157,13 @@ const add   = (a,b) => (a||0n) + (b||0n);
 async function computePnL(wallet, { sinceTs=0 }) {
   wallet = wallet.toLowerCase();
 
-  // 1) Pull histories
-  const [erc20, normal, ethBalWeiStr] = await Promise.all([
+  // 1) Pull histories + current ETH balance
+  const [erc20, normal, ethBalWei] = await Promise.all([
     getWalletERC20Txs(wallet, { fromTs: sinceTs }),
     getWalletNormalTxs(wallet, { fromTs: sinceTs }),
-    getEthBalance(wallet),
+    getEthBalanceWei(wallet),
   ]);
-  const ethBalanceFloat = Number(ethBalWeiStr) / 1e18;
+  const ethBalanceFloat = Number(ethBalWei) / 1e18;
 
   // Build ETH & WETH deltas per tx-hash (+block net) and group token txs
   const wethDeltaByHash = new Map(); // txHash -> +in / -out (wei)
@@ -196,23 +195,25 @@ async function computePnL(wallet, { sinceTs=0 }) {
     const hash  = String(r.hash);
     const bn    = Number(r.blockNumber || 0);
     const token = String(r.contractAddress || '').toLowerCase();
-    const to    = String(r.to   || '').toLowerCase();
-    const from  = String(r.from || '').toLowerCase();
-    const v     = toBig(r.value || '0');
+    theToken: {
+      const to    = String(r.to   || '').toLowerCase();
+      const from  = String(r.from || '').toLowerCase();
+      const v     = toBig(r.value || '0');
 
-    if (token === WETH) {
-      let d = 0n;
-      if (to === wallet) d = v; else if (from === wallet) d = -v;
-      if (d !== 0n) {
-        wethDeltaByHash.set(hash, add(wethDeltaByHash.get(hash), d));
-        blockWethNet.set(bn, add(blockWethNet.get(bn), d));
+      if (token === WETH) {
+        let d = 0n;
+        if (to === wallet) d = v; else if (from === wallet) d = -v;
+        if (d !== 0n) {
+          wethDeltaByHash.set(hash, add(wethDeltaByHash.get(hash), d));
+          blockWethNet.set(bn, add(blockWethNet.get(bn), d));
+        }
+        break theToken;
       }
-      continue;
-    }
 
-    if (to !== wallet && from !== wallet) continue;
-    if (!tokenTxsByToken.has(token)) tokenTxsByToken.set(token, []);
-    tokenTxsByToken.get(token).push(r);
+      if (to !== wallet && from !== wallet) break theToken;
+      if (!tokenTxsByToken.has(token)) tokenTxsByToken.set(token, []);
+      tokenTxsByToken.get(token).push(r);
+    }
   }
 
   const perToken = [];
@@ -255,7 +256,7 @@ async function computePnL(wallet, { sinceTs=0 }) {
       if (to === wallet && (paidWei > 0n || from === token)) {
         buys += amt;
         qty  += amt;
-        costWeth += paidWei; // if bonding-from-token and paidWei==0, cost basis stays; MTM handles valuation
+        costWeth += paidWei; // if bonding-from-token and paidWei==0, cost stays; MTM handles valuation
         continue;
       }
 
@@ -285,9 +286,9 @@ async function computePnL(wallet, { sinceTs=0 }) {
         // Fallback to price if still zero and we have liquidity
         if (proceeds === 0n && priceWeth > 0) {
           // estProceedsWei = amt * priceWeth * 1e18 / scale
-          // Convert via safe int math: (amt * 1e18 / scale) * priceWeth
-          const amtScaled1e18 = scale > 0n ? (amt * 1_000_000_000_000_000_000n) / scale : 0n; // wei-equivalent of tokens at 1 WETH/token
-          proceeds = toBig(Math.floor(Number(amtScaled1e18) * Number(priceWeth))); // safe because amtScaled1e18 ~ 1e18-scale
+          const amtScaled1e18 = scale > 0n ? (amt * 1_000_000_000_000_000_000n) / scale : 0n;
+          // Convert 1e18 "tokens" * priceWeth (WETH) => wei
+          proceeds = toBig(Math.floor(Number(amtScaled1e18) * Number(priceWeth)));
         }
 
         const avgCostWeiPerUnit = qty > 0n ? (costWeth * 1_000_000_000_000_000_000n) / qty : 0n;
@@ -325,10 +326,10 @@ async function computePnL(wallet, { sinceTs=0 }) {
 
     // Mark-to-market + USD
     const qtyFloat   = Number(qty) / Number(scale || 1n);
-    const invCostW  = Number(costWeth) / 1e18;
-    const mtmW      = qtyFloat * Number(priceWeth || 0);
-    const unrealW   = mtmW - invCostW;
-    const usdValue  = qtyFloat * Number(priceUsd || 0);
+    const invCostW   = Number(costWeth) / 1e18;
+    const mtmW       = qtyFloat * Number(priceWeth || 0);
+    const unrealW    = mtmW - invCostW;
+    const usdValue   = qtyFloat * Number(priceUsd || 0);
 
     // Airdrops USD
     let adUnits = 0n;
@@ -353,11 +354,11 @@ async function computePnL(wallet, { sinceTs=0 }) {
         sells: sells.toString(),
         remaining: qty.toString(),
 
-        realizedWeth: Number(realizedWeth) / 1e18,  // float (WETH)
-        inventoryCostWeth: Number(costWeth) / 1e18, // float (WETH)
+        realizedWeth: Number(realizedWeth) / 1e18,  // float (WETH/ETH)
+        inventoryCostWeth: Number(costWeth) / 1e18, // float (WETH/ETH)
         priceUsd: Number(priceUsd || 0),
         priceWeth: Number(priceWeth || 0),
-        unrealizedWeth: unrealW,                     // float (WETH)
+        unrealizedWeth: unrealW,                     // float (WETH/ETH)
         usdValueRemaining: usdValue,                 // float (USD)
 
         airdrops: {
@@ -403,7 +404,7 @@ async function computePnL(wallet, { sinceTs=0 }) {
     .filter(t => (t.airdrops?.count || 0) > 0)
     .map(t => ({ token: t.token, symbol: t.symbol, decimals: t.decimals, units: t.airdrops.units, estUsd: t.airdrops.estUsd }));
 
-  // Realized (closed or partially realized) leaders by realized PnL only
+  // Realized (by realized PnL only) — renderer will filter to closed-only lists
   const realizedOnly = perToken.filter(t => Math.abs(Number(t.realizedWeth) || 0) > 0);
   const best  = [...realizedOnly].sort((a,b)=> (Number(b.realizedWeth)||0) - (Number(a.realizedWeth)||0)).slice(0, 15);
   const worst = [...realizedOnly].sort((a,b)=> (Number(a.realizedWeth)||0) - (Number(b.realizedWeth)||0)).slice(0, 15);
@@ -412,8 +413,8 @@ async function computePnL(wallet, { sinceTs=0 }) {
     wallet,
     sinceTs,
     totals: {
-      // ETH balance
-      ethBalance: ethBalanceFloat, // float ETH
+      // Wallet ETH balance (native)
+      ethBalanceFloat,
 
       // Raw in/out
       wethIn: wethIn.toString(),   wethOut: wethOut.toString(),
