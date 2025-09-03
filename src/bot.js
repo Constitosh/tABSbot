@@ -22,11 +22,52 @@ bot.command('pnl', async (ctx) => {
     }
     await pnlQueue.add('pnl', { wallet, window: '30d' }, { removeOnComplete: true, removeOnFail: true });
     const data = await refreshPnl(wallet, '30d');
-    const { text, extra } = renderPNL(data, '30d');
+    const { text, extra } = renderPNL(data, '30d', 'overview');
     return ctx.replyWithHTML(text, extra);
   } catch (e) {
     console.error(e);
     return ctx.reply('PNL: something went wrong.');
+  }
+});
+
+// ----- PNL callbacks (windows / views / refresh) -----
+bot.on('callback_query', async (ctx) => {
+  try {
+    const d = ctx.callbackQuery?.data || '';
+
+    // NEW: window + view switcher
+    // pnlv:<wallet>:<window>:<view>
+    if (d.startsWith('pnlv:')) {
+      const [, wallet, window, view] = d.split(':');
+      const data = await refreshPnl(wallet, window);
+      const { text, extra } = renderPNL(data, window, view);
+      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
+      return ctx.answerCbQuery();
+    }
+
+    // Backward compatibility: old window switcher kept working
+    // pnl:<wallet>:<window>
+    if (d.startsWith('pnl:')) {
+      const [, wallet, window] = d.split(':');
+      const data = await refreshPnl(wallet, window);
+      const { text, extra } = renderPNL(data, window, 'overview');
+      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
+      return ctx.answerCbQuery();
+    }
+
+    // Refresh keeps the current window; default to overview view
+    if (d.startsWith('pnl_refresh:')) {
+      const [, wallet, window] = d.split(':');
+      await pnlQueue.add('pnl', { wallet, window }, { removeOnComplete: true, removeOnFail: true });
+      const data = await refreshPnl(wallet, window);
+      const { text, extra } = renderPNL(data, window, 'overview');
+      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
+      return ctx.answerCbQuery('Refreshed');
+    }
+
+  } catch (e) {
+    console.error(e);
+    try { await ctx.answerCbQuery('Error'); } catch {}
   }
 });
 
