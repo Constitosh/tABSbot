@@ -108,6 +108,10 @@ const DEAD = new Set([
   '0x000000000000000000000000000000000000dead',
 ].map(s => s.toLowerCase()));
 
+const BANNED = new Set([
+  '0x0d6848e39114abe69054407452b8aab82f8a44ba'  // unwanted wallet distribution
+].map(s => s.toLowerCase()));
+
 const toBig = (x) => BigInt(String(x));
 const topicToAddr = (t) => ('0x' + String(t).slice(-40)).toLowerCase();
 const padAddrTopic = (addr) => '0x'.concat('0'.repeat(24), String(addr).toLowerCase().replace(/^0x/, ''));
@@ -285,6 +289,7 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
     const a = addr.toLowerCase();
     if (bal <= 0n) continue;
     if (ex.has(a)) continue;
+    if (BANNED.has(a)) continue;  // NEW line
     rows.push([a, bal]);
   }
   rows.sort((A, B) => (B[1] > A[1] ? 1 : (B[1] < A[1] ? -1 : 0)));
@@ -324,6 +329,7 @@ function first20BuyersFromTokentx(txsAsc, { tokenAddress, creator, pairAddress, 
     if (DEAD.has(to)) return false;
     if (pair && to === pair) return false;
     if (excludeTokenAsPool && to === ca) return false;
+    if (BANNED.has(to)) return false;   // NEW line
     if (!firstSeen.has(to)) {
       let amt = 0n;
       try { amt = toBig(tx.value || '0'); } catch {}
@@ -380,6 +386,7 @@ function first20BuyersFromLogs(logsAsc, { tokenAddress, creator, pairAddress, ex
     if (DEAD.has(to)) return false;
     if (pair && to === pair) return false;
     if (excludeTokenAsPool && to === ca) return false;
+    if (BANNED.has(to)) return false;   // NEW line
     if (!firstSeen.has(to)) {
       const amt = toBig(lg.data);
       firstSeen.set(to, {
