@@ -176,7 +176,7 @@ bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
 });
 
 // ----- PNL view/window router: pnlview:<wallet>:<window>:<view>
-bot.action(/^pnlview:0x[a-f0-9]{40}:(24h|7d|30d|365d|all):(overview|profits|losses|open|airdrops)$/i, async (ctx) => {
+bot.action(/^pnlview:0x[a-f0-9]{40}:(24h|7d|30d|90d|all):(overview|profits|losses|open|airdrops)$/i, async (ctx) => {
   await ack(ctx, 'Loading…'); // ack first
   try {
     const [, wallet, window, view] = ctx.callbackQuery.data.split(':');
@@ -189,7 +189,7 @@ bot.action(/^pnlview:0x[a-f0-9]{40}:(24h|7d|30d|365d|all):(overview|profits|loss
 });
 
 // ----- PNL legacy window switcher: pnl:<wallet>:<window>
-bot.action(/^pnl:0x[a-f0-9]{40}:(24h|7d|30d|365d|all)$/i, async (ctx) => {
+bot.action(/^pnl:0x[a-f0-9]{40}:(24h|7d|30d|90d|all)$/i, async (ctx) => {
   await ack(ctx, 'Loading…');
   try {
     const [, wallet, window] = ctx.callbackQuery.data.split(':');
@@ -202,7 +202,7 @@ bot.action(/^pnl:0x[a-f0-9]{40}:(24h|7d|30d|365d|all)$/i, async (ctx) => {
 });
 
 // ----- PNL refresh: pnl_refresh:<wallet>:<window>
-bot.action(/^pnl_refresh:0x[a-f0-9]{40}:(24h|7d|30d|365d|all)$/i, async (ctx) => {
+bot.action(/^pnl_refresh:0x[a-f0-9]{40}:(24h|7d|30d|90d|all)$/i, async (ctx) => {
   await ack(ctx, 'Refreshing…');
   try {
     const [, wallet, window] = ctx.callbackQuery.data.split(':');
