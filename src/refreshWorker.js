@@ -330,44 +330,32 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
 }
 
 /**
- * NEW: First 20 buyers logic (creator-anchored)
- * - Find the first log where the CREATOR receives tokens FROM { tokenCA, ZERO, ammPair }.
- * - From that point forward, collect the next unique inbound recipients meeting the same source rule,
- *   until we have 20 recipients (including the creator as #1).
- * - Status is derived from balanceNow vs firstBuyAmt only (hold / sold some / sold all / bought more).
+ * FIRST 20 BUYERS — CREATOR-ANCHORED & SENDER-AGNOSTIC
+ * 1) Find the first log where `to === creator`.
+ * 2) From that index forward, collect the next unique `to` recipients (including creator),
+ *    skipping dead addresses and (if present) the AMM pair itself, until we have 20.
+ * 3) Status = compare current balance with *their first received amount* (strict).
  */
-function first20BuyersByCreatorStart(logs, tokenCA, creator, pairAddress, balances) {
-  if (!Array.isArray(logs) || logs.length === 0) return [];
-  const token = String(tokenCA || '').toLowerCase();
-  const creatorAddr = creator ? String(creator).toLowerCase() : null;
+function first20BuyersByCreatorStart(logs, creator, pairAddress, balances) {
+  if (!Array.isArray(logs) || logs.length === 0 || !creator) return [];
+  const creatorAddr = String(creator).toLowerCase();
   const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
 
-  // 1) find anchor index where creator receives from token||zero||pair
+  // 1) anchor at first inbound to creator (no restriction on `from`)
   let startIdx = -1;
   for (let i = 0; i < logs.length; i++) {
     const lg = logs[i];
-    const from = topicToAddr(lg.topics[1]);
-    const to   = topicToAddr(lg.topics[2]);
-    if (!creatorAddr || to !== creatorAddr) continue;
-
-    const fromIsSource = (from === token) || (from === ZERO) || (pair && from === pair);
-    if (fromIsSource) { startIdx = i; break; }
+    const to = topicToAddr(lg.topics[2]);
+    if (to === creatorAddr) { startIdx = i; break; }
   }
-
-  // If we can't find that anchor, bail to empty (your UI can say N/A)
   if (startIdx < 0) return [];
 
-  // 2) walk forward and collect earliest unique recipients from the same sources
+  // 2) scan forward & collect unique recipients (including creator first)
   const firstSeen = new Map(); // addr -> { firstBuyBlock, firstBuyAmt }
   const addIfEligible = (lg) => {
-    const from = topicToAddr(lg.topics[1]);
-    const to   = topicToAddr(lg.topics[2]);
+    const to = topicToAddr(lg.topics[2]);
     if (DEAD.has(to)) return false;
-    if (pair && to === pair) return false; // ignore LP address as a receiver
-
-    const fromIsSource = (from === token) || (from === ZERO) || (pair && from === pair);
-    if (!fromIsSource) return false;
-
+    if (pair && to === pair) return false;
     if (!firstSeen.has(to)) {
       firstSeen.set(to, {
         firstBuyBlock: Number(lg.blockNumber),
@@ -378,15 +366,12 @@ function first20BuyersByCreatorStart(logs, tokenCA, creator, pairAddress, balanc
     return false;
   };
 
-  // Include creator first (anchor log will satisfy it)
   addIfEligible(logs[startIdx]);
-
-  // keep scanning forward until we have 20 unique recipients total
   for (let i = startIdx + 1; i < logs.length && firstSeen.size < 20; i++) {
     addIfEligible(logs[i]);
   }
 
-  // 3) render ordered list (by firstBuyBlock) + status vs firstBuyAmt
+  // 3) map to status based on firstBuyAmt
   const ordered = [...firstSeen.entries()]
     .sort((a, b) => a[1].firstBuyBlock - b[1].firstBuyBlock)
     .map(([address, info]) => {
@@ -398,11 +383,10 @@ function first20BuyersByCreatorStart(logs, tokenCA, creator, pairAddress, balanc
         status = 'sold some';
       } else if (balNow > info.firstBuyAmt) {
         status = 'bought more';
-      } // else exactly equal => 'hold'
+      }
       return { address, status };
     });
 
-  // exactly first 20 (or fewer if not enough recipients)
   return ordered.slice(0, Math.min(20, ordered.length));
 }
 
@@ -555,8 +539,8 @@ export async function refreshToken(tokenAddress) {
       }
       creatorPercent = (supply > 0n) ? Number((creatorBal * 1000000n) / supply) / 10000 : 0;
 
-      // NEW buyers logic (creator-anchored)
-      first20Buyers = first20BuyersByCreatorStart(logs, ca, creatorAddr, ammPair, balances);
+      // FIRST BUYERS (creator-anchored, sender-agnostic)
+      first20Buyers = first20BuyersByCreatorStart(logs, creatorAddr, ammPair, balances);
 
       console.log('[WORKER] compute sizes',
         'balances=', balancesSize,
