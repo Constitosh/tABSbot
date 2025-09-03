@@ -211,14 +211,13 @@ async function computePnL(wallet, { sinceTs=0 }) {
     const from = String(tx.from || '').toLowerCase();
     const to   = String(tx.to   || '').toLowerCase();
     const val  = toBig(tx.value || '0');
-    if (to === wallet && val > 0n) {
-      ethDeltaByHash.set(hash, add(ethDeltaByHash.get(hash), val));
-      addCash(bn, hash, +val);
-    } else if (from === wallet && val > 0n) {
-      ethDeltaByHash.set(hash, add(ethDeltaByHash.get(hash), -val));
-      addCash(bn, hash, -val);
-    }
-  }
+if (to === wallet && val > 0n) {
+ethDeltaByHash.set(hash, add(ethDeltaByHash.get(hash), val));
+addCash(bn, hash, val);        // pass BigInt, no unary +
+ } else if (from === wallet && val > 0n) {
+   ethDeltaByHash.set(hash, add(ethDeltaByHash.get(hash), -val));
+   addCash(bn, hash, -val);       // pass negative BigInt
+ }
 
   // WETH + group per token
   for (const r of erc20) {
@@ -229,16 +228,16 @@ async function computePnL(wallet, { sinceTs=0 }) {
     const from  = String(r.from || '').toLowerCase();
     const v     = toBig(r.value || '0');
 
-    if (token === WETH) {
-      if (to === wallet) {
-        wethDeltaByHash.set(hash, add(wethDeltaByHash.get(hash), v));
-        addCash(bn, hash, +v);
-      } else if (from === wallet) {
-        wethDeltaByHash.set(hash, add(wethDeltaByHash.get(hash), -v));
-        addCash(bn, hash, -v);
-      }
-      continue;
-    }
+ if (token === WETH) {
+   if (to === wallet) {
+     wethDeltaByHash.set(hash, add(wethDeltaByHash.get(hash), v));
+     addCash(bn, hash, v);          // pass BigInt
+   } else if (from === wallet) {
+     wethDeltaByHash.set(hash, add(wethDeltaByHash.get(hash), -v));
+     addCash(bn, hash, -v);         // pass negative BigInt
+   }
+   continue;
+ }
     if (to !== wallet && from !== wallet) continue;
     if (!tokenTxsByToken.has(token)) tokenTxsByToken.set(token, []);
     tokenTxsByToken.get(token).push(r);
