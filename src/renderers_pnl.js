@@ -1,150 +1,159 @@
 // src/renderers_pnl.js
+// Renders: overview (with top3 winners/losers), profits (closed), losses (closed), open, airdrops.
+
 import { esc, money } from './ui_html.js';
 
-// helpers
 const shortAddr = (a) => a ? (a.slice(0,6) + '…' + a.slice(-4)) : '';
-const sign = (x) => (x > 0 ? '+' : (x < 0 ? '−' : '±'));
-const fmtETH = (w) => `${Number(w).toFixed(6)} ETH`;
-const fmtWeiETH = (wei) => `${(Number(wei)/1e18).toFixed(6)} ETH`;
-const greenBadge = '🟢';
-const redBadge   = '🔴';
-const flatBadge  = '⚪️';
+const fmtWETH = (w) => `${Number(w).toFixed(6)} ETH`;
+const fmtWeiWETH = (wei) => `${(Number(wei)/1e18).toFixed(6)} ETH`;
+const badge = (x) => (x > 0 ? '🟢' : (x < 0 ? '🔴' : '⚪️'));
 
-function qtyFmtFloat(n){
-  if (!Number.isFinite(n) || n === 0) return '0';
+function fmtQty(units, decimals){
+  const n = Number(units)/10**decimals;
+  if (!isFinite(n) || n === 0) return '0';
   if (n >= 1) return n.toFixed(4);
   return n.toPrecision(4);
 }
 
-function headerChips(wallet, currentWindow, currentView){
-  const windows = ['24h','7d','30d','90d','all']; // 90d window
-  return {
-    inline_keyboard: [
-      windows.map(w => ({
-        text: w === currentWindow ? `· ${w} ·` : w,
-        callback_data: `pnlview:${wallet}:${w}:${currentView}`
-      })),
-      [
-        { text:'🏆 Profits', callback_data:`pnlview:${wallet}:${currentWindow}:profits` },
-        { text:'⚠️ Losses',  callback_data:`pnlview:${wallet}:${currentWindow}:losses` },
-      ],
-      [
-        { text:'📈 Open',    callback_data:`pnlview:${wallet}:${currentWindow}:open` },
-        { text:'🎁 Airdrops',callback_data:`pnlview:${wallet}:${currentWindow}:airdrops` }
-      ],
-      [
-        { text:'↻ Refresh',  callback_data:`pnl_refresh:${wallet}:${currentWindow}` },
-        { text:'🏠 Back',     callback_data:'about' }
-      ]
+function windowTabs(wallet, currentWindow, view){
+  const ws = ['24h','7d','30d','90d','all'];
+  return [
+    ws.map(w => ({
+      text: w === currentWindow ? `· ${w} ·` : w,
+      callback_data: `pnlv:${wallet}:${w}:${view}`
+    })),
+  ];
+}
+
+function viewTabs(wallet, window, currentView){
+  const views = [
+    ['overview','Overview'],
+    ['profits','Profits'],
+    ['losses','Losses'],
+    ['open','Open'],
+    ['airdrops','Airdrops']
+  ];
+  return [
+    views.map(([v, label]) => ({
+      text: v === currentView ? `· ${label} ·` : label,
+      callback_data: `pnlv:${wallet}:${window}:${v}`
+    })),
+    [
+      { text:'↻ Refresh', callback_data:`pnl_refresh:${wallet}:${window}` },
+      { text:'🏠 Back',    callback_data:'about' }
     ]
-  };
+  ];
 }
 
-function pnlBadge(num){
-  if (num > 0) return greenBadge;
-  if (num < 0) return redBadge;
-  return flatBadge;
+function header(wallet, window, totals){
+  const bal = Number(totals.ethLikeBalanceFloat||0);
+  const lines = [];
+  lines.push(`💼 <b>Wallet PnL — ${shortAddr(esc(wallet))}</b>`);
+  lines.push(`<i>Window: ${esc(window)}</i>`);
+  lines.push(`💰 <b>Balance:</b> ${bal.toFixed(6)} ETH`);
+  lines.push('');
+  lines.push(
+    [
+      `💧 <b>ETH IN:</b> ${esc(fmtWETH((totals.ethInFloat||0) + (totals.wethInFloat||0)))}`,
+      `🔥 <b>ETH OUT:</b> ${esc(fmtWETH((totals.ethOutFloat||0) + (totals.wethOutFloat||0)))}`
+    ].join('   ·   ')
+  );
+  lines.push(
+    [
+      `📈 <b>Realized:</b> ${esc(fmtWETH(totals.realizedWeth||0))}`,
+      `📊 <b>Unrealized:</b> ${esc(fmtWETH(totals.unrealizedWeth||0))}`,
+      `📦 <b>Holdings:</b> ${esc(money(totals.holdingsUsd||0))}`,
+      `🎁 <b>Airdrops:</b> ${esc(money(totals.airdropsUsd||0))}`
+    ].join('   ·   ')
+  );
+  const pnl = Number(totals.totalPnlWeth||0);
+  const pct = Number(totals.pnlPct||0);
+  const pnlTag = `${pnl >= 0 ? '🟢' : '🔴'} ${Math.abs(pnl).toFixed(6)} ETH  (${pct>=0?'+':'−'}${Math.abs(pct).toFixed(2)}%)`;
+  lines.push(`🧮 <b>Total PnL:</b> ${pnlTag}`);
+  return lines;
 }
 
-function bulletPnL(symbol, ethAmount){
-  const s = Number(ethAmount||0);
-  const tag = `${s === 0 ? '0.000000' : (s > 0 ? '+' : '−') + Math.abs(s).toFixed(6)} ETH`;
-  // No dash between token and amount, as requested
-  return `• <b>${esc(symbol)}</b>  ${pnlBadge(s)} ${esc(tag)}`;
+function lineClosedToken(t){
+  const sym = esc(t.symbol || t.token.slice(0,6));
+  const realized = Number(t.realizedWeth||0);
+  const tag = `${realized>=0?'+':'−'}${Math.abs(realized).toFixed(6)} ETH`;
+  // per your ask: remove the dash between token and number
+  return `• <b>${sym}</b>  ${badge(realized)} ${tag}`;
 }
 
-// Renders a compact list (up to n) from tokens array with realizedWeth field
-function renderClosedRealizedList(rows, n=15){
-  if (!Array.isArray(rows) || rows.length === 0) return '<i>None</i>';
-  const slice = rows.slice(0, n);
-  return slice.map(r => bulletPnL(r.symbol || r.token.slice(0,6), r.realizedWeth)).join('\n');
+function top3Section(title, arr){
+  const lines = [];
+  lines.push(`<b>${title}</b>`);
+  if (!arr || !arr.length) {
+    lines.push('<i>—</i>');
+  } else {
+    for (const t of arr) lines.push(lineClosedToken(t));
+  }
+  return lines;
 }
 
 export function renderPNL(data, window='30d', view='overview'){
   const w = esc(data.wallet);
   const t = data.totals || {};
-  const derived = data.derived || {};
+  const d = data.derived || {};
   const tokens = Array.isArray(data.tokens) ? data.tokens : [];
 
   const lines = [];
-  lines.push(`💼 <b>Wallet PnL — ${shortAddr(w)}</b>`);
-  lines.push(`<i>Window: ${esc(window)}</i>`);
-
-  // NEW: ETH balance line (native ETH)
-  lines.push(`💰 <b>ETH Balance:</b> ${esc(fmtETH(t.ethBalanceFloat || 0))}`);
-  lines.push(''); // keep spacing exactly like your sample
-
-  // Totals “cards” — ETH+WETH flows shown as ETH (label ETH)
-  const ethIn  = (Number(t.ethInFloat||0) + Number(t.wethInFloat||0));
-  const ethOut = (Number(t.ethOutFloat||0) + Number(t.wethOutFloat||0));
-  lines.push(
-    [
-      `💧 <b>ETH IN:</b> ${esc(fmtETH(ethIn))}`,
-      `🔥 <b>ETH OUT:</b> ${esc(fmtETH(ethOut))}`
-    ].join('   ·   ')
-  );
-  lines.push(
-    [
-      `📈 <b>Realized:</b> ${esc(fmtETH(t.realizedWeth||0))}`,
-      `📊 <b>Unrealized:</b> ${esc(fmtETH(t.unrealizedWeth||0))}`,
-      `📦 <b>Holdings:</b> ${esc(money(t.holdingsUsd||0))}`,
-      `🎁 <b>Airdrops:</b> ${esc(money(t.airdropsUsd||0))}`
-    ].join('   ·   ')
-  );
-
-  const totalPnl = Number(t.totalPnlWeth||0);
-  const pct = Number(t.pnlPct||0);
-  const pnlLine = `${pnlBadge(totalPnl)} <b>Total PnL:</b> ${esc(fmtETH(totalPnl))}  (${sign(pct)}${Math.abs(pct).toFixed(2)}%)`;
-  lines.push(pnlLine);
+  lines.push(...header(w, window, t));
   lines.push('');
 
   if (view === 'overview') {
-    // Top 3 realized profits & losses (CLOSED positions only)
-    lines.push('<b>Top Profits (realized)</b>');
-    lines.push(renderClosedRealizedList(derived.profitsClosed, 3));
+    lines.push(...top3Section('Top Profits (closed)', d.top3Profits || []));
     lines.push('');
-    lines.push('<b>Top Losses (realized)</b>');
-    lines.push(renderClosedRealizedList(derived.lossesClosed, 3));
+    lines.push(...top3Section('Top Losses (closed)', d.top3Losses || []));
   }
   else if (view === 'profits') {
-    lines.push('<b>Top Profits (realized)</b>');
-    lines.push(renderClosedRealizedList(derived.profitsClosed, 15));
+    lines.push('<b>Top Profits (closed)</b>');
+    const arr = d.profitsClosed || [];
+    if (!arr.length) lines.push('<i>No closed profitable trades found.</i>');
+    for (const tk of arr.slice(0,15)) lines.push(lineClosedToken(tk));
   }
   else if (view === 'losses') {
-    lines.push('<b>Top Losses (realized)</b>');
-    lines.push(renderClosedRealizedList(derived.lossesClosed, 15));
+    lines.push('<b>Top Losses (closed)</b>');
+    const arr = d.lossesClosed || [];
+    if (!arr.length) lines.push('<i>No closed losing trades found.</i>');
+    for (const tk of arr.slice(0,15)) lines.push(lineClosedToken(tk));
   }
   else if (view === 'open') {
     lines.push('<b>Open Positions</b>');
-    const rows = Array.isArray(derived.open) ? derived.open : [];
-    if (!rows.length) {
-      lines.push('<i>None</i>');
+    const arr = d.open || [];
+    if (!arr.length) {
+      lines.push('<i>No open positions.</i>');
     } else {
-      // Show symbol, remaining qty, and USD value; PnL marker with unrealized
-      for (const r of rows) {
+      for (const r of arr) {
         const sym = esc(r.symbol || r.token.slice(0,6));
-        const rem = qtyFmtFloat(Number(r.remainingUnitsFloat || 0));
-        const usd = Number(r.usdValueRemaining || 0);
-        const unreal = Number(r.unrealizedWeth || 0);
-        lines.push(`• <b>${sym}</b>  ${pnlBadge(unreal)} ${esc(sign(unreal))}${Math.abs(unreal).toFixed(6)} ETH`);
-        lines.push(`   rem ${rem}   ·   worth ${esc(money(usd))}`);
+        const dec = Number(r.decimals||18);
+        const rem = fmtQty(r.remaining, dec);
+        const unreal = Number(r.unrealizedWeth||0);
+        const tag = `${unreal>=0?'+':'−'}${Math.abs(unreal).toFixed(6)} ETH`;
+        lines.push(`• <b>${sym}</b>  ${badge(unreal)} ${tag}  ·  rem ${rem}`);
       }
     }
   }
   else if (view === 'airdrops') {
     lines.push('<b>Airdrops</b>');
-    const rows = Array.isArray(derived.airdrops) ? derived.airdrops : [];
-    if (!rows.length) {
-      lines.push('<i>None</i>');
-    } else {
-      for (const r of rows) {
-        const sym = esc(r.symbol || r.token.slice(0,6));
-        const est = Number(r.estUsd || 0);
-        lines.push(`• <b>${sym}</b>  ≈ ${esc(money(est))}`);
-      }
+    const arr = d.airdrops || [];
+    if (!arr.length) lines.push('<i>None.</i>');
+    for (const a of arr.slice(0,25)) {
+      const sym = esc(a.symbol || a.token.slice(0,6));
+      lines.push(`• <b>${sym}</b>  ~${esc(money(a.estUsd||0))}`);
     }
   }
 
-  const extra = { reply_markup: headerChips(w, window, view) };
+  const extra = {
+    reply_markup: {
+      inline_keyboard: [
+        ...windowTabs(w, window, view),
+        ...viewTabs(w, window, view)
+      ]
+    },
+    disable_web_page_preview: true
+  };
+
   return { text: lines.join('\n'), extra };
 }
