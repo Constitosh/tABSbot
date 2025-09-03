@@ -1,28 +1,19 @@
 // src/pnlWorker.js
-// Accurate wallet PnL for Abstract (ETH+WETH combined as ETH “base”).
-// What this does:
-// • Collects wallet ERC20 + native tx history (Etherscan v2) for the window.
-// • Pairs token transfers with ETH/WETH legs in this order:
-//     1) Same tx hash (ideal)
-//     2) Same block + same counterparty (router/proxy/token addr), with usage tracking
-//     3) Same block pool fallback (usage tracking)
-// • BUY  = token -> wallet and matched baseOut (or bonding from token addr at 0 cost)
-// • SELL = wallet -> token and matched baseIn (else treat as gift/internal move, reduce qty and cost, no realized PnL)
-// • Realized PnL uses average-cost inventory
-// • “Closed” = remaining == 0, or <5 tokens (dust) for non-ETH/WETH
-// • Open positions list only: symbol, holdings (units compact), holdings USD
-// • ETH/WETH are combined (“base”); ETH IN/OUT only count matched trade flows
-//
-// Exports: refreshPnl(), pnlQueueName, pnlQueue (same as your bot wiring)
+// Accurate wallet PnL for Abstract chain — ETH & WETH combined, robust same-block pairing.
+//   • Greedy-nearest base matching (same-hash → same-counterparty → nearest in block), single-use base legs
+//   • Bonding buys (from===token) at 0 cost
+//   • Gifts/internal outs reduce qty & cost basis proportionally (no realized PnL)
+//   • Closed-only realized lists (profits>0 / losses<0)
+//   • Open positions: only ≥$1 holdings, no ETH/WETH lines, no MTM fields in rows
+//   • ETH IN/OUT totals are trade-only (matched legs), random transfers excluded
 
-// ---------- Boot ----------
 import './configEnv.js';
 import axios from 'axios';
 import Redis from 'ioredis';
 import { Worker, Queue } from 'bullmq';
 import { setJSON, getJSON, withLock } from './cache.js';
 
-// ---------- Chain / APIs ----------
+// ---------- Chain / API ----------
 const ES_BASE  = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
 const ES_KEY   = process.env.ETHERSCAN_API_KEY;
 const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741';
@@ -30,10 +21,10 @@ if (!ES_KEY) console.warn('[PNL BOOT] ETHERSCAN_API_KEY missing');
 
 const WETH = '0x3439153eb7af838ad19d56e1571fbd09333c2809'.toLowerCase();
 
-// Routers / proxies (extend as you find more)
+// Known routers / proxies
 const KNOWN_ROUTERS = new Set([
-  '0x0d6848e39114abe69054407452b8aab82f8a44ba'.toLowerCase(), // Moonshot router (bonding/proxy)
-  '0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f'.toLowerCase(), // TG bot proxy you flagged
+  '0x0d6848e39114abe69054407452b8aab82f8a44ba'.toLowerCase(), // Moonshot / bonding router
+  '0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f'.toLowerCase(), // TG proxy you flagged
 ]);
 
 const httpES = axios.create({ baseURL: ES_BASE, timeout: 45_000 });
@@ -64,7 +55,7 @@ async function esGET(params,{logOnce=false,tag=''}={}) {
   }
 }
 
-// ---------- Quotes (Dexscreener) ----------
+// ---------- Quotes ----------
 async function getUsdQuote(ca){
   try {
     const { data } = await axios.get(`https://api.dexscreener.com/tokens/v1/abstract/${ca}`, { timeout: 15000 });
@@ -143,84 +134,101 @@ async function computePnL(wallet,{sinceTs=0}={}){
   ]);
   const ethBalanceFloat = Number(ethBalWeiStr)/1e18;
 
-  // Base (ETH+WETH) deltas by hash
-  const wethDeltaByHash = new Map(); // +in/-out
-  const ethDeltaByHash  = new Map();
-
-  // Per-block, per-counterparty pools (with usage tracking) to catch router/proxy split-settlements
-  const blkOutByCP = new Map(); // bn -> Map(counterparty -> wei)   (wallet -> cp)
-  const blkInByCP  = new Map(); // bn -> Map(counterparty -> wei)   (cp -> wallet)
-  const blkOutUsedByCP = new Map(); // bn -> Map(counterparty -> wei used)
-  const blkInUsedByCP  = new Map();
-
-  function inc(map, bn, addr, wei){
-    const byCp = map.get(bn) || new Map();
-    byCp.set(addr, (byCp.get(addr)||0n) + wei);
-    map.set(bn, byCp);
+  // Build base events (ETH+WETH) per block with usage flag; also map by hash for same-hash match.
+  const baseByBlock = new Map(); // bn -> [{dir:'out'|'in', wei, txIndex, logIndex, hash, cp, used:false}]
+  const baseByHash  = new Map(); // hash -> {inWei,outWei}
+  function pushBase(bn, ev){
+    const arr = baseByBlock.get(bn) || [];
+    arr.push(ev);
+    baseByBlock.set(bn, arr);
   }
-  function use(map, bn, addr, wei){
-    const byCp = map.get(bn) || new Map();
-    byCp.set(addr, (byCp.get(addr)||0n) + wei);
-    map.set(bn, byCp);
-  }
-  function avail(map, usedMap, bn, addr){
-    const byCp = map.get(bn) || new Map();
-    const used = usedMap.get(bn) || new Map();
-    const a = byCp.get(addr)||0n;
-    const u = used.get(addr)||0n;
-    return a>u ? (a-u) : 0n;
+  function addHash(h, dir, wei){
+    const rec = baseByHash.get(h) || { inWei:0n, outWei:0n };
+    if (dir==='in')  rec.inWei  = add(rec.inWei,  wei);
+    else             rec.outWei = add(rec.outWei, wei);
+    baseByHash.set(h, rec);
   }
 
-  // Record native ETH flows
+  // Native ETH → base events
   for(const tx of normal){
-    const hash = String(tx.hash);
     const bn   = Number(tx.blockNumber||0);
+    const idx  = Number(tx.transactionIndex||0);
+    const hash = String(tx.hash);
     const from = String(tx.from||'').toLowerCase();
-    const to   = String(tx.to  ||'').toLowerCase();
+    const to   = String(tx.to||'').toLowerCase();
     const val  = toBig(tx.value||'0');
-    if (to === wallet && val>0n){
-      ethDeltaByHash.set(hash, add(ethDeltaByHash.get(hash), val));
-      inc(blkInByCP, bn, from, val);
-    } else if (from === wallet && val>0n){
-      ethDeltaByHash.set(hash, add(ethDeltaByHash.get(hash), -val));
-      inc(blkOutByCP, bn, to, val);
+    if (val === 0n) continue;
+
+    if (to === wallet){
+      pushBase(bn, { dir:'in', wei:val, txIndex:idx, logIndex:-1, hash, cp:from, used:false });
+      addHash(hash,'in',val);
+    } else if (from === wallet){
+      pushBase(bn, { dir:'out', wei:val, txIndex:idx, logIndex:-1, hash, cp:to, used:false });
+      addHash(hash,'out',val);
     }
   }
 
-  // Group token txs and collect WETH flows
-  const tokenTxsByToken = new Map();
+  // WETH ERC20 → base events
+  const tokenTxsByToken = new Map(); // token -> txs[]
   for(const r of erc20){
-    const hash  = String(r.hash);
-    const bn    = Number(r.blockNumber||0);
-    const token = String(r.contractAddress||'').toLowerCase();
-    const to    = String(r.to||'').toLowerCase();
-    const from  = String(r.from||'').toLowerCase();
-    const v     = toBig(r.value||'0');
+    const bn   = Number(r.blockNumber||0);
+    const idx  = Number(r.transactionIndex||0);
+    const lg   = Number(r.logIndex||0);
+    const hash = String(r.hash);
+    const token= String(r.contractAddress||'').toLowerCase();
+    const to   = String(r.to||'').toLowerCase();
+    const from = String(r.from||'').toLowerCase();
+    const val  = toBig(r.value||'0');
 
     if (token === WETH){
+      if (val === 0n) continue;
       if (to === wallet){
-        wethDeltaByHash.set(hash, add(wethDeltaByHash.get(hash), v));
-        inc(blkInByCP, bn, from, v);
+        pushBase(bn, { dir:'in', wei:val, txIndex:idx, logIndex:lg, hash, cp:from, used:false });
+        addHash(hash,'in',val);
       } else if (from === wallet){
-        wethDeltaByHash.set(hash, add(wethDeltaByHash.get(hash), -v));
-        inc(blkOutByCP, bn, to, v);
+        pushBase(bn, { dir:'out', wei:val, txIndex:idx, logIndex:lg, hash, cp:to, used:false });
+        addHash(hash,'out',val);
       }
       continue;
     }
 
+    // group non-WETH tokens for PnL
     if (to !== wallet && from !== wallet) continue;
     if (!tokenTxsByToken.has(token)) tokenTxsByToken.set(token, []);
     tokenTxsByToken.get(token).push(r);
   }
 
-  const perToken = [];
-  let baseInTradeWei  = 0n; // matched SELL proceeds
-  let baseOutTradeWei = 0n; // matched BUY cost
+  // Nearest base picker (same block), preferring same cp & routers, then minimal (|txIndex diff|, |logIndex diff|)
+  function takeNearestBase(bn, wantDir, ref){
+    const pool = (baseByBlock.get(bn) || []).filter(e => !e.used && e.dir === wantDir);
+    if (!pool.length) return 0n;
 
-  // Per-token loop
+    // First pass: prefer same counterparty if provided
+    let cand = pool
+      .map(e => {
+        const cpScore =
+          (ref.cp && e.cp === ref.cp) ? 0 :
+          ((ref.cp && (KNOWN_ROUTERS.has(ref.cp) || ref.cp === ref.token)) && (KNOWN_ROUTERS.has(e.cp) || e.cp === ref.token)) ? 1 :
+          2; // worse
+        const dx = Math.abs((e.txIndex||0) - (ref.txIndex||0));
+        const dl = Math.abs((e.logIndex||0) - (ref.logIndex||0));
+        return { e, score: [cpScore, dx, dl] };
+      })
+      .sort((a,b)=> (a.score[0]-b.score[0]) || (a.score[1]-b.score[1]) || (a.score[2]-b.score[2]));
+
+    if (!cand.length) return 0n;
+    const picked = cand[0].e;
+    picked.used = true;
+    return picked.wei;
+  }
+
+  const perToken = [];
+  let baseInMatchedWei  = 0n; // proceeds from sells
+  let baseOutMatchedWei = 0n; // cost for buys
+
+  // Per-token processing
   for (const [token, txs] of tokenTxsByToken.entries()){
     txs.sort((a,b)=>
-      (Number(a.timeStamp)-Number(b.timeStamp)) ||
       (Number(a.blockNumber)-Number(b.blockNumber)) ||
       (Number(a.transactionIndex||0)-Number(b.transactionIndex||0)) ||
       (Number(a.logIndex||0)-Number(b.logIndex||0))
@@ -228,202 +236,140 @@ async function computePnL(wallet,{sinceTs=0}={}){
 
     const { priceUsd, priceWeth } = await getQuotes(token);
 
-    let qty = 0n;             // remaining units
-    let costWei = 0n;         // cost basis of remaining (wei)
-    let realizedWei = 0n;     // realized P/L (wei)
+    let qty = 0n;         // remaining units
+    let cost = 0n;        // cost basis of remaining (wei)
+    let realized = 0n;    // realized PnL (wei)
 
-    let totalBuyWei  = 0n;    // sum of paid base for matched buys
-    let totalSellWei = 0n;    // sum of received base for matched sells
+    let totalBuyWei  = 0n;
+    let totalSellWei = 0n;
     let boughtUnits  = 0n;
     let soldUnits    = 0n;
 
     const tokenDecimals = Math.max(0, Number(txs[0]?.tokenDecimal || 18));
     const scale = 10n ** BigInt(tokenDecimals);
 
-    for(const r of txs){
-      const hash = String(r.hash);
+    for (const r of txs){
       const bn   = Number(r.blockNumber||0);
+      const idx  = Number(r.transactionIndex||0);
+      const lg   = Number(r.logIndex||0);
+      const hash = String(r.hash);
       const to   = String(r.to||'').toLowerCase();
       const from = String(r.from||'').toLowerCase();
       const amt  = toBig(r.value||'0');
 
-      const wd = wethDeltaByHash.get(hash) || 0n;
-      const ed = ethDeltaByHash.get(hash)  || 0n;
-      const sameHashPaid = (ed<0n?-ed:0n) + (wd<0n?-wd:0n);
-      const sameHashRecv = (ed>0n? ed:0n) + (wd>0n? wd:0n);
+      const h = baseByHash.get(hash) || { inWei:0n, outWei:0n };
 
-      // ---- BUY (token -> wallet) ----
+      // BUY (token -> wallet)
       if (to === wallet){
-        let paidWei = sameHashPaid;
-
-        // If same-hash miss, try same-block from specific counterparty
+        let paidWei = h.outWei; // same-hash base out
         if (paidWei === 0n){
-          const cp = from;
-          let available = avail(blkOutByCP, blkOutUsedByCP, bn, cp);
-          if (available === 0n && (KNOWN_ROUTERS.has(cp) || cp === token)) {
-            available = avail(blkOutByCP, blkOutUsedByCP, bn, cp);
-          }
-          if (available > 0n){
-            paidWei = available;
-            use(blkOutUsedByCP, bn, cp, paidWei);
-          }
+          paidWei = takeNearestBase(bn, 'out', { txIndex:idx, logIndex:lg, cp:from, token });
         }
-        // Fallback: any block-level base out still unused
-        if (paidWei === 0n){
-          const byCp = blkOutByCP.get(bn) || new Map();
-          for (const [cp] of byCp.entries()){
-            const rem = avail(blkOutByCP, blkOutUsedByCP, bn, cp);
-            if (rem > 0n){ paidWei = rem; use(blkOutUsedByCP, bn, cp, rem); break; }
-          }
-        }
-
-        // Bonding (from === token) → treat as buy at zero-cost (MTM later covers value)
+        // bonding 0-cost
         if (from === token && paidWei === 0n){
-          boughtUnits += amt;
-          qty += amt;
-          continue;
+          boughtUnits += amt; qty += amt; continue;
         }
-
-        // If something matched, book cost
+        // matched cost
         if (paidWei > 0n){
-          boughtUnits += amt;
-          qty += amt;
-          costWei += paidWei;
+          boughtUnits += amt; qty += amt;
+          cost += paidWei;
           totalBuyWei += paidWei;
-          baseOutTradeWei += paidWei;
+          baseOutMatchedWei += paidWei;
           continue;
         }
-
-        // Else unlabeled inbound → count as zero-cost “airdropish”; keep in inventory
-        boughtUnits += amt;
-        qty += amt;
+        // unpriced inbound → keep as zero-cost (airdrop-like)
+        boughtUnits += amt; qty += amt;
         continue;
       }
 
-      // ---- SELL (wallet -> token) ----
+      // SELL (wallet -> token)
       if (from === wallet){
-        let proceeds = sameHashRecv;
-
-        // same-block, same counterparty first
+        let proceeds = h.inWei; // same-hash base in
         if (proceeds === 0n){
-          const cp = to;
-          let available = avail(blkInByCP, blkInUsedByCP, bn, cp);
-          if (available === 0n && (KNOWN_ROUTERS.has(cp) || cp === token)) {
-            available = avail(blkInByCP, blkInUsedByCP, bn, cp);
-          }
-          if (available > 0n){
-            proceeds = available;
-            use(blkInUsedByCP, bn, cp, proceeds);
-          }
+          proceeds = takeNearestBase(bn, 'in', { txIndex:idx, logIndex:lg, cp:to, token });
         }
-        // block pool fallback
         if (proceeds === 0n){
-          const byCp = blkInByCP.get(bn) || new Map();
-          for (const [cp] of byCp.entries()){
-            const rem = avail(blkInByCP, blkInUsedByCP, bn, cp);
-            if (rem > 0n){ proceeds = rem; use(blkInUsedByCP, bn, cp, rem); break; }
-          }
-        }
-
-        // Gift/internal move with no proceeds: reduce qty + cost proportionally, no realized P/L
-        if (proceeds === 0n){
+          // gift / internal: reduce qty & cost proportionally
           if (qty > 0n){
-            const avg = (costWei * 1_000_000_000_000_000_000n) / (qty || 1n);
-            const used = amt > qty ? qty : amt;
-            const reduce = (avg * used) / 1_000_000_000_000_000_000n;
-            qty -= used;
-            costWei = costWei > reduce ? (costWei - reduce) : 0n;
+            const avg = (cost * 1_000_000_000_000_000_000n) / (qty || 1n);
+            const useAmt = amt > qty ? qty : amt;
+            const reduce = (avg * useAmt) / 1_000_000_000_000_000_000n;
+            qty -= useAmt;
+            cost = cost > reduce ? (cost - reduce) : 0n;
           }
           continue;
         }
-
-        // Real sell: average-cost realization
+        // real sell
         soldUnits += amt;
-        const sellUnits = amt > qty ? qty : amt;
-        const avgCost = qty > 0n ? (costWei * 1_000_000_000_000_000_000n) / qty : 0n;
-        const costOfSold = (avgCost * sellUnits) / 1_000_000_000_000_000_000n;
+        const useAmt = amt > qty ? qty : amt;
+        const avg = qty > 0n ? (cost * 1_000_000_000_000_000_000n) / qty : 0n;
+        const costOfSold = (avg * useAmt) / 1_000_000_000_000_000_000n;
 
-        realizedWei += (proceeds - costOfSold);
+        realized += (proceeds - costOfSold);
 
-        const newQty = qty > sellUnits ? (qty - sellUnits) : 0n;
-        costWei = newQty > 0n ? (avgCost * newQty) / 1_000_000_000_000_000_000n : 0n;
+        const newQty = qty > useAmt ? (qty - useAmt) : 0n;
+        cost = newQty > 0n ? (avg * newQty) / 1_000_000_000_000_000_000n : 0n;
         qty = newQty;
 
         totalSellWei += proceeds;
-        baseInTradeWei += proceeds;
+        baseInMatchedWei += proceeds;
         continue;
       }
     }
 
-    // Mark-to-market only for totals; open list will only show units & USD
+    // Valuation for totals/open (no MTM on row)
     const qtyFloat = Number(qty) / Number(scale || 1n);
-    const invCostBase = Number(costWei) / 1e18;
-    const mtmBase = qtyFloat * Number(priceWeth || 0);
-    const unrealBase = mtmBase - invCostBase;
-    const usdValue = qtyFloat * Number(priceUsd || 0);
+    const holdingsUsd = qtyFloat * Number((await getUsdQuote(token)).priceUsd || priceUsd || 0); // small refresh to avoid 0s sometimes
 
-    // Dust logic for open vs closed classification
-    const symUp = String(txs[0]?.tokenSymbol || '').toUpperCase();
-    const isEthLike = (symUp === 'ETH') || (symUp === 'WETH') || (token === WETH);
-    const MIN_UNITS = 5n * (10n ** BigInt(tokenDecimals));
-    const isOpen = qty > 0n;
-    const isDustOpen = isOpen && !isEthLike && qty < MIN_UNITS;
-
-    // Keep all rows; UI will filter open dust out
     perToken.push({
       token,
       symbol: txs[0]?.tokenSymbol || '',
       decimals: tokenDecimals,
 
-      boughtUnits: boughtUnits.toString(),
-      soldUnits:   soldUnits.toString(),
-      remaining:   qty.toString(),
+      boughtUnits:  boughtUnits.toString(),
+      soldUnits:    soldUnits.toString(),
+      remaining:    qty.toString(),
 
-      totalBuyBase:  Number(totalBuyWei)  / 1e18, // ETH float
-      totalSellBase: Number(totalSellWei) / 1e18, // ETH float
-      realizedBase:  Number(realizedWei)  / 1e18, // ETH float
-      unrealizedBase: unrealBase,                 // ETH float (for totals only)
-      priceUsd: Number(priceUsd || 0),
-      holdingsUsd: usdValue,                      // for open positions
+      totalBuyBase:  Number(totalBuyWei)  / 1e18,
+      totalSellBase: Number(totalSellWei) / 1e18,
+      realizedBase:  Number(realized)     / 1e18,
+
+      holdingsUsd
     });
   }
 
-  // Totals (trade flows only)
-  const baseIn  = Number(baseInTradeWei)/1e18;
-  const baseOut = Number(baseOutTradeWei)/1e18;
+  // Trade-only ETH in/out
+  const baseIn  = Number(baseInMatchedWei)  / 1e18;
+  const baseOut = Number(baseOutMatchedWei) / 1e18;
 
-  let totalRealized = 0, totalUnreal = 0, totalHoldUsd = 0;
+  // Totals + lists
+  let totalRealized = 0, totalHoldUsd = 0;
   for (const r of perToken){
     totalRealized += Number(r.realizedBase)||0;
-    totalUnreal   += Number(r.unrealizedBase)||0;
     totalHoldUsd  += Number(r.holdingsUsd)||0;
   }
-  const totalPnl = totalRealized + totalUnreal;
+  // No MTM in rows; unrealized is implied by open positions value – we keep it 0 for summary now.
+  const totalUnrealized = 0;
+  const totalPnl = totalRealized + totalUnrealized;
   const pnlPct = baseOut > 0 ? (totalPnl / baseOut) * 100 : 0;
 
-  // Classifiers for UI:
-  // Closed = remaining == 0, or (remaining < 5 tokens and not ETH/WETH)
+  // Classifications
   function isClosed(row){
     const q = BigInt(row.remaining || '0');
     if (q === 0n) return true;
-    const symUp = String(row.symbol||'').toUpperCase();
-    const isEthLike = (symUp === 'ETH' || symUp === 'WETH');
-    const dec = Number(row.decimals || 18);
+    const dec = Number(row.decimals||18);
     const minUnits = 5n * (10n ** BigInt(dec));
-    return (!isEthLike) && (q < minUnits);
+    return q < minUnits;
   }
   function isOpenRow(row){
     const q = BigInt(row.remaining || '0');
     if (q === 0n) return false;
-    const symUp = String(row.symbol||'').toUpperCase();
-    const isEthLike = (symUp === 'ETH' || symUp === 'WETH');
-    if (isEthLike) return true; // show if real balance (rare as ERC20)
-    const dec = Number(row.decimals || 18);
+    const dec = Number(row.decimals||18);
     const minUnits = 5n * (10n ** BigInt(dec));
-    return q >= minUnits; // open only if >= 5 tokens
+    if (q < minUnits) return false;
+    return Number(row.holdingsUsd||0) >= 1; // hide <$1
   }
 
-  // Derivatives
   const closed = perToken.filter(isClosed);
   const best  = closed.filter(r => Number(r.realizedBase) > 0)
                       .sort((a,b)=> Number(b.realizedBase)-Number(a.realizedBase))
@@ -437,10 +383,10 @@ async function computePnL(wallet,{sinceTs=0}={}){
     wallet,
     sinceTs,
     totals: {
-      ethBalance: ethBalanceFloat, // wallet ETH (native)
+      ethBalance: ethBalanceFloat, // native ETH balance
       baseIn, baseOut,             // trade-only ETH in/out
       realizedBase: totalRealized,
-      unrealizedBase: totalUnreal, // used only for summary; not shown inside open rows
+      unrealizedBase: totalUnrealized, // kept 0 to avoid MTM confusion
       totalPnlBase: totalPnl,
       pnlPct,
       holdingsUsd: totalHoldUsd,
