@@ -54,15 +54,15 @@ function header(wallet, window, totals){
   lines.push('');
   lines.push(
     [
-      `💧 <b>ETH IN:</b> ${esc(fmtWETH((totals.ethInFloat||0) + (totals.wethInFloat||0)))}`,
-      `🔥 <b>ETH OUT:</b> ${esc(fmtWETH((totals.ethOutFloat||0) + (totals.wethOutFloat||0)))}`
+      `💧 <b>ETH IN:</b> ${esc(fmtWETH((totals.ethInFloat||0) + (totals.wethInFloat||0)))}`,<br>
+      `🔥 <b>ETH OUT:</b> ${esc(fmtWETH((totals.ethOutFloat||0) + (totals.wethOutFloat||0)))}`<br>
     ].join('   ·   ')
   );
   lines.push(
     [
-      `📈 <b>Realized:</b> ${esc(fmtWETH(totals.realizedWeth||0))}`,
-      `📊 <b>Unrealized:</b> ${esc(fmtWETH(totals.unrealizedWeth||0))}`,
-      `📦 <b>Holdings:</b> ${esc(money(totals.holdingsUsd||0))}`,
+      `📈 <b>Realized:</b> ${esc(fmtWETH(totals.realizedWeth||0))}`,<br>
+      `📊 <b>Unrealized:</b> ${esc(fmtWETH(totals.unrealizedWeth||0))}`,<br>
+      `📦 <b>Holdings:</b> ${esc(money(totals.holdingsUsd||0))}`,<br>
       `🎁 <b>Airdrops:</b> ${esc(money(totals.airdropsUsd||0))}`
     ].join('   ·   ')
   );
