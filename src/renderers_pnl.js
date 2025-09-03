@@ -1,11 +1,11 @@
 // src/renderers_pnl.js
 import { esc, money } from './ui_html.js';
 
-// helpers
 const shortAddr = (a) => a ? (a.slice(0,6) + '…' + a.slice(-4)) : '';
 const sign = (x) => (x > 0 ? '+' : (x < 0 ? '−' : '±'));
 const fmtWETH = (w) => `${Number(w).toFixed(6)} WETH`;
 const fmtWeiWETH = (wei) => `${(Number(wei)/1e18).toFixed(6)} WETH`;
+const fmtETH = (e) => `${Number(e).toFixed(6)} ETH`;
 const pct = (x) => `${(Number(x)||0).toFixed(2)}%`;
 
 function fmtQty(units, decimals){
@@ -58,13 +58,16 @@ function lineForToken(t){
   const unreal   = Number(t.unrealizedWeth||0);
   const total    = realized + unreal;
   const tag = `${badge(total)} ${sign(total)}${Math.abs(total).toFixed(6)} WETH`;
-  return `• <b>${sym}</b> — ${tag}\n   buy ${buys}, sell ${sells}, rem ${rem}\n   real ${esc(fmtWETH(realized))}, unreal ${esc(fmtWETH(unreal))}`;
+  const remUsd = Number(t.usdValueRemaining||0);
+
+  return `• <b>${sym}</b> — ${tag}\n` +
+         `   buy ${buys}, sell ${sells}, rem ${rem}  ·  💵 ${esc(money(remUsd))}\n` +
+         `   real ${esc(fmtWETH(realized))}, unreal ${esc(fmtWETH(unreal))}`;
 }
 
 export function renderPNL(data, window='30d', view='overview'){
   const w = esc(data.wallet);
   const t = data.totals || {};
-  const tokens = Array.isArray(data.tokens) ? data.tokens : [];
   const derived = data.derived || {};
 
   const lines = [];
@@ -72,26 +75,31 @@ export function renderPNL(data, window='30d', view='overview'){
   lines.push(`<i>Window: ${esc(window)}</i>`);
   lines.push('');
 
-  // Overview header cards always shown
+  // Totals / header cards
   lines.push(
     [
       `💧 <b>WETH IN:</b> ${esc(fmtWeiWETH(t.wethIn||'0'))}`,
       `🔥 <b>WETH OUT:</b> ${esc(fmtWeiWETH(t.wethOut||'0'))}`,
-      `📊 <b>PnL%:</b> ${esc(pct(t.pnlPct||0))}`
+      `🪙 <b>ETH IN:</b> ${esc(fmtETH(t.ethInFloat||0))}`,
+      `🚀 <b>ETH OUT:</b> ${esc(fmtETH(t.ethOutFloat||0))}`
     ].join('   ·   ')
   );
   lines.push(
     [
       `📈 <b>Realized:</b> ${esc(fmtWETH(t.realizedWeth||0))}`,
       `📉 <b>Unrealized:</b> ${esc(fmtWETH(t.unrealizedWeth||0))}`,
-      `🎁 <b>Airdrops:</b> ${esc(money(t.airdropsUsd||0))}`
+      `📊 <b>PnL%:</b> ${esc(pct(t.pnlPct||0))}`
+    ].join('   ·   ')
+  );
+  lines.push(
+    [
+      `💼 <b>Holdings (USD):</b> ${esc(money(t.holdingsUsd||0))}`,
+      `🎁 <b>Airdrops (USD):</b> ${esc(money(t.airdropsUsd||0))}`
     ].join('   ·   ')
   );
   lines.push('');
 
-  // View bodies
   if (view === 'overview') {
-    // Top 3 best + top 3 worst
     const best = Array.isArray(derived.best) ? derived.best.slice(0,3) : [];
     const worst = Array.isArray(derived.worst) ? derived.worst.slice(0,3) : [];
 
