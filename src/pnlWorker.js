@@ -8,6 +8,9 @@
 // • Combine ETH+WETH cash legs for PnL% and totals.
 // • Bonding-phase buys: treat inbound-from-token as BUY (no false airdrops)
 // • Subtract any outbound token transfers from inventory (adjust cost proportionally)
+// • NEW: Forwarder-aware + block-level cash pairing to catch Moonshot proxy flows
+//        (e.g. 0x0d6848e3... forwarder). If no cash leg on same tx-hash, pair with
+//        unmatched ETH/WETH delta in the same block.
 
 import './configEnv.js';
 import axios from 'axios';
@@ -16,6 +19,11 @@ import { Worker, Queue } from 'bullmq';
 import { setJSON, getJSON, withLock } from './cache.js';
 
 const WETH = '0x3439153eb7af838ad19d56e1571fbd09333c2809'.toLowerCase();
+
+// ---- Forwarders / proxies (expandable)
+const FORWARDERS = new Set([
+  '0x0d6848e39114abe69054407452b8aab82f8a44ba', // Moonshot forwarder (observed)
+]);
 
 // ---------- Etherscan v2 client + throttle ----------
 const ES_BASE  = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
@@ -168,27 +176,67 @@ async function computePnL(wallet, { sinceTs=0 }) {
   const ethDeltaByHash  = new Map(); // txHash -> +in / -out (wei)
   const tokenTxsByToken = new Map(); // tokenCA -> txs[]
 
+  // We'll also index ETH/WETH deltas by blockNumber so we can pair when
+  // the cash leg is NOT in the same tx-hash (forwarder flows).
+  const cashPosByBlock = new Map(); // block -> [{hash, amount>0, consumed:false}]
+  const cashNegByBlock = new Map(); // block -> [{hash, amount<0 (store abs), consumed:false}]
+
+  function addCash(blockNumber, hash, deltaWei) {
+    if (deltaWei === 0n) return;
+    if (deltaWei > 0n) {
+      const arr = cashPosByBlock.get(blockNumber) || [];
+      arr.push({ hash, amount: deltaWei, consumed: false });
+      cashPosByBlock.set(blockNumber, arr);
+    } else {
+      const arr = cashNegByBlock.get(blockNumber) || [];
+      arr.push({ hash, amount: (-deltaWei), consumed: false }); // store abs
+      cashNegByBlock.set(blockNumber, arr);
+    }
+  }
+  function takeCashFromBlock(blockNumber, sign /* 'pos'|'neg' */) {
+    const arr = (sign === 'pos' ? cashPosByBlock.get(blockNumber) : cashNegByBlock.get(blockNumber)) || [];
+    for (const item of arr) {
+      if (!item.consumed && item.amount > 0n) {
+        item.consumed = true;
+        return item.amount; // wei (positive)
+      }
+    }
+    return 0n;
+  }
+
   // native ETH
   for (const tx of normal) {
     const hash = String(tx.hash);
+    const bn   = Number(tx.blockNumber || 0);
     const from = String(tx.from || '').toLowerCase();
     const to   = String(tx.to   || '').toLowerCase();
     const val  = toBig(tx.value || '0');
-    if (to === wallet && val > 0n)       ethDeltaByHash.set(hash, add(ethDeltaByHash.get(hash), val));
-    else if (from === wallet && val > 0n) ethDeltaByHash.set(hash, add(ethDeltaByHash.get(hash), -val));
+    if (to === wallet && val > 0n) {
+      ethDeltaByHash.set(hash, add(ethDeltaByHash.get(hash), val));
+      addCash(bn, hash, +val);
+    } else if (from === wallet && val > 0n) {
+      ethDeltaByHash.set(hash, add(ethDeltaByHash.get(hash), -val));
+      addCash(bn, hash, -val);
+    }
   }
 
   // WETH + group per token
   for (const r of erc20) {
     const hash  = String(r.hash);
+    const bn    = Number(r.blockNumber || 0);
     const token = String(r.contractAddress || '').toLowerCase();
     const to    = String(r.to   || '').toLowerCase();
     const from  = String(r.from || '').toLowerCase();
     const v     = toBig(r.value || '0');
 
     if (token === WETH) {
-      if (to === wallet)       wethDeltaByHash.set(hash, add(wethDeltaByHash.get(hash), v));
-      else if (from === wallet) wethDeltaByHash.set(hash, add(wethDeltaByHash.get(hash), -v));
+      if (to === wallet) {
+        wethDeltaByHash.set(hash, add(wethDeltaByHash.get(hash), v));
+        addCash(bn, hash, +v);
+      } else if (from === wallet) {
+        wethDeltaByHash.set(hash, add(wethDeltaByHash.get(hash), -v));
+        addCash(bn, hash, -v);
+      }
       continue;
     }
     if (to !== wallet && from !== wallet) continue;
@@ -214,25 +262,41 @@ async function computePnL(wallet, { sinceTs=0 }) {
 
     for (const r of txs) {
       const hash = String(r.hash);
+      const bn   = Number(r.blockNumber || 0);
       const to   = String(r.to   || '').toLowerCase();
       const from = String(r.from || '').toLowerCase();
       const amt  = toBig(r.value || '0');
 
       const wethDelta = wethDeltaByHash.get(hash) || 0n;
       const ethDelta  = ethDeltaByHash.get(hash)  || 0n;
-      const paidWei   = (ethDelta < 0n ? -ethDelta : 0n) + (wethDelta < 0n ? -wethDelta : 0n);
-      const recvWei   = (ethDelta > 0n ?  ethDelta : 0n) + (wethDelta > 0n ?  wethDelta : 0n);
+      let paidWei   = (ethDelta < 0n ? -ethDelta : 0n) + (wethDelta < 0n ? -wethDelta : 0n);
+      let recvWei   = (ethDelta > 0n ?  ethDelta : 0n) + (wethDelta > 0n ?  wethDelta : 0n);
 
-      // BUY (cash leg OR bonding pool == token)
-      if (to === wallet && (paidWei > 0n || from === token)) {
+      const fromIsToken     = (from === token);
+      const fromIsForwarder = FORWARDERS.has(from);
+      const toIsForwarder   = FORWARDERS.has(to);
+
+      // BUY (cash leg OR bonding pool == token OR forwarder with same-block pairing)
+      if (to === wallet && (paidWei > 0n || fromIsToken || fromIsForwarder)) {
+        if (paidWei === 0n && (fromIsToken || fromIsForwarder)) {
+          // try to pair with unmatched cash OUT in the same block
+          const paired = takeCashFromBlock(bn, 'neg'); // returns abs(wei) or 0n
+          if (paired > 0n) paidWei = paired;
+        }
         buys += amt;
         qty  += amt;
-        costWeth += paidWei; // may be 0 for bonding, then mark-to-market takes over
+        costWeth += paidWei; // may be 0 if still unpaired; mark-to-market handles unrealized
         continue;
       }
 
-      // SELL (cash leg)
-      if (from === wallet && recvWei > 0n) {
+      // SELL (cash leg OR forwarder with same-block pairing)
+      if (from === wallet && (recvWei > 0n || toIsForwarder)) {
+        if (recvWei === 0n && toIsForwarder) {
+          // try to pair with unmatched cash IN in the same block
+          const paired = takeCashFromBlock(bn, 'pos');
+          if (paired > 0n) recvWei = paired;
+        }
+
         sells += amt;
         const avgCostWeiPerUnit = qty > 0n ? (costWeth * 1_000_000_000_000_000_000n) / qty : 0n;
         const proceeds  = recvWei;
@@ -257,19 +321,17 @@ async function computePnL(wallet, { sinceTs=0 }) {
         continue;
       }
 
-      // AIRDROP: inbound with no cash leg and not from token (avoid bonding)
-      if (to === wallet && paidWei === 0n && from !== token) {
+      // AIRDROP: inbound with no cash leg and not from token/forwarder (avoid bonding/forwarders)
+      if (to === wallet && paidWei === 0n && !fromIsToken && !fromIsForwarder) {
         airdrops.push({ hash, amount: amt });
         qty += amt; // 0 cost
         continue;
       }
     }
 
-    // Hide dust (< 5 tokens), exclude ETH/WETH (not in perToken anyway)
+    // Hide dust (< 5 tokens)
     const MIN_UNITS = 5n * (10n ** BigInt(tokenDecimals));
-    if (qty > 0n && qty < MIN_UNITS) {
-      // treat as closed (dust ignored in open)
-    }
+    // (We keep the position in perToken for PnL accounting; view logic will treat <=5 as closed.)
 
     const remainingUnitsFloat = Number(qty) / Number(scale || 1n);
     const invCostFloatWeth = Number(costWeth) / 1e18;
@@ -322,11 +384,11 @@ async function computePnL(wallet, { sinceTs=0 }) {
 
   // Wallet ETH/WETH net flows
   let wethIn = 0n, wethOut = 0n;
-  for (const v of (function*(){ for (const x of wethDeltaByHash.values()) yield x; })()) {
+  for (const v of (function*(){ for (const x of new Map(wethDeltaByHash).values()) yield x; })()) {
     if (v > 0n) wethIn += v; else wethOut += (-v);
   }
   let ethIn = 0n, ethOut = 0n;
-  for (const v of (function*(){ for (const x of ethDeltaByHash.values()) yield x; })()) {
+  for (const v of (function*(){ for (const x of new Map(ethDeltaByHash).values()) yield x; })()) {
     if (v > 0n) ethIn += v; else ethOut += (-v);
   }
 
@@ -339,7 +401,7 @@ async function computePnL(wallet, { sinceTs=0 }) {
   const spentBase    = wethOutFloat + ethOutFloat;
   const pnlPct       = spentBase > 0 ? (totalPnlWeth / spentBase) * 100 : 0;
 
-  // Classification: open vs closed
+  // Classification: open vs closed (closed if <= 5 tokens)
   const isClosed = (t) => (Number(t.remainingUnitsFloat || 0) <= 5);
   const closed   = perToken.filter(isClosed);
   const open     = perToken.filter(t => !isClosed(t) && Number(t.usdValueRemaining || 0) > 0);
@@ -380,7 +442,6 @@ async function computePnL(wallet, { sinceTs=0 }) {
       open,
       profitsClosed,
       lossesClosed,
-      // keep original airdrop view: tokens that have any airdrops
       airdrops: perToken
         .filter(t => (t.airdrops?.count || 0) > 0)
         .map(t => ({
@@ -404,7 +465,7 @@ export async function refreshPnl(wallet, window) {
     '24h':  60*60*24,
     '7d':   60*60*24*7,
     '30d':  60*60*24*30,
-    '90d':  60*60*24*90, // window list includes 90d
+    '90d':  60*60*24*90,
     'all':  0
   };
   const sinceSec = sinceMap[window] ?? sinceMap['30d'];
