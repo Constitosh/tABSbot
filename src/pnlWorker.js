@@ -113,7 +113,7 @@ async function getWalletNormalTxs(wallet,{fromTs=0}={}){
 }
 async function getEthBalance(wallet){
   try {
-    const r = await esGET({ module:'account', action:'balance', address:wallet, tag:'latest' }, { tag:'[balance]' });
+    const r = await esGET({ module:'account', action:'balance', address: wallet, tag:'latest' }, { tag:'[balance]' });
     const s = typeof r === 'string' ? r : (r?.result || '0');
     return s;
   } catch { return '0'; }
@@ -179,7 +179,7 @@ async function computePnL(wallet,{sinceTs=0}={}){
     }
   }
 
-  // WETH
+  // WETH + group token txs
   const tokenTxsByToken = new Map();
   for(const r of erc20){
     const hash  = String(r.hash);
@@ -218,6 +218,7 @@ async function computePnL(wallet,{sinceTs=0}={}){
       (Number(a.logIndex||0)-Number(b.logIndex||0))
     );
 
+    // ONE quote fetch per token
     const { priceUsd, priceWeth } = await getQuotes(token);
 
     let qty = 0n;
@@ -228,8 +229,6 @@ async function computePnL(wallet,{sinceTs=0}={}){
 
     const tokenDecimals = Math.max(0, Number(txs[0]?.tokenDecimal || 18));
     const scale = 10n ** BigInt(tokenDecimals);
-
-    const airdrops = [];
 
     for(const r of txs){
       const hash = String(r.hash);
@@ -247,32 +246,27 @@ async function computePnL(wallet,{sinceTs=0}={}){
       if (to === wallet){
         let paidWei = sameHashPaid;
 
-        // Counterparty pairing first (use wallet->counterparty base out in same block)
+        // Counterparty pairing
         if (paidWei === 0n){
-          const cp = from; // the address that sent us the tokens
+          const cp = from;
           const available = avail(blkOutByCP, blkOutUsedByCP, bn, cp);
-          if (available > 0n) {
+          if (available > 0n){
             paidWei = available;
             use(blkOutUsedByCP, bn, cp, paidWei);
           }
         }
-
-        // Block pool fallback (any remaining out in this block)
+        // Block pool fallback
         if (paidWei === 0n){
-          let poolRem = 0n;
-          for (const [cp,wei] of (blkOutByCP.get(bn)||new Map()).entries()){
+          for (const [cp] of (blkOutByCP.get(bn)||new Map()).entries()){
             const rem = avail(blkOutByCP, blkOutUsedByCP, bn, cp);
-            if (rem > 0n){ poolRem += rem; use(blkOutUsedByCP, bn, cp, rem); break; }
+            if (rem > 0n){ paidWei = rem; use(blkOutUsedByCP, bn, cp, rem); break; }
           }
-          if (poolRem > 0n) paidWei = poolRem;
         }
-
-        // Bonding (from==token) counts as buy with zero cost
+        // Bonding (from === token) -> zero-cost buy
         if (from === token && paidWei === 0n){
           buysUnits += amt; qty += amt;
           continue;
         }
-
         if (paidWei > 0n){
           buysUnits += amt; qty += amt;
           costWei   += paidWei;
@@ -280,10 +274,8 @@ async function computePnL(wallet,{sinceTs=0}={}){
           baseOutTradeWei += paidWei;
           continue;
         }
-
-        // Otherwise treat as airdrop
-        airdrops.push({ hash, amount: amt });
-        qty += amt; // zero cost
+        // Else unlabeled inbound -> include as zero-cost (airdrop/unknown)
+        buysUnits += amt; qty += amt;
         continue;
       }
 
@@ -291,27 +283,24 @@ async function computePnL(wallet,{sinceTs=0}={}){
       if (from === wallet){
         let proceeds = sameHashRecv;
 
-        // Counterparty pairing first (use counterparty->wallet base in in same block)
+        // Counterparty pairing
         if (proceeds === 0n){
-          const cp = to; // the address we sent tokens to
+          const cp = to;
           const available = avail(blkInByCP, blkInUsedByCP, bn, cp);
           if (available > 0n){
             proceeds = available;
             use(blkInUsedByCP, bn, cp, proceeds);
           }
         }
-
         // Block pool fallback
         if (proceeds === 0n){
-          let poolRem = 0n;
-          for (const [cp,wei] of (blkInByCP.get(bn)||new Map()).entries()){
+          for (const [cp] of (blkInByCP.get(bn)||new Map()).entries()){
             const rem = avail(blkInByCP, blkInUsedByCP, bn, cp);
-            if (rem > 0n){ poolRem += rem; use(blkInUsedByCP, bn, cp, rem); break; }
+            if (rem > 0n){ proceeds = rem; use(blkInUsedByCP, bn, cp, rem); break; }
           }
-          if (poolRem > 0n) proceeds = poolRem;
         }
 
-        // Gift / internal out (no proceeds)
+        // Gift/internal out (no proceeds)
         if (proceeds === 0n){
           if (qty > 0n){
             const avg = (costWei * 1_000_000_000_000_000_000n) / (qty || 1n);
@@ -341,13 +330,11 @@ async function computePnL(wallet,{sinceTs=0}={}){
       }
     }
 
-    // Mark-to-market + USD
+    // Mark-to-market + USD (use single fetched quotes)
     const qtyFloat = Number(qty) / Number(scale || 1n);
     const invCostBase = Number(costWei) / 1e18;
-    const { priceWeth } = await getWethQuote(token);
     const mtmBase = qtyFloat * Number(priceWeth || 0);
     const unrealBase = mtmBase - invCostBase;
-    const { priceUsd } = await getUsdQuote(token);
     const usdValue = qtyFloat * Number(priceUsd || 0);
 
     // Hide open dust (<5 tokens) except ETH/WETH
@@ -391,7 +378,7 @@ async function computePnL(wallet,{sinceTs=0}={}){
   const totalPnl = totalRealized + totalUnreal;
   const pnlPct = baseOut > 0 ? (totalPnl / baseOut) * 100 : 0;
 
-  // Derived lists
+  // Derived lists (closed-only for realized rankings)
   const isClosedOrDust = (row) => {
     const q = BigInt(row.remaining||'0');
     if (q === 0n) return true;
