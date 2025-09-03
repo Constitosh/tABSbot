@@ -228,7 +228,6 @@ async function getAllTransferLogs(token, {
 
 // ---------- Earliest tokentx ASC (for first buyers) ----------
 async function fetchEarliestTokentxAsc(token, { pages = 20, offset = 200 } = {}) {
-  // up to ~4000 earliest transfers; bump if you ever see the creator anchor missing
   const out = [];
   for (let page = 1; page <= pages; page++) {
     const params = {
@@ -250,7 +249,7 @@ async function fetchEarliestTokentxAsc(token, { pages = 20, offset = 200 } = {})
     out.push(...batch);
     if (batch.length < offset) break;
   }
-  return out; // already ascending
+  return out; // ascending
 }
 
 // ---------- Etherscan helpers ----------
@@ -304,26 +303,21 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
   return { holdersTop20: top20, top10CombinedPct, holdersCount: rows.length };
 }
 
-// ---------- First 20 buyers (creator-anchored; status vs first amount) ----------
+/** ---------- First buyers from tokentx (creator-anchored) ---------- */
 function first20BuyersFromTokentx(txsAsc, { tokenAddress, creator, pairAddress, excludeTokenAsPool = false }, balances) {
   if (!Array.isArray(txsAsc) || txsAsc.length === 0 || !creator) return [];
   const ca = String(tokenAddress).toLowerCase();
   const creatorAddr = String(creator).toLowerCase();
   const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
 
-  // Locate the first transfer where the creator receives the token
   let startIdx = -1;
   for (let i = 0; i < txsAsc.length; i++) {
     const to = String(txsAsc[i]?.to || '').toLowerCase();
     if (to === creatorAddr) { startIdx = i; break; }
   }
-  if (startIdx < 0) {
-    console.warn('[FIRST-BUYERS] creator anchor not found in earliest tokentx batch');
-    return [];
-  }
+  if (startIdx < 0) return [];
 
-  // Collect unique recipients from the anchor forward (include creator as #1)
-  const firstSeen = new Map(); // addr -> { firstBuyAmt, blockNumber, txIndex/logIndex }
+  const firstSeen = new Map(); // addr -> { firstBuyAmt, blockNumber, logIndex }
   const addIfEligible = (tx) => {
     const to = String(tx?.to || '').toLowerCase();
     if (!to) return false;
@@ -348,7 +342,61 @@ function first20BuyersFromTokentx(txsAsc, { tokenAddress, creator, pairAddress, 
     addIfEligible(txsAsc[i]);
   }
 
-  // Order and label status using balances map (current holdings)
+  const ordered = [...firstSeen.entries()]
+    .sort((a, b) => {
+      if (a[1].blockNumber !== b[1].blockNumber) return a[1].blockNumber - b[1].blockNumber;
+      return a[1].logIndex - b[1].logIndex;
+    })
+    .map(([address, info]) => {
+      const balNow = balances.get(address.toLowerCase()) || 0n;
+      let status = 'hold';
+      if (balNow === 0n) status = 'sold all';
+      else if (balNow < info.firstBuyAmt) status = 'sold some';
+      else if (balNow > info.firstBuyAmt) status = 'bought more';
+      return { address, status };
+    });
+
+  return ordered.slice(0, Math.min(20, ordered.length));
+}
+
+/** ---------- Fallback: first buyers directly from logs (creator-anchored) ---------- */
+function first20BuyersFromLogs(logsAsc, { tokenAddress, creator, pairAddress, excludeTokenAsPool = false }, balances) {
+  if (!Array.isArray(logsAsc) || logsAsc.length === 0 || !creator) return [];
+  const ca = String(tokenAddress).toLowerCase();
+  const creatorAddr = String(creator).toLowerCase();
+  const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
+
+  // find first log to creator
+  let startIdx = -1;
+  for (let i = 0; i < logsAsc.length; i++) {
+    const to = topicToAddr(logsAsc[i].topics[2]);
+    if (to === creatorAddr) { startIdx = i; break; }
+  }
+  if (startIdx < 0) return [];
+
+  const firstSeen = new Map(); // addr -> { firstBuyAmt, blockNumber, logIndex }
+  const addIfEligible = (lg) => {
+    const to = topicToAddr(lg.topics[2]);
+    if (DEAD.has(to)) return false;
+    if (pair && to === pair) return false;
+    if (excludeTokenAsPool && to === ca) return false;
+    if (!firstSeen.has(to)) {
+      const amt = toBig(lg.data);
+      firstSeen.set(to, {
+        firstBuyAmt: amt,
+        blockNumber: Number(lg.blockNumber || 0),
+        logIndex: Number(lg.logIndex || 0),
+      });
+      return true;
+    }
+    return false;
+  };
+
+  addIfEligible(logsAsc[startIdx]);
+  for (let i = startIdx + 1; i < logsAsc.length && firstSeen.size < 20; i++) {
+    addIfEligible(logsAsc[i]);
+  }
+
   const ordered = [...firstSeen.entries()]
     .sort((a, b) => {
       if (a[1].blockNumber !== b[1].blockNumber) return a[1].blockNumber - b[1].blockNumber;
@@ -440,16 +488,11 @@ export async function refreshToken(tokenAddress) {
 
       console.log('[WORKER] range', ca, fromB, '→', toB);
 
-      // logs for balances + holders; tokentx (ASC) for first buyers
       [logs, totalSupplyRaw, earlyTokentx] = await Promise.all([
         getAllTransferLogs(ca, { fromBlock: fromB, toBlock: toB, window: 200_000, offset: 1000 }),
         getTokenTotalSupply(ca),
         fetchEarliestTokentxAsc(ca, { pages: 20, offset: 200 }),
       ]);
-
-      if (!logs.length) {
-        console.warn('[WORKER] getLogs returned 0 — holders may be empty, but first buyers still use tokentx.');
-      }
 
       if (creatorAddr) {
         creatorBalRaw = await getCreatorTokenBalance(ca, creatorAddr);
@@ -507,17 +550,29 @@ export async function refreshToken(tokenAddress) {
       }
       creatorPercent = (supply > 0n) ? Number((creatorBal * 1000000n) / supply) / 10000 : 0;
 
-      // FIRST BUYERS — strict, from tokentx asc, creator-anchored
+      // FIRST BUYERS — try tokentx asc first; fallback to logs
       first20Buyers = first20BuyersFromTokentx(
         earlyTokentx,
-        {
-          tokenAddress: ca,
-          creator: creatorAddr,
-          pairAddress: ammPair,
-          excludeTokenAsPool,
-        },
+        { tokenAddress: ca, creator: creatorAddr, pairAddress: ammPair, excludeTokenAsPool },
         balances
       );
+      if (!first20Buyers.length) {
+        first20Buyers = first20BuyersFromLogs(
+          logs,
+          { tokenAddress: ca, creator: creatorAddr, pairAddress: ammPair, excludeTokenAsPool },
+          balances
+        );
+      }
+
+      console.log(
+        '[WORKER] compute sizes',
+        'balances=', balances.size,
+        'holdersTop20=', holdersTop20?.length || 0,
+        'buyers=', first20Buyers?.length || 0
+      );
+      if (process.env.DEBUG_FIRST) {
+        console.log('[DBG] first-buyers sample:', first20Buyers.slice(0, 5));
+      }
     } catch (e) {
       console.log('[WORKER] compute failed:', e?.message || e);
     }
