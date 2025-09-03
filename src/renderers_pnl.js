@@ -2,12 +2,26 @@
 import { esc, money } from './ui_html.js';
 
 const shortAddr = (a) => a ? (a.slice(0,6) + '…' + a.slice(-4)) : '';
-const fmtETH = (x) => (Number(x)||0).toFixed(6) + ' ETH';
-const green = (s) => `<b><span style="color:#2ecc71">${esc(s)}</span></b>`;
-const red   = (s) => `<b><span style="color:#e74c3c">${esc(s)}</span></b>`;
-const gray  = (s) => `<b><span style="color:#95a5a6">${esc(s)}</span></b>`;
 
-// window/view keyboard
+/* --- Formatting helpers (Telegram-safe HTML only) --- */
+const fmtETH = (x) => (Number(x)||0).toFixed(6) + ' ETH';
+
+function signETH(val){
+  const v = Number(val)||0;
+  const body = (v>=0?'+':'−') + Math.abs(v).toFixed(6) + ' ETH';
+  if (v > 0)  return `🟢 <b>${esc(body)}</b>`;
+  if (v < 0)  return `🔴 <b>${esc(body)}</b>`;
+  return `⚪️ <b>${esc(body)}</b>`;
+}
+function pctStr(val){
+  const v = Number(val)||0;
+  const body = `${v>=0?'+':''}${v.toFixed(2)}%`;
+  if (v > 0)  return `🟢 <b>${esc(body)}</b>`;
+  if (v < 0)  return `🔴 <b>${esc(body)}</b>`;
+  return `⚪️ <b>${esc(body)}</b>`;
+}
+
+/* --- Keyboard --- */
 function kb(wallet, window, view='overview'){
   const windows = ['24h','7d','30d','90d','all'];
   return {
@@ -17,36 +31,30 @@ function kb(wallet, window, view='overview'){
         callback_data: `pnlv:${wallet}:${w}:${view}`
       })),
       [
-        { text:'🏠 Home', callback_data:`pnlv:${wallet}:${window}:overview` },
-        { text:'🟢 Profits', callback_data:`pnlv:${wallet}:${window}:profits` },
-        { text:'🔴 Losses',  callback_data:`pnlv:${wallet}:${window}:losses` },
+        { text:'🏠 Home',     callback_data:`pnlv:${wallet}:${window}:overview` },
+        { text:'🟢 Profits',  callback_data:`pnlv:${wallet}:${window}:profits` },
+        { text:'🔴 Losses',   callback_data:`pnlv:${wallet}:${window}:losses` },
       ],
       [
-        { text:'📦 Open',   callback_data:`pnlv:${wallet}:${window}:open` },
+        { text:'📦 Open',     callback_data:`pnlv:${wallet}:${window}:open` },
         { text:'🎁 Airdrops', callback_data:`pnlv:${wallet}:${window}:airdrops` },
-        { text:'↻ Refresh',  callback_data:`pnl_refresh:${wallet}:${window}` }
+        { text:'↻ Refresh',   callback_data:`pnl_refresh:${wallet}:${window}` }
       ]
     ]
   };
 }
 
-function pctStr(x){
-  const v = Number(x)||0;
-  const s = `${v>=0?'+':''}${v.toFixed(2)}%`;
-  return v>0 ? green(s) : v<0 ? red(s) : gray(s);
-}
-function signETH(x){
-  const v = Number(x)||0;
-  const s = (v>=0?'+':'−') + Math.abs(v).toFixed(6) + ' ETH';
-  return v>0 ? green(s) : v<0 ? red(s) : gray(s);
-}
-
-// -------- Overview --------
+/* --- Main renderer --- */
 export function renderPNL(data, window='30d', view='overview'){
   const w = String(data.wallet||'').toLowerCase();
   const t = data.totals || {};
   const d = data.derived || {};
   const tokens = Array.isArray(data.tokens) ? data.tokens : [];
+
+  if (view === 'profits')  return renderPnLList(w, window, d.best,  true);
+  if (view === 'losses')   return renderPnLList(w, window, d.worst, false);
+  if (view === 'open')     return renderOpen(w, window, d.open||[]);
+  if (view === 'airdrops') return renderAirdrops(w, window, tokens);
 
   const lines = [];
   lines.push(`💼 <b>Wallet PnL — ${esc(shortAddr(w))}</b>`);
@@ -62,12 +70,12 @@ export function renderPNL(data, window='30d', view='overview'){
   lines.push(`📦 <b>Holdings:</b> ${esc(money(Number(t.holdingsUsd)||0))}`);
   lines.push(`🎁 <b>Airdrops:</b> ${esc(money(Number(t.airdropsUsd)||0))}`);
 
-  const totalP = Number(t.totalPnlBase)||0;
-  const pnlLine = `${totalP>0?'🟢':totalP<0?'🔴':'⚪️'} <b>Total PnL:</b> ${(totalP).toFixed(6)} ETH  (${pctStr(t.pnlPct)})`;
-  lines.push(pnlLine);
+  const pnl = Number(t.totalPnlBase)||0;
+  const badge = pnl>0 ? '🟢' : pnl<0 ? '🔴' : '⚪️';
+  lines.push(`${badge} <b>Total PnL:</b> ${(pnl).toFixed(6)} ETH  (${pctStr(t.pnlPct)})`);
   lines.push('');
 
-  // show top 3 winners/losers on overview
+  // Top 3 winners/losers on overview
   const best = Array.isArray(d.best) ? d.best.slice(0,3) : [];
   const worst = Array.isArray(d.worst) ? d.worst.slice(0,3) : [];
 
@@ -91,47 +99,32 @@ export function renderPNL(data, window='30d', view='overview'){
     }
   }
 
-  // route extra views
-  if (view === 'profits') {
-    return renderPnLList(w, window, d.best, 'Top Profits (realized)');
-  }
-  if (view === 'losses') {
-    return renderPnLList(w, window, d.worst, 'Top Losses (realized)');
-  }
-  if (view === 'open') {
-    const open = Array.isArray(d.open) ? d.open : [];
-    return renderOpen(w, window, open);
-  }
-  if (view === 'airdrops') {
-    const airdrops = tokens.filter(r => (r.airdrops?.count||0)>0 && Number(r.airdrops?.estUsd||0)>0);
-    return renderAirdrops(w, window, airdrops);
-  }
-
   return { text: lines.join('\n'), extra: { reply_markup: kb(w, window, 'overview') } };
 }
 
-// -------- Profits/Losses list (closed trades only) --------
-function renderPnLList(wallet, window, rows, title){
+/* --- Profits/Losses pages (closed trades only) --- */
+function renderPnLList(wallet, window, rows, isProfit){
+  const title = isProfit ? 'Top Profits (realized)' : 'Top Losses (realized)';
   const lines = [];
   lines.push(`<b>${esc(title)}</b>`);
   if (!rows || !rows.length) {
     lines.push('<i>No items</i>');
   } else {
     for (const r of rows){
-      const sym = esc(r.symbol || r.token.slice(0,6));
-      const buy = Number(r.totalBuyBase)||0;
-      const sell= Number(r.totalSellBase)||0;
-      const pnl = Number(r.realizedBase)||0;
-      const pct = buy>0 ? (pnl/buy)*100 : 0;
-      const left = Number(r.remaining||'0');
-      const det = `buy ${buy.toFixed(6)} · sell ${sell.toFixed(6)} · ${left<1?'closed':'dust'}`;
-      lines.push(`• <b>${sym}</b> — ${signETH(pnl)}  (${pctStr(pct)})\n   ${esc(det)}`);
+      const sym  = esc(r.symbol || r.token.slice(0,6));
+      const buy  = Number(r.totalBuyBase)||0;
+      const sell = Number(r.totalSellBase)||0;
+      const pnl  = Number(r.realizedBase)||0;
+      const pct  = buy>0 ? (pnl/buy)*100 : 0;
+      const leftUnits = r.remaining ? String(r.remaining) : '0';
+      const state = (Number(leftUnits)>0) ? 'closed (dust left)' : 'closed';
+      lines.push(`• <b>${sym}</b> — ${signETH(pnl)} (${pctStr(pct)})\n   buy ${fmtETH(buy)} · sell ${fmtETH(sell)} · ${esc(state)}`);
     }
   }
-  return { text: lines.join('\n'), extra: { reply_markup: kb(wallet, window, title.toLowerCase().includes('profit') ? 'profits' : 'losses') } };
+  return { text: lines.join('\n'), extra: { reply_markup: kb(wallet, window, isProfit?'profits':'losses') } };
 }
 
-// -------- Open positions (hide <5 tokens, except ETH/WETH already filtered in the worker) --------
+/* --- Open positions --- */
 function renderOpen(wallet, window, rows){
   const lines = [];
   lines.push('<b>Open Positions</b>');
@@ -145,18 +138,22 @@ function renderOpen(wallet, window, rows){
       const sell= Number(r.totalSellBase)||0;
       const u   = Number(r.unrealizedBase)||0;
       const usd = Number(r.usdValueRemaining)||0;
-      const det = `rem ≈ ${rem} units · mtm ${signETH(u)} · ${esc(money(usd))}`;
-      lines.push(`• <b>${sym}</b>\n   ${esc(det)}\n   buy ${buy.toFixed(6)} · sell ${sell.toFixed(6)}`);
+      lines.push(
+        `• <b>${sym}</b>\n` +
+        `   rem ≈ ${rem} units · MTM ${signETH(u)} · ${esc(money(usd))}\n` +
+        `   buy ${fmtETH(buy)} · sell ${fmtETH(sell)}`
+      );
     }
   }
   return { text: lines.join('\n'), extra: { reply_markup: kb(wallet, window, 'open') } };
 }
 
-// -------- Airdrops --------
-function renderAirdrops(wallet, window, rows){
+/* --- Airdrops --- */
+function renderAirdrops(wallet, window, tokens){
+  const rows = (tokens||[]).filter(r => (r.airdrops?.count||0)>0 && Number(r.airdrops?.estUsd||0)>0);
   const lines = [];
   lines.push('<b>Airdrops</b>');
-  if (!rows || !rows.length){
+  if (!rows.length){
     lines.push('<i>No airdrops</i>');
   } else {
     for (const r of rows){
