@@ -12,6 +12,11 @@ import { renderPNL } from './renderers_pnl.js';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
+/* ====== Small helper: safe, immediate ack for callback queries ====== */
+async function ack(ctx, text = '') {
+  try { await ctx.answerCbQuery(text); } catch {} // ignore "query is too old" etc.
+}
+
 /* ====== PNL command ====== */
 bot.command('pnl', async (ctx) => {
   try {
@@ -34,7 +39,7 @@ bot.command('pnl', async (ctx) => {
 const sendHTML = (ctx, text, extra = {}) =>
   ctx.replyWithHTML(text, { disable_web_page_preview: true, ...extra });
 
-// Safe edit: ignore “message is not modified”
+// Safe edit: swallow “message is not modified”
 const editHTML = async (ctx, text, extra = {}) => {
   try {
     return await ctx.editMessageText(text, {
@@ -45,7 +50,7 @@ const editHTML = async (ctx, text, extra = {}) => {
   } catch (err) {
     const desc = err?.response?.description || '';
     if (desc.includes('message is not modified')) {
-      return ctx.answerCbQuery('Already up to date');
+      return; // don’t re-ack here; query might be expired
     }
     throw err;
   }
@@ -58,11 +63,9 @@ async function ensureData(ca) {
     const cache = await getJSON(key);
     if (cache) return cache;
 
-    // cold start: try a synchronous refresh once
     const fresh = await refreshToken(ca);
     return fresh || null;
   } catch (e) {
-    // enqueue and ask user to retry
     try {
       await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
     } catch (_) {}
@@ -70,7 +73,6 @@ async function ensureData(ca) {
   }
 }
 
-// Always return { ok:boolean, age?:number, error?:string }
 async function requestRefresh(ca) {
   try {
     const last = await getJSON(`token:${ca}:last_refresh`);
@@ -133,28 +135,23 @@ bot.command('refresh', async (ctx) => {
 
 /* ====== Callback handlers ====== */
 
-// noop buttons: just close the spinner
-bot.action('noop', (ctx) => ctx.answerCbQuery(''));
+// noop buttons: just close the spinner (ack immediately)
+bot.action('noop', async (ctx) => { await ack(ctx); });
 
 // Main action router for stats/buyers/holders/refresh
 bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
+  await ack(ctx); // ack right away
   try {
     const [kind, ca, maybePage] = ctx.callbackQuery.data.split(':');
 
     if (kind === 'refresh') {
       const res = await requestRefresh(ca);
-      const msg = res.ok
-        ? 'Refreshing…'
-        : (typeof res.age === 'number'
-            ? `Recently refreshed (${res.age.toFixed(0)}s ago). Try again shortly.`
-            : `Couldn't queue refresh${res.error ? `: ${res.error}` : ''}`);
-      return ctx.answerCbQuery(msg, { show_alert: false });
+      // We already acked; optionally edit message or not—keep as is and show toast was handled
+      return; // nothing else to do
     }
 
     const data = await ensureData(ca);
-    if (!data) {
-      return ctx.answerCbQuery('Initializing… try again shortly.', { show_alert: true });
-    }
+    if (!data) return; // already acked
 
     if (kind === 'stats') {
       const { text, extra } = renderOverview(data);
@@ -173,55 +170,54 @@ bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
       return editHTML(ctx, text, extra);
     }
   } catch (e) {
-    return ctx.answerCbQuery('Error — try again', { show_alert: true });
+    console.error(e);
+    // ack already sent
   }
 });
 
 // ----- PNL view/window router: pnlview:<wallet>:<window>:<view>
 bot.action(/^pnlview:0x[a-f0-9]{40}:(24h|7d|30d|365d|all):(overview|profits|losses|open|airdrops)$/i, async (ctx) => {
+  await ack(ctx, 'Loading…'); // ack first
   try {
     const [, wallet, window, view] = ctx.callbackQuery.data.split(':');
     const data = await refreshPnl(wallet, window);
     const { text, extra } = renderPNL(data, window, view);
     await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
-    return ctx.answerCbQuery();
   } catch (e) {
     console.error(e);
-    try { await ctx.answerCbQuery('Error'); } catch {}
   }
 });
 
-// ----- PNL legacy window switcher: pnl:<wallet>:<window>  (kept for backward-compat)
+// ----- PNL legacy window switcher: pnl:<wallet>:<window>
 bot.action(/^pnl:0x[a-f0-9]{40}:(24h|7d|30d|365d|all)$/i, async (ctx) => {
+  await ack(ctx, 'Loading…');
   try {
     const [, wallet, window] = ctx.callbackQuery.data.split(':');
     const data = await refreshPnl(wallet, window);
     const { text, extra } = renderPNL(data, window, 'overview');
     await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
-    return ctx.answerCbQuery();
   } catch (e) {
     console.error(e);
-    try { await ctx.answerCbQuery('Error'); } catch {}
   }
 });
 
 // ----- PNL refresh: pnl_refresh:<wallet>:<window>
 bot.action(/^pnl_refresh:0x[a-f0-9]{40}:(24h|7d|30d|365d|all)$/i, async (ctx) => {
+  await ack(ctx, 'Refreshing…');
   try {
     const [, wallet, window] = ctx.callbackQuery.data.split(':');
     await pnlQueue.add('pnl', { wallet, window }, { removeOnComplete: true, removeOnFail: true });
     const data = await refreshPnl(wallet, window);
     const { text, extra } = renderPNL(data, window, 'overview');
     await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
-    return ctx.answerCbQuery('Refreshed');
   } catch (e) {
     console.error(e);
-    try { await ctx.answerCbQuery('Error'); } catch {}
   }
 });
 
 // About modal
 bot.action('about', async (ctx) => {
+  await ack(ctx);
   const { text, extra } = renderAbout();
   return editHTML(ctx, text, extra);
 });
