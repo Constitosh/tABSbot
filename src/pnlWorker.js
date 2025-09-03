@@ -1,18 +1,17 @@
 // src/pnlWorker.js
 // Wallet PnL for Abstract chain (ETH + WETH).
 //
-// Fixes:
-// • Remaining qty now subtracts ANY outbound token transfers (even w/o ETH/WETH leg).
-//   We reduce cost basis proportionally (no realized PnL for gifts/internal moves).
-// • Bonding-phase buys: detect ETH out OR from==token (pool≡token) -> treat as BUY,
-//   so they aren't flagged as airdrops.
-// • Add native ETH in/out tracking (account.txlist). Classify trades using combined
-//   WETH+ETH delta per tx-hash.
-// • Add per-position USD valuation and TOTAL holdings USD.
-// • Hide dust positions < 5 tokens (but never hide ETH/WETH).
+// What this version adds/changes:
+// • Combines native ETH + WETH legs and exposes combined "base" (ETH) totals.
+// • Classifies BUY/SELL using combined base (ETH+WETH) per tx-hash.
+// • Treats bonding-phase receives (from == token) as BUY even if no base leg.
+// • Subtracts ANY outbound token transfer from remaining qty (and cost basis proportionally).
+// • Hides dust positions < 5 tokens (never hide ETH/WETH).
+// • Computes per-position USD value, wallet-wide USD holdings.
+// • Exposes derived buckets: open (≥ 5 tokens), closed ( < 5 tokens ), airdrops, best/worst.
+// • Closed = remaining < 5 tokens; Profits/Losses use realized PnL only.
 //
-// Views (unchanged API):
-//   refreshPnl(wallet, window) returns totals, tokens[], derived{open,airdrops,best,worst}
+// renderers_pnl.js drives the views (overview/profits/losses/open/airdrops).
 
 import './configEnv.js';
 import axios from 'axios';
@@ -70,7 +69,6 @@ async function getUsdQuote(ca) {
     return { priceUsd: Number(data?.priceUsd || 0) || 0 };
   } catch { return { priceUsd: 0 }; }
 }
-
 async function getWethQuote(ca) {
   try {
     const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${ca}`, { timeout: 15_000 });
@@ -84,7 +82,6 @@ async function getWethQuote(ca) {
     return { priceWeth: Number(best?.priceNative || 0) || 0 };
   } catch { return { priceWeth: 0 }; }
 }
-
 async function getQuotes(ca) {
   const [{ priceUsd }, { priceWeth }] = await Promise.all([ getUsdQuote(ca), getWethQuote(ca) ]);
   return { priceUsd, priceWeth };
@@ -120,12 +117,10 @@ async function getWalletERC20Txs(wallet, { fromTs=0 }={}) {
   }
   return out;
 }
-
-// Normal (native ETH) txs so we can detect ETH legs (bonding etc.)
 async function getWalletNormalTxs(wallet, { fromTs=0 }={}) {
   wallet = wallet.toLowerCase();
   let page = 1;
-  const PAGE = 10000; // v2 returns lots; still paginate for safety
+  const PAGE = 10000;
   const out = [];
   while (true) {
     const res = await esGET({
@@ -208,14 +203,12 @@ async function computePnL(wallet, { sinceTs=0 }) {
 
   const perToken = [];
   for (const [token, txs] of tokenTxsByToken.entries()) {
-    // Chrono sort within token
     txs.sort((a,b) => Number(a.timeStamp)-Number(b.timeStamp) || Number(a.logIndex||0)-Number(b.logIndex||0));
-
     const { priceUsd, priceWeth } = await getQuotes(token);
 
     let qty = 0n;              // token units currently held
     let costWeth = 0n;         // total WETH+ETH cost of current inventory (wei)
-    let realizedWeth = 0n;     // realized PnL (in wei, treated as WETH-equivalent)
+    let realizedWeth = 0n;     // realized PnL (in wei, WETH-equiv)
     let buys = 0n, sells = 0n; // units
 
     const tokenDecimals = Math.max(0, Number(txs[0]?.tokenDecimal || 18));
@@ -234,69 +227,58 @@ async function computePnL(wallet, { sinceTs=0 }) {
       const paidWei   = (ethDelta < 0n ? -ethDelta : 0n) + (wethDelta < 0n ? -wethDelta : 0n);
       const recvWei   = (ethDelta > 0n ?  ethDelta : 0n) + (wethDelta > 0n ?  wethDelta : 0n);
 
-      // BUY:
-      // - wallet receives token (to==wallet) AND (paid in ETH/WETH)
-      // - OR wallet receives token from the token contract itself (bonding pool == token)
+      // BUY (receive token and pay base OR bonding from token)
       if (to === wallet && (paidWei > 0n || from === token)) {
         buys += amt;
         qty  += amt;
-        costWeth += paidWei; // can be 0 in bonding-from-token case
+        costWeth += paidWei; // can be 0 for bonding from token
         continue;
       }
 
-      // SELL:
-      // - wallet sends token (from==wallet) AND (received ETH or WETH).
+      // SELL (send token and receive base)
       if (from === wallet && recvWei > 0n) {
         sells += amt;
 
-        // average cost per unit (wei per token) using 1e18 scaling
-        const avgCostWeiPerUnit = qty > 0n ? (costWeth * 1_000_000_000_000_000_000n) / qty : 0n;
-        const proceeds = recvWei; // wei
-        const costOfSold = (avgCostWeiPerUnit * amt) / 1_000_000_000_000_000_000n;
+        const avg = qty > 0n ? (costWeth * 1_000_000_000_000_000_000n) / qty : 0n;
+        const proceeds = recvWei;
+        const costOfSold = (avg * amt) / 1_000_000_000_000_000_000n;
 
         realizedWeth += (proceeds - costOfSold);
 
-        // reduce inventory; recompute costWeth from avgCost (avoid drift)
         const newQty = qty > amt ? (qty - amt) : 0n;
-        costWeth = newQty > 0n ? (avgCostWeiPerUnit * newQty) / 1_000_000_000_000_000_000n : 0n;
+        costWeth = newQty > 0n ? (avg * newQty) / 1_000_000_000_000_000_000n : 0n;
         qty = newQty;
         continue;
       }
 
-      // GIFT / INTERNAL MOVE OUT (no ETH/WETH received) — adjust holdings + cost basis, no realized pnl
+      // GIFT/INTERNAL OUT (no base received): reduce qty & cost proportionally
       if (from === wallet && recvWei === 0n) {
         if (qty > 0n) {
-          const avgCostWeiPerUnit = qty > 0n ? (costWeth * 1_000_000_000_000_000_000n) / qty : 0n;
-          const amtUsed = amt > qty ? qty : amt;
-          const costReduction = (avgCostWeiPerUnit * amtUsed) / 1_000_000_000_000_000_000n;
-          qty -= amtUsed;
-          costWeth = costWeth > costReduction ? (costWeth - costReduction) : 0n;
+          const avg = qty > 0n ? (costWeth * 1_000_000_000_000_000_000n) / qty : 0n;
+          const used = amt > qty ? qty : amt;
+          const cut  = (avg * used) / 1_000_000_000_000_000_000n;
+          qty -= used;
+          costWeth = costWeth > cut ? (costWeth - cut) : 0n;
         }
         continue;
       }
 
-      // AIRDROP: inbound token with no ETH/WETH leg AND not from token (to avoid bonding false-positives)
+      // AIRDROP (no base paid and not bonding)
       if (to === wallet && paidWei === 0n && from !== token) {
         airdrops.push({ hash, amount: amt });
-        // include in inventory at 0 cost
         qty += amt;
         continue;
       }
-
-      // else: ignore neutral moves in (rare)
     }
 
-    // ---------- Hide dust < 5 tokens (but NOT ETH/WETH) ----------
+    // Hide dust < 5 tokens (never hide ETH/WETH rows)
     const symUp     = String(txs[0]?.tokenSymbol || '').toUpperCase();
     const isEthLike = (symUp === 'ETH') || (symUp === 'WETH') || (token === WETH);
     const MIN_UNITS = 5n * (10n ** BigInt(tokenDecimals));
+    // (We still keep them in totals internally; just don't show in views)
+    const hideFromViews = (qty > 0n && !isEthLike && qty < MIN_UNITS);
 
-    if (qty > 0n && !isEthLike && qty < MIN_UNITS) {
-      // skip pushing this token to perToken[]
-      continue;
-    }
-
-    // Mark-to-market unrealized (in WETH-equiv) & USD valuation
+    // Mark-to-market
     const qtyFloatTokens   = Number(qty) / Number(scale || 1n);
     const invCostFloatWeth = Number(costWeth) / 1e18;
     const mtmValueWeth     = qtyFloatTokens * Number(priceWeth || 0);
@@ -308,14 +290,14 @@ async function computePnL(wallet, { sinceTs=0 }) {
     for (const a of airdrops) airdropUnits += a.amount;
     const airdropUsd = (Number(airdropUnits) / Number(scale || 1n)) * Number(priceUsd || 0);
 
-    // Push the row ONCE
     perToken.push({
       token,
       symbol: txs[0]?.tokenSymbol || '',
       decimals: tokenDecimals,
       buys: buys.toString(),
       sells: sells.toString(),
-      remaining: qty.toString(),
+      remaining: qty.toString(),           // bigint string
+      hideFromViews,                       // for renderer logic
 
       realizedWeth: Number(realizedWeth) / 1e18,  // float
       inventoryCostWeth: Number(costWeth) / 1e18, // float
@@ -332,12 +314,11 @@ async function computePnL(wallet, { sinceTs=0 }) {
     });
   }
 
-  // Totals across tokens
+  // Totals across tokens (USD)
   let totalRealizedWeth   = 0;
   let totalUnrealizedWeth = 0;
   let totalAirdropUsd     = 0;
   let totalHoldingsUsd    = 0;
-
   for (const r of perToken) {
     totalRealizedWeth   += Number(r.realizedWeth) || 0;
     totalUnrealizedWeth += Number(r.unrealizedWeth) || 0;
@@ -345,12 +326,11 @@ async function computePnL(wallet, { sinceTs=0 }) {
     totalHoldingsUsd    += Number(r.usdValueRemaining || 0);
   }
 
-  // Wallet ETH/WETH net flows (all hashes)
+  // Wallet base (ETH+WETH) net flows
   let wethIn = 0n, wethOut = 0n;
   for (const v of wethDeltaByHash.values()) {
     if (v > 0n) wethIn += v; else wethOut += (-v);
   }
-
   let ethIn = 0n, ethOut = 0n;
   for (const v of ethDeltaByHash.values()) {
     if (v > 0n) ethIn += v; else ethOut += (-v);
@@ -361,17 +341,41 @@ async function computePnL(wallet, { sinceTs=0 }) {
   const ethInFloat   = Number(ethIn)   / 1e18;
   const ethOutFloat  = Number(ethOut)  / 1e18;
 
+  const baseInFloat  = wethInFloat + ethInFloat;
+  const baseOutFloat = wethOutFloat + ethOutFloat;
+
   const totalPnlWeth = totalRealizedWeth + totalUnrealizedWeth;
-  const spentBase    = wethOutFloat + ethOutFloat; // denominator for PnL%
+  const spentBase    = baseOutFloat; // denominator for PnL%
   const pnlPct       = spentBase > 0 ? (totalPnlWeth / spentBase) * 100 : 0;
 
-  // Derivatives for views
-  const openPositions = perToken
-    .filter(t => Number(t.remaining) > 0)
-    .map(t => ({ ...t }));
+  // Derived buckets for views
+  const MIN_REMAIN_STRICT = (t) => {
+    const d = Number(t.decimals||18);
+    const minUnits = 5 * (10 ** d);
+    const rem = Number(t.remaining || '0');
+    return rem >= minUnits;
+  };
 
+  const open = perToken
+    .filter(t => MIN_REMAIN_STRICT(t) && !t.hideFromViews && Number(t.usdValueRemaining) > 0);
+
+  // closed = remaining < 5 tokens
+  const closed = perToken.filter(t => !MIN_REMAIN_STRICT(t));
+
+  // realized-only for profits/losses (ignore zero-value positions)
+  const profits = closed
+    .filter(t => Number(t.realizedWeth) > 0 && (Number(t.usdValueRemaining) === 0 || Number(t.usdValueRemaining) < 0.000001))
+    .sort((a,b)=> Number(b.realizedWeth) - Number(a.realizedWeth))
+    .slice(0, 100);
+
+  const losses = closed
+    .filter(t => Number(t.realizedWeth) < 0 && (Number(t.usdValueRemaining) === 0 || Number(t.usdValueRemaining) < 0.000001))
+    .sort((a,b)=> Number(a.realizedWeth) - Number(b.realizedWeth))
+    .slice(0, 100);
+
+  // airdrops (only show with USD > 0)
   const airdropsFlat = perToken
-    .filter(t => (t.airdrops?.count || 0) > 0)
+    .filter(t => (t.airdrops?.count || 0) > 0 && Number(t.airdrops?.estUsd || 0) > 0)
     .map(t => ({
       token: t.token,
       symbol: t.symbol,
@@ -380,34 +384,35 @@ async function computePnL(wallet, { sinceTs=0 }) {
       estUsd: t.airdrops.estUsd
     }));
 
-  const ranked = perToken
-    .map(t => ({ ...t, totalImpact: (Number(t.realizedWeth)||0) + (Number(t.unrealizedWeth)||0) }))
-    .sort((a,b)=> Math.abs(b.totalImpact) - Math.abs(a.totalImpact));
-
-  const best  = [...ranked].sort((a,b)=> b.totalImpact - a.totalImpact).slice(0, 15);
-  const worst = [...ranked].sort((a,b)=> a.totalImpact - b.totalImpact).slice(0, 15);
+  // best/worst by realized for quick overview
+  const best  = profits.slice(0, 15);
+  const worst = losses.slice(0, 15);
 
   return {
     wallet,
     sinceTs,
     totals: {
-      // Raw
-      wethIn: wethIn.toString(),   wethOut: wethOut.toString(),
-      ethIn:  ethIn.toString(),    ethOut:  ethOut.toString(),
-      // Floats
-      wethInFloat,  wethOutFloat,
-      ethInFloat,   ethOutFloat,
+      // Raw combined ETH-like picture
+      baseInFloat,    // ETH+WETH in
+      baseOutFloat,   // ETH+WETH out
+      wethInFloat, wethOutFloat, ethInFloat, ethOutFloat,
+
       // PnL
       realizedWeth: totalRealizedWeth,
       unrealizedWeth: totalUnrealizedWeth,
       totalPnlWeth,
       pnlPct,
+
+      // USD
       airdropsUsd: totalAirdropUsd,
-      holdingsUsd: totalHoldingsUsd
+      holdingsUsd: totalHoldingsUsd,
     },
     tokens: perToken,
     derived: {
-      open: openPositions,
+      open,
+      closed,     // available for debugging if needed
+      profits,    // realized > 0, closed
+      losses,     // realized < 0, closed
       airdrops: airdropsFlat,
       best,
       worst
