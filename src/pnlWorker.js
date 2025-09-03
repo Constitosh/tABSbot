@@ -430,7 +430,7 @@ export async function refreshPnl(wallet, window) {
     '24h':  60*60*24,
     '7d':   60*60*24*7,
     '30d':  60*60*24*30,
-    '365d': 60*60*24*365,
+    '90d': 60*60*24*90,
     'all':  0
   };
   const sinceSec = sinceMap[window] ?? sinceMap['30d'];
