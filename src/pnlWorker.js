@@ -9,6 +9,7 @@
 // • Add native ETH in/out tracking (account.txlist). Classify trades using combined
 //   WETH+ETH delta per tx-hash.
 // • Add per-position USD valuation and TOTAL holdings USD.
+// • Hide dust positions < 5 tokens (but never hide ETH/WETH).
 //
 // Views (unchanged API):
 //   refreshPnl(wallet, window) returns totals, tokens[], derived{open,airdrops,best,worst}
@@ -28,7 +29,7 @@ const ES_KEY   = process.env.ETHERSCAN_API_KEY;
 const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741';
 if (!ES_KEY) console.warn('[PNL BOOT] ETHERSCAN_API_KEY missing');
 
-const httpES = axios.create({ baseURL: ES_BASE, timeout: 45000 });
+const httpES = axios.create({ baseURL: ES_BASE, timeout: 45_000 });
 
 const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
 const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS);
@@ -64,7 +65,7 @@ async function esGET(params, { logOnce=false, tag='' }={}) {
 // ---------- Dexscreener helpers ----------
 async function getUsdQuote(ca) {
   try {
-    const { data } = await axios.get(`https://api.dexscreener.com/tokens/v1/abstract/${ca}`, { timeout: 15000 });
+    const { data } = await axios.get(`https://api.dexscreener.com/tokens/v1/abstract/${ca}`, { timeout: 15_000 });
     if (Array.isArray(data) && data.length > 0) return { priceUsd: Number(data[0]?.priceUsd || 0) || 0 };
     return { priceUsd: Number(data?.priceUsd || 0) || 0 };
   } catch { return { priceUsd: 0 }; }
@@ -72,7 +73,7 @@ async function getUsdQuote(ca) {
 
 async function getWethQuote(ca) {
   try {
-    const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${ca}`, { timeout: 15000 });
+    const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${ca}`, { timeout: 15_000 });
     const ps = Array.isArray(data?.pairs) ? data.pairs : [];
     const abs = ps.filter(p => p?.chainId === 'abstract');
     abs.sort((a,b) =>
@@ -239,7 +240,7 @@ async function computePnL(wallet, { sinceTs=0 }) {
       if (to === wallet && (paidWei > 0n || from === token)) {
         buys += amt;
         qty  += amt;
-        costWeth += paidWei; // can be 0 in bonding-from-token case; then cost basis grows 0 (we mark-to-market later)
+        costWeth += paidWei; // can be 0 in bonding-from-token case
         continue;
       }
 
@@ -265,9 +266,8 @@ async function computePnL(wallet, { sinceTs=0 }) {
       // GIFT / INTERNAL MOVE OUT (no ETH/WETH received) — adjust holdings + cost basis, no realized pnl
       if (from === wallet && recvWei === 0n) {
         if (qty > 0n) {
-          const avgCostWeiPerUnit = (costWeth * 1_000_000_000_000_000_000n) / (qty || 1n);
+          const avgCostWeiPerUnit = qty > 0n ? (costWeth * 1_000_000_000_000_000_000n) / qty : 0n;
           const amtUsed = amt > qty ? qty : amt;
-          // proportional reduction in cost basis
           const costReduction = (avgCostWeiPerUnit * amtUsed) / 1_000_000_000_000_000_000n;
           qty -= amtUsed;
           costWeth = costWeth > costReduction ? (costWeth - costReduction) : 0n;
@@ -286,73 +286,33 @@ async function computePnL(wallet, { sinceTs=0 }) {
       // else: ignore neutral moves in (rare)
     }
 
-    // Mark-to-market unrealized (in WETH-equiv)
-    const qtyFloatTokens = Number(qty) / Number(scale || 1n);
-    const invCostFloatWeth = Number(costWeth) / 1e18;
-    const mtmValueWeth = qtyFloatTokens * Number(priceWeth || 0);
-    const unrealizedWeth = mtmValueWeth - invCostFloatWeth;
+    // ---------- Hide dust < 5 tokens (but NOT ETH/WETH) ----------
+    const symUp     = String(txs[0]?.tokenSymbol || '').toUpperCase();
+    const isEthLike = (symUp === 'ETH') || (symUp === 'WETH') || (token === WETH);
+    const MIN_UNITS = 5n * (10n ** BigInt(tokenDecimals));
 
-    // USD valuation for remaining
+    if (qty > 0n && !isEthLike && qty < MIN_UNITS) {
+      // skip pushing this token to perToken[]
+      continue;
+    }
+
+    // Mark-to-market unrealized (in WETH-equiv) & USD valuation
+    const qtyFloatTokens   = Number(qty) / Number(scale || 1n);
+    const invCostFloatWeth = Number(costWeth) / 1e18;
+    const mtmValueWeth     = qtyFloatTokens * Number(priceWeth || 0);
+    const unrealizedWeth   = mtmValueWeth - invCostFloatWeth;
     const usdValueRemaining = qtyFloatTokens * Number(priceUsd || 0);
 
     // Airdrop USD estimate
     let airdropUnits = 0n;
     for (const a of airdrops) airdropUnits += a.amount;
-    const airdropQtyFloat = Number(airdropUnits) / Number(scale || 1n);
-    const airdropUsd = airdropQtyFloat * Number(priceUsd || 0);
+    const airdropUsd = (Number(airdropUnits) / Number(scale || 1n)) * Number(priceUsd || 0);
 
-// You already have these above in your loop:
-// const qty = ...
-// const costWeth = ...
-// const realizedWeth = ...
-// const tokenDecimals = ...
-// const scale = 10n ** BigInt(tokenDecimals);
-
-// ---------- NEW: hide dust < 5 tokens (but NOT ETH/WETH) ----------
-const symUp     = String(txs[0]?.tokenSymbol || '').toUpperCase();
-const isEthLike = (symUp === 'ETH') || (symUp === 'WETH') || (token === WETH);
-
-// 5 tokens, scaled to the token's decimals
-const MIN_UNITS = 5n * (10n ** BigInt(tokenDecimals));
-
-// If there's a remaining balance and it's below 5 tokens, skip (unless ETH/WETH)
-if (qty > 0n && !isEthLike && qty < MIN_UNITS) {
-  continue; // skip pushing this token to perToken[]
-}
-
-// ----- mark-to-market (only once now) -----
-const qtyFloatTokens   = Number(qty) / Number(scale || 1n);
-const invCostFloatWeth = Number(costWeth) / 1e18;
-const mtmValueWeth     = qtyFloatTokens * Number(priceWeth || 0);
-const unrealizedWeth   = mtmValueWeth - invCostFloatWeth;
-
-// Push the row
-perToken.push({
-  token,
-  symbol: txs[0]?.tokenSymbol || '',
-  decimals: tokenDecimals,
-  buys: buys.toString(),
-  sells: sells.toString(),
-  remaining: qty.toString(),
-  realizedWeth: Number(realizedWeth) / 1e18,
-  inventoryCostWeth: Number(costWeth) / 1e18,
-  priceUsd: Number(priceUsd || 0),
-  priceWeth: Number(priceWeth || 0),
-  unrealizedWeth,
-  airdrops: {
-    count: airdrops.length,
-    units: airdropUnits.toString(),
-    estUsd: (Number(airdropUnits) / Number(scale || 1n)) * Number(priceUsd || 0),
-  },
-});
-
-
-
+    // Push the row ONCE
     perToken.push({
       token,
       symbol: txs[0]?.tokenSymbol || '',
       decimals: tokenDecimals,
-
       buys: buys.toString(),
       sells: sells.toString(),
       remaining: qty.toString(),
