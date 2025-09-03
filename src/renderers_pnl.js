@@ -1,180 +1,184 @@
 // src/renderers_pnl.js
-// Renders: overview (with top3 winners/losers), profits (closed), losses (closed), open, airdrops.
-
 import { esc, money } from './ui_html.js';
 
+// helpers
 const shortAddr = (a) => a ? (a.slice(0,6) + '…' + a.slice(-4)) : '';
-const fmtETH = (w) => `${Number(w).toFixed(6)} ETH`;
-const badge = (x) => (x > 0 ? '🟢' : (x < 0 ? '🔴' : '⚪️'));
+const sign = (x) => (x > 0 ? '+' : (x < 0 ? '−' : '±'));
+const fmtWETH = (w) => `${Number(w).toFixed(6)} ETH`;         // display in ETH units
+const fmtWeiWETH = (wei) => `${(Number(wei)/1e18).toFixed(6)} ETH`;
+const fmtETH = (e) => `${Number(e).toFixed(6)} ETH`;
+const green = (s) => s; // Telegram doesn’t support colored fonts; keep plain, use emojis
+const red   = (s) => s;
 
 function fmtQty(units, decimals){
   const n = Number(units)/10**decimals;
-  if (!isFinite(n) || n === 0) return '0';
+  if (n === 0) return '0';
   if (n >= 1) return n.toFixed(4);
   return n.toPrecision(4);
 }
 
-function windowTabs(wallet, currentWindow, view){
-  const ws = ['24h','7d','30d','90d','all'];
-  return [
-    ws.map(w => ({
-      text: w === currentWindow ? `· ${w} ·` : w,
-      callback_data: `pnlv:${wallet}:${w}:${view}`
-    })),
-  ];
+function isEthLike(symbol, token) {
+  const up = String(symbol || '').toUpperCase();
+  return up === 'ETH' || up === 'WETH' || String(token||'').toLowerCase() === '0x3439153eb7af838ad19d56e1571fbd09333c2809';
 }
 
-function viewTabs(wallet, window, currentView){
-  const views = [
-    ['overview','Overview'],
-    ['profits','Profits'],
-    ['losses','Losses'],
-    ['open','Open'],
-    ['airdrops','Airdrops']
+function headerChips(wallet, currentWindow, currentView){
+  const windows = ['24h','7d','30d','90d','all'];
+  const views   = [
+    { key:'overview', label:'🏠 Overview' },
+    { key:'profits',  label:'🟢 Profits' },
+    { key:'losses',   label:'🔴 Losses' },
+    { key:'open',     label:'📦 Open' },
+    { key:'airdrops', label:'🎁 Airdrops' },
   ];
-  return [
-    views.map(([v, label]) => ({
-      text: v === currentView ? `· ${label} ·` : label,
-      callback_data: `pnlv:${wallet}:${window}:${v}`
-    })),
-    [
-      { text:'↻ Refresh', callback_data:`pnl_refresh:${wallet}:${window}` },
-      { text:'🏠 Back',    callback_data:'about' }
+  return {
+    inline_keyboard: [
+      windows.map(w => ({
+        text: w === currentWindow ? `· ${w} ·` : w,
+        callback_data: `pnlv:${wallet}:${w}:${currentView}`
+      })),
+      views.map(v => ({
+        text: v.key === currentView ? `· ${v.label} ·` : v.label,
+        callback_data: `pnlv:${wallet}:${currentWindow}:${v.key}`
+      })),
+      [
+        { text:'↻ Refresh', callback_data:`pnl_refresh:${wallet}:${currentWindow}` },
+        { text:'Back',      callback_data:'about' }
+      ]
     ]
-  ];
+  };
 }
 
-function header(wallet, window, totals){
-  const bal = Number(totals.ethLikeBalanceFloat||0);
-
-  const ethIn  = (Number(totals.ethInFloat||0)  + Number(totals.wethInFloat||0));
-  const ethOut = (Number(totals.ethOutFloat||0) + Number(totals.wethOutFloat||0));
-
-  const realized   = Number(totals.realizedWeth||0);
-  const unrealized = Number(totals.unrealizedWeth||0);
-  const holdings   = Number(totals.holdingsUsd||0);
-  const airdrops   = Number(totals.airdropsUsd||0);
-
-  const pnl = Number(totals.totalPnlWeth||0);
-  const pct = Number(totals.pnlPct||0);
-  const pnlTag = `${pnl >= 0 ? '🟢' : '🔴'} ${Math.abs(pnl).toFixed(6)} ETH  (${pct>=0?'+':'−'}${Math.abs(pct).toFixed(2)}%)`;
-
-  const lines = [];
-  lines.push(`💼 <b>Wallet PnL — ${shortAddr(esc(wallet))}</b>`);
-  lines.push(`<i>Window: ${esc(window)}</i>`);
-  lines.push(`💰 <b>Balance:</b> ${bal.toFixed(6)} ETH`);
-  lines.push('');
-  // one metric per line (requested)
-  lines.push(`💧 <b>ETH IN:</b> ${esc(fmtETH(ethIn))}`);
-  lines.push(`🔥 <b>ETH OUT:</b> ${esc(fmtETH(ethOut))}`);
-  lines.push(`📈 <b>Realized:</b> ${esc(fmtETH(realized))}`);
-  lines.push(`📊 <b>Unrealized:</b> ${esc(fmtETH(unrealized))}`);
-  lines.push(`📦 <b>Holdings:</b> ${esc(money(holdings))}`);
-  lines.push(`🎁 <b>Airdrops:</b> ${esc(money(airdrops))}`);
-  lines.push(`🧮 <b>Total PnL:</b> ${pnlTag}`);
-  return lines;
-}
-
-function lineClosedToken(t){
-  const sym = esc(t.symbol || t.token.slice(0,6));
-  const realized = Number(t.realizedWeth||0);
-  const tag = `${realized>=0?'+':'−'}${Math.abs(realized).toFixed(6)} ETH`;
-  // no dash between token and number
-  return `• <b>${sym}</b>  ${badge(realized)} ${tag}`;
-}
-
-function top3Section(title, arr){
-  const lines = [];
-  lines.push(`<b>${title}</b>`);
-  if (!arr || !arr.length) {
-    lines.push('<i>—</i>');
-  } else {
-    for (const t of arr) lines.push(lineClosedToken(t));
+// build closed-only realized lists (remaining < 5 tokens except ETH/WETH)
+function pickClosedRealized(tokens) {
+  const out = [];
+  for (const r of tokens) {
+    const dec = Number(r.decimals||18);
+    const remainingUnits = BigInt(String(r.remaining || '0'));
+    const minUnits = 5n * (10n ** BigInt(dec));
+    const symUp = String(r.symbol||'').toUpperCase();
+    const ethish = isEthLike(symUp, r.token);
+    const closed = ethish ? (remainingUnits === 0n) : (remainingUnits === 0n || remainingUnits < minUnits);
+    const realized = Number(r.realizedWeth || 0);
+    if (closed && realized !== 0) {
+      out.push({
+        ...r,
+        realized
+      });
+    }
   }
-  return lines;
+  return out;
 }
 
-function ensureTop3FromTokens(tokens){
-  // Fallback top3 computation if derived not present or empty
-  // Closed = remaining == 0 or isDust; realized > 0 for profits, < 0 for losses.
-  const closed = (tokens||[]).filter(t => {
-    const rem = Number(t.remaining || 0) / (10 ** Number(t.decimals||18));
-    return rem === 0 || !!t.isDust;
-  });
-  const profits = closed.filter(t => Number(t.realizedWeth||0) > 0)
-    .sort((a,b)=> Number(b.realizedWeth)-Number(a.realizedWeth))
-    .slice(0,3);
-  const losses = closed.filter(t => Number(t.realizedWeth||0) < 0)
-    .sort((a,b)=> Number(a.realizedWeth)-Number(b.realizedWeth))
-    .slice(0,3);
-  return { profits, losses };
+function renderTopList(list, title, emptyTxt='No items') {
+  const lines = [];
+  lines.push(`<b>${esc(title)}</b>`);
+  if (!list.length) {
+    lines.push(`<i>${esc(emptyTxt)}</i>`);
+    return lines.join('\n');
+  }
+  for (const r of list) {
+    const realized = Number(r.realizedWeth || 0);
+    const sym = esc(r.symbol || r.token.slice(0,6));
+    const tag = (realized >= 0)
+      ? `🟢 ${fmtETH(realized)}`
+      : `🔴 ${fmtETH(Math.abs(realized))}`;
+    lines.push(`• <b>${sym}</b> ${tag}`);
+  }
+  return lines.join('\n');
+}
+
+function renderOpenPositions(tokens) {
+  const lines = [];
+  lines.push('<b>Open Positions</b>');
+  const open = tokens.filter(t => Number(t.remaining) > 0);
+  if (!open.length) {
+    lines.push('<i>No open positions.</i>');
+    return lines.join('\n');
+  }
+  for (const r of open) {
+    const dec = Number(r.decimals||18);
+    const sym = esc(r.symbol || r.token.slice(0,6));
+    const rem = fmtQty(r.remaining, dec);
+    const unreal = Number(r.unrealizedWeth || 0);
+    const tag = (unreal >= 0)
+      ? `🟢 ${fmtETH(unreal)}`
+      : `🔴 ${fmtETH(Math.abs(unreal))}`;
+    lines.push(`• <b>${sym}</b> — rem ${rem}, unreal ${tag}`);
+  }
+  return lines.join('\n');
+}
+
+function renderAirdrops(tokens) {
+  const lines = [];
+  lines.push('<b>Airdrops</b>');
+  const drops = tokens
+    .map(t => ({ sym: t.symbol || t.token.slice(0,6), ...t.airdrops, priceUsd: t.priceUsd }))
+    .filter(a => (a?.count || 0) > 0);
+
+  if (!drops.length) {
+    lines.push('<i>No airdrops.</i>');
+    return lines.join('\n');
+  }
+  for (const d of drops) {
+    const usd = Number(d.estUsd || 0);
+    lines.push(`• <b>${esc(d.sym)}</b> — ${esc(money(usd))}`);
+  }
+  return lines.join('\n');
 }
 
 export function renderPNL(data, window='30d', view='overview'){
   const w = esc(data.wallet);
   const t = data.totals || {};
-  const d = data.derived || {};
   const tokens = Array.isArray(data.tokens) ? data.tokens : [];
 
+  // Pre-compute the closed-only realized lists for overview + dedicated views
+  const realizedClosed = pickClosedRealized(tokens);
+  const topProfits = [...realizedClosed].sort((a,b)=> (Number(b.realizedWeth)||0) - (Number(a.realizedWeth)||0)).slice(0,15);
+  const topLosses  = [...realizedClosed].sort((a,b)=> (Number(a.realizedWeth)||0) - (Number(b.realizedWeth)||0)).slice(0,15);
+
+  // Header
   const lines = [];
-  lines.push(...header(w, window, t));
+  lines.push(`💼 <b>Wallet PnL — ${shortAddr(w)}</b>`);
+  lines.push(`<i>Window: ${esc(window)}</i>`);
+  // ETH balance line (native ETH)
+  const ethBal = Number(t.ethBalanceFloat || 0);
+  lines.push(`💰 <b>Wallet Balance:</b> ${fmtETH(ethBal)}`);
   lines.push('');
 
-  if (view === 'overview') {
-    const top3P = Array.isArray(d.top3Profits) && d.top3Profits.length ? d.top3Profits : null;
-    const top3L = Array.isArray(d.top3Losses)  && d.top3Losses.length  ? d.top3Losses  : null;
-    const fallback = (!top3P || !top3L) ? ensureTop3FromTokens(tokens) : null;
+  // Flows + buckets: each on its own line (as requested)
+  lines.push(`💧 <b>ETH IN:</b>  ${fmtETH(t.ethInFloat || 0)}   ·   🔷 <b>WETH IN:</b> ${fmtETH(t.wethInFloat || 0)}`);
+  lines.push(`🔥 <b>ETH OUT:</b> ${fmtETH(t.ethOutFloat || 0)}   ·   🔶 <b>WETH OUT:</b> ${fmtETH(t.wethOutFloat || 0)}`);
+  lines.push(`📈 <b>Realized:</b> ${fmtETH(t.realizedWeth || 0)}`);
+  lines.push(`📊 <b>Unrealized:</b> ${fmtETH(t.unrealizedWeth || 0)}`);
+  lines.push(`📦 <b>Holdings:</b> ${esc(money(t.holdingsUsd || 0))}   ·   🎁 <b>Airdrops:</b> ${esc(money(t.airdropsUsd || 0))}`);
 
-    lines.push(...top3Section('Top Profits (closed)', top3P || fallback.profits));
+  // Total PnL (in ETH) + %
+  const totalPnl = Number(t.totalPnlWeth || 0);
+  const pnlPct   = Number(t.pnlPct || 0);
+  const pnlBadge = totalPnl > 0 ? '🟢' : (totalPnl < 0 ? '🔴' : '⚪️');
+  const pnlText  = `${pnlBadge} <b>Total PnL:</b> ${fmtETH(Math.abs(totalPnl))}  (${sign(pnlPct)}${Math.abs(pnlPct).toFixed(2)}%)`;
+  lines.push(pnlText);
+  lines.push('');
+
+  // View content
+  if (view === 'profits') {
+    lines.push(renderTopList(topProfits, 'Top Profits (realized)', 'No realized profitable trades.'));
+  } else if (view === 'losses') {
+    lines.push(renderTopList(topLosses,  'Top Losses (realized)',  'No realized losing trades.'));
+  } else if (view === 'open') {
+    lines.push(renderOpenPositions(tokens));
+  } else if (view === 'airdrops') {
+    lines.push(renderAirdrops(tokens));
+  } else {
+    // Overview: show top 3 profits & top 3 losses (closed-only)
+    lines.push(renderTopList(topProfits.slice(0,3), 'Top Profits (realized)'));
     lines.push('');
-    lines.push(...top3Section('Top Losses (closed)', top3L || fallback.losses));
-  }
-  else if (view === 'profits') {
-    lines.push('<b>Top Profits (closed)</b>');
-    const arr = Array.isArray(d.profitsClosed) ? d.profitsClosed : [];
-    if (!arr.length) lines.push('<i>No closed profitable trades found.</i>');
-    for (const tk of arr.slice(0,15)) lines.push(lineClosedToken(tk));
-  }
-  else if (view === 'losses') {
-    lines.push('<b>Top Losses (closed)</b>');
-    const arr = Array.isArray(d.lossesClosed) ? d.lossesClosed : [];
-    if (!arr.length) lines.push('<i>No closed losing trades found.</i>');
-    for (const tk of arr.slice(0,15)) lines.push(lineClosedToken(tk));
-  }
-  else if (view === 'open') {
-    lines.push('<b>Open Positions</b>');
-    const arr = Array.isArray(d.open) ? d.open : [];
-    if (!arr.length) {
-      lines.push('<i>No open positions.</i>');
-    } else {
-      for (const r of arr) {
-        const sym = esc(r.symbol || r.token.slice(0,6));
-        const dec = Number(r.decimals||18);
-        const rem = fmtQty(r.remaining, dec);
-        const unreal = Number(r.unrealizedWeth||0);
-        const tag = `${unreal>=0?'+':'−'}${Math.abs(unreal).toFixed(6)} ETH`;
-        lines.push(`• <b>${sym}</b>  ${badge(unreal)} ${tag}  ·  rem ${rem}`);
-      }
-    }
-  }
-  else if (view === 'airdrops') {
-    lines.push('<b>Airdrops</b>');
-    const arr = Array.isArray(d.airdrops) ? d.airdrops : [];
-    if (!arr.length) lines.push('<i>None.</i>');
-    for (const a of arr.slice(0,25)) {
-      const sym = esc(a.symbol || a.token.slice(0,6));
-      lines.push(`• <b>${sym}</b>  ~${esc(money(a.estUsd||0))}`);
-    }
+    lines.push(renderTopList(topLosses.slice(0,3), 'Top Losses (realized)'));
   }
 
   const extra = {
-    reply_markup: {
-      inline_keyboard: [
-        ...windowTabs(w, window, view),
-        ...viewTabs(w, window, view)
-      ]
-    },
-    disable_web_page_preview: true
+    reply_markup: headerChips(w, window, view)
   };
 
   return { text: lines.join('\n'), extra };
