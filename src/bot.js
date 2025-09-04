@@ -7,7 +7,7 @@ import { renderOverview, renderBuyers, renderHolders, renderAbout } from './rend
 import { isAddress } from './util.js';
 
 // PNL imports (queue optional; see notes below)
-import { refreshPnl } from './pnlWorker.js'; // only refreshPnl to avoid export mismatch
+import { refreshPnl } from './pnlWorker.js'; // ⬅ only refreshPnl to avoid export mismatch
 import { renderPNL } from './renderers_pnl.js';
 
 // --- Bot with longer handler timeout + global error catcher ---
@@ -54,9 +54,11 @@ async function ensureData(ca) {
     const cache = await getJSON(key);
     if (cache) return cache;
 
+    // cold start: try a synchronous refresh once
     const fresh = await refreshToken(ca);
     return fresh || null;
   } catch (e) {
+    // enqueue and ask user to retry
     try {
       await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
     } catch (_) {}
@@ -134,10 +136,10 @@ bot.command('pnl', async (ctx) => {
       return ctx.reply('Usage: /pnl <walletAddress>');
     }
 
-    // Optional queue:
+    // Optional queue: uncomment if your pnlWorker exports `pnlQueue`
     // try { await pnlQueue.add('pnl', { wallet, window: '30d' }, { removeOnComplete: true, removeOnFail: true }); } catch {}
 
-    const data = await refreshPnl(wallet, '30d');
+    const data = await refreshPnl(wallet, '30d'); // window: 24h|7d|30d|90d|all
     const { text, extra } = renderPNL(data, '30d', 'overview');
     return ctx.replyWithHTML(text, extra);
   } catch (e) {
@@ -155,6 +157,7 @@ bot.action('noop', (ctx) => ctx.answerCbQuery(''));
 bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
   const dataStr = ctx.callbackQuery?.data || '';
   try {
+    // ack asap
     try { await ctx.answerCbQuery('Working…'); } catch {}
 
     const [kind, ca, maybePage] = dataStr.split(':');
@@ -209,13 +212,14 @@ bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
 bot.on('callback_query', async (ctx) => {
   const d = ctx.callbackQuery?.data || '';
   try {
+    // ACK immediately so Telegram doesn't expire the callback
     try { await ctx.answerCbQuery('Working…'); } catch {}
 
     if (d.startsWith('pnlv:')) {
       const [, wallet, window, view] = d.split(':');
       const data = await refreshPnl(wallet, window);
       const { text, extra } = renderPNL(data, window, view);
-      await editHTML(ctx, text, extra);            // <-- safe edit
+      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
       return;
     }
 
@@ -223,22 +227,24 @@ bot.on('callback_query', async (ctx) => {
       const [, wallet, window] = d.split(':');
       const data = await refreshPnl(wallet, window);
       const { text, extra } = renderPNL(data, window, 'overview');
-      await editHTML(ctx, text, extra);            // <-- safe edit
+      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
       return;
     }
 
     if (d.startsWith('pnl_refresh:')) {
       const [, wallet, window] = d.split(':');
-      // Optional queue:
+
+      // Optional queue: uncomment if your pnlWorker exports `pnlQueue`
       // try { await pnlQueue.add('pnl', { wallet, window }, { removeOnComplete: true, removeOnFail: true }); } catch {}
 
       const data = await refreshPnl(wallet, window);
       const { text, extra } = renderPNL(data, window, 'overview');
-      await editHTML(ctx, text, extra);            // <-- safe edit
+      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
       try { await ctx.answerCbQuery('Refreshed'); } catch {}
       return;
     }
 
+    // ignore other callback routes here (handled above)
   } catch (e) {
     console.error('[PNL cb] error:', e?.response?.description || e);
     try { await ctx.answerCbQuery('Error'); } catch {}
