@@ -24,26 +24,59 @@ function keyboard(wallet, window, view){
 }
 
 function realizedLists(data){
-  // Build once from tokens to have consistent buys/sells
-  const by = new Map();
-  for(const t of (data.tokens||[])){
-    const sym = t.symbol||''; if(!sym || ['ETH','WETH'].includes(sym.toUpperCase())) continue;
-    const r = Number(t.realizedWeth||0);
-    if (Math.abs(r) < 1e-10) continue;
-    const spent = Number(t.totalBuysEth||0);
-    by.set(sym, {
-      symbol: sym,
-      realized: r,
-      pct: spent>0 ? (r/spent)*100 : 0,
-      buys: Number(t.totalBuysEth||0),
-      sells: Number(t.totalSellsEth||0),
-    });
+  // Build normalized realized entries (exclude ETH/WETH)
+  const map = new Map();
+  for (const t of (data.tokens || [])) {
+    const sym = t.symbol || '';
+    if (!sym || ['ETH','WETH'].includes(sym.toUpperCase())) continue;
+
+    const realized = Number(t.realizedWeth || 0);
+    if (Math.abs(realized) < 1e-12) continue; // ignore true zeros
+
+    const buys = Number(t.totalBuysEth || 0);
+    const pct  = buys > 0 ? (realized / buys) * 100 : 0;
+
+    // Dedup by symbol (merge if repeated symbols appear)
+    const prev = map.get(sym);
+    if (prev) {
+      prev.realized += realized;
+      prev.buys     += buys;
+      prev.sells    += Number(t.totalSellsEth || 0);
+      prev.pct       = prev.buys > 0 ? (prev.realized / prev.buys) * 100 : 0;
+    } else {
+      map.set(sym, {
+        symbol: sym,
+        realized,
+        pct,
+        buys,
+        sells: Number(t.totalSellsEth || 0)
+      });
+    }
   }
-  const vals=[...by.values()];
-  const profits = vals.filter(x=>x.realized>0).sort((a,b)=>b.realized-a.realized);
-  const losses  = vals.filter(x=>x.realized<0).sort((a,b)=>a.realized-b.realized);
+
+  const arr = [...map.values()];
+
+  // Sort profits: highest realized → lowest; tie-break by % desc, then buys desc
+  const profits = arr
+    .filter(x => x.realized > 0)
+    .sort((a, b) =>
+      b.realized - a.realized ||
+      b.pct      - a.pct      ||
+      b.buys     - a.buys
+    );
+
+  // Sort losses: most negative → least negative; tie-break by % asc (more negative first), then buys desc
+  const losses = arr
+    .filter(x => x.realized < 0)
+    .sort((a, b) =>
+      a.realized - b.realized ||    // e.g. -1.5 < -0.2 ⇒ a first
+      a.pct      - b.pct      ||
+      b.buys     - a.buys
+    );
+
   return { profits, losses };
 }
+
 
 function renderOverview(data, window){
   const w = data.wallet.slice(0,6)+'…'+data.wallet.slice(-4);
