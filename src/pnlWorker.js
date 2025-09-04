@@ -408,61 +408,54 @@ async function computePnL(wallet, { sinceTs = 0 }) {
   const pnlPct       = spentBase > 0 ? (totalPnlWeth / spentBase) * 100 : 0;
 
   // ----- Build derived lists (robust) -----
-  // A position counts as closed if remaining units are zero, or it's just dust (<$1).
-  const realizedClosed = tokensOut
-    .filter(t => {
-      const isEthLike = (t.symbol || '').toUpperCase() === 'ETH' ||
-                        (t.symbol || '').toUpperCase() === 'WETH' ||
-                        t.token === WETH;
-      if (isEthLike) return false;
-      const remUnits = BigInt(t.remainingUnits || '0');
-      const isClosed = remUnits === 0n || Number(t.remainingUsd || 0) < 1;
-      const hasRealized = Math.abs(Number(t.realizedWeth || 0)) > 1e-9;
-      return isClosed && hasRealized;
-    });
+  // A position is considered closed if no units remain OR the remaining USD value is < $1.
+  const realizedClosed = perToken.filter(t => {
+    const sym = String(t.symbol || '').toUpperCase();
+    const isEthLike = sym === 'ETH' || sym === 'WETH' || t.token === WETH;
+    if (isEthLike) return false;
 
-  // Sort: profits high→low, losses low→high (most negative first)
+    const remUnits = BigInt(t.remaining || '0');
+    const isClosed = remUnits === 0n || Number(t.usdValueRemaining || 0) < 1;
+
+    const realized = Number(t.realizedWeth || 0);
+    const hasRealized = Math.abs(realized) > 1e-9;
+
+    return isClosed && hasRealized;
+  });
+
+  // Sort results
   const profits = realizedClosed
     .filter(t => Number(t.realizedWeth) > 0)
-    .sort((a,b) => Number(b.realizedWeth) - Number(a.realizedWeth));
+    .sort((a, b) => Number(b.realizedWeth) - Number(a.realizedWeth));
 
   const losses = realizedClosed
     .filter(t => Number(t.realizedWeth) < 0)
-    .sort((a,b) => Number(a.realizedWeth) - Number(b.realizedWeth));
+    .sort((a, b) => Number(a.realizedWeth) - Number(b.realizedWeth));
 
-  // Open positions: hide ETH/WETH, hide <$1, and do not show MTM in UI (renderer).
-  const open = tokensOut.filter(t => {
-    const isEthLike = (t.symbol || '').toUpperCase() === 'ETH' ||
-                      (t.symbol || '').toUpperCase() === 'WETH' ||
-                      t.token === WETH;
-    const remUnits = BigInt(t.remainingUnits || '0');
-    return !isEthLike && remUnits > 0n && Number(t.remainingUsd || 0) >= 1;
+  // Open positions: hide ETH/WETH and <$1 value; renderer will not show MTM lines.
+  const open = perToken.filter(t => {
+    const sym = String(t.symbol || '').toUpperCase();
+    const isEthLike = sym === 'ETH' || sym === 'WETH' || t.token === WETH;
+    const remUnits = BigInt(t.remaining || '0');
+    return !isEthLike && remUnits > 0n && Number(t.usdValueRemaining || 0) >= 1;
   });
 
-  // NFT airdrops were already computed above as `nftDrops`.
-
-  return {
+  result = {
     wallet,
     sinceTs,
     totals: {
-      ethBalance: ethBalanceFloat,
-      ethInFloat: baseInF,    // token-related base only
-      ethOutFloat: baseOutF,
-      realizedWeth: totalRealized,
-      unrealizedWeth: totalUnrealized,
-      totalPnlWeth,
-      pnlPct,
-      holdingsUsd: totalHoldUsd,
-      airdropsUsd: totalAirdropUsd,
+      ...result?.totals, // keep what you already compute (ethBalance, ethIn/out, realized, etc.)
     },
-    tokens: tokensOut,
+    tokens: perToken,
     derived: {
       open,
       profits,
       losses,
-      nfts: nftDrops,
+      ...(result?.derived?.nfts ? { nfts: result.derived.nfts } : {})
     }
   };
+  return result;
+
 
 
 /* ================================
