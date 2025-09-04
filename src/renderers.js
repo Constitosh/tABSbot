@@ -66,31 +66,31 @@ export function renderOverview(data) {
     `${moonshotHeaderIcon}<b>${name}${sym ? ` (${sym})` : ''}</b>`,
     `<code>${ca}</code>`,
     moonshotLine,
-    ``,\n
-    ``,\n
+    ``,
+    ``,
     (m ? `${capLabel}: <b>${esc(money(m.marketCap))}</b>` : undefined),
     (m && typeof m.priceUsd === 'number')
       ? `Price: <b>${esc(money(m.priceUsd, 8))}</b>   ${t24}`
       : `<i>No market data yet (no Abstract pair indexed)</i>`,
-    ``,\n
-    ``,\n
+    ``,
+    ``,
     `Volume:`,
     (m ? `5m <b>${esc(money(vol.m5))}</b> • 1h <b>${esc(money(vol.h1))}</b> • 6h <b>${esc(money(vol.h6))}</b> • 24h <b>${esc(money(vol.h24))}</b>` : undefined),
     `Change:`,
     (m ? `5m <b>${esc(pct(chg.m5))}</b> • 1h <b>${esc(pct(chg.h1))}</b> • 6h <b>${esc(pct(chg.h6))}</b> • 24h <b>${esc(pct(chg.h24))}</b>` : undefined),
-    ``,\n
-    ``,\n
+    ``,
+    ``,
     holdersLine,
     `Creator: <code>${creatorAddr}</code> — <b>${esc(pct(data.creator?.percent))}</b>`,
     top10Line,
     burnedLine,
-    ``,\n
-    ``,\n
+    ``,
+    ``,
     `<i>Pick a section:</i>`,
     `• <b>Buyers</b> — first 20 buyers + status`,
     ...(hasHolders(data) ? [`• <b>Holders</b> — top 20 holder percentages`] : []),
-    ``,\n
-    ``,\n
+    ``,
+    ``,
     `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>`,
     `<i>Source: Dexscreener · Explorer</i>`
   ].filter(Boolean);
