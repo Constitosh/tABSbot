@@ -15,6 +15,7 @@ function progressBar(pctNum) {
 function hasHolders(data) {
   return Array.isArray(data.holdersTop20) && data.holdersTop20.length > 0;
 }
+const BR = '\u200B';
 
 /**
  * Overview screen (ordered for readability)
@@ -72,39 +73,35 @@ export function renderOverview(data) {
     `<code>${ca}</code>`,
     moonshotLine,
 
-'&nbsp;',
     '',
+    BR,
 
     (m ? `${capLabel}: <b>${esc(money(m.marketCap))}</b>` : `<i>No market data yet</i>`),
     (m && typeof m.priceUsd === 'number')
       ? `Price: <b>${esc(money(m.priceUsd, 8))}</b>   ${t24}`
       : `<i>Price unavailable</i>`,
     '',
-    '&nbsp;',
-    '',
+    BR,
     'Volume:',
     (m ? `24h <b>${esc(money(vol.h24))}</b>` : undefined),
     (m ? `5m <b>${esc(money(vol.m5))}</b> • 1h <b>${esc(money(vol.h1))}</b> • 6h <b>${esc(money(vol.h6))}</b>` : undefined),
     '',
-    '&nbsp;',
-    '',
+    BR,
     'Change:',
     (m ? `24h <b>${esc(pct(chg.h24))}</b>` : undefined),
     (m ? `5m <b>${esc(pct(chg.m5))}</b> • 1h <b>${esc(pct(chg.h1))}</b> • 6h <b>${esc(pct(chg.h6))}</b>` : undefined),
     '',
-    '&nbsp;',
-    '',
+    BR,
     holdersLine,
     top10Line,
     `Creator: <code>${creatorAddr}</code><b>${creatorPct}</b>`,
     burnedLine,
     '',
-    '&nbsp;',
-    '',
+  BR,
     `<i>Pick a section:</i>`,
     `• <b>Buyers</b> — first 20 buyers + status`,
     ...(hasHolders(data) ? [`• <b>Holders</b> — top 20 holder percentages`] : []),
-    '',
+    BR,
     `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>`,
     `<i>Source: Dexscreener · Explorer</i>`
   ].filter(Boolean);
