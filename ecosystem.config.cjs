@@ -8,12 +8,10 @@ module.exports = {
       node_args: '--enable-source-maps',
       env: { NODE_ENV: 'production' }
     },
-    {
+  {
       name: 'tabs-worker',
-      cwd: '/root/tABSbot/tABSbot',
-      script: 'src/refreshWorker.js',
-      node_args: '--enable-source-maps',
-      env: { NODE_ENV: 'production' }
+      script: './src/worker.cjs',   // <— was ./src/pnlWorker.js
+      interpreter: 'node'
     }
   ]
 };
