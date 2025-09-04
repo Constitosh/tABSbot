@@ -97,6 +97,7 @@ function renderOverview(data, window){
     `📦 <b>Holdings:</b> ${fmtUsd(t.holdingsUsd||0)}`,
     `🎁 <b>Airdrops:</b> ${fmtUsd(t.airdropsUsd||0)}`,
     `${dot} <b>Total PnL:</b> ${fmt4(total)} ETH  (${total>=0?'🟢':'🔴'} ${fmt4(Math.abs(pct))}%)`,
+    '',
     ''
   ];
 
