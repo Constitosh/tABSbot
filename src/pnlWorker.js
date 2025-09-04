@@ -1,12 +1,6 @@
 // src/pnlWorker.js
-// Precise wallet PnL (Abstract chain) with hash-level ETH+WETH netting.
-// - Avoids ETH+WETH double counting in a single tx (wrap+swap)
-// - Handles bonding-phase mints (from token contract) as buys
-// - Only counts base flows attached to token activity for ETH IN/OUT
-// - Realized PnL via average cost; profits/losses sorted; closed only
-// - Open positions: no ETH/WETH, hide <$1, no MTM line
-// - NFT (ERC-721) airdrops: collection name + count
-// - Exports: refreshPnl(), pnlQueueName, pnlQueue, Worker
+// Accurate wallet PnL on Abstract with: normal ETH, internal ETH, WETH legs, router/proxy settlement,
+// deduped token logs, overview top-3 lists (via renderer), and NFT airdrop detection.
 
 import './configEnv.js';
 import axios from 'axios';
@@ -14,486 +8,382 @@ import Redis from 'ioredis';
 import { Worker, Queue } from 'bullmq';
 import { setJSON, getJSON, withLock } from './cache.js';
 
-/* =========================
-   Chain / API configuration
-   ========================= */
 const ES_BASE  = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
 const ES_KEY   = process.env.ETHERSCAN_API_KEY;
-const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741'; // Abstract
+const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741';
 if (!ES_KEY) console.warn('[PNL] ETHERSCAN_API_KEY missing');
 
 const WETH = '0x3439153eb7af838ad19d56e1571fbd09333c2809'.toLowerCase();
 
-/** Routers / forwarders / telegram bot proxies frequently seen */
 const KNOWN_ROUTERS = new Set([
-  '0x0d6848e39114abe69054407452b8aab82f8a44ba'.toLowerCase(), // Moonshot/forwarder
-  '0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f'.toLowerCase(), // TG proxy (user supplied)
-]);
+  '0x0d6848e39114abe69054407452b8aab82f8a44ba', // Moonshot
+  '0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f', // TG proxy/forwarder
+].map(s=>s.toLowerCase()));
 
-/* ===== Etherscan client with throttle ===== */
+// ---- throttled Etherscan (≤5rps) ----
 const httpES = axios.create({ baseURL: ES_BASE, timeout: 45_000 });
-const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
-const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS);
-let esLastTs = 0;
-let esChain = Promise.resolve();
-
-async function throttleES() {
-  await (esChain = esChain.then(async () => {
-    const wait = Math.max(0, esLastTs + ES_MIN_INTERVAL - Date.now());
-    if (wait > 0) await new Promise(r => setTimeout(r, wait));
-    esLastTs = Date.now();
-  }));
-}
-
-function esParams(params) {
-  return { params: { chainid: ES_CHAIN, apikey: ES_KEY, ...params } };
-}
-
-async function esGET(params, { tag='' } = {}) {
-  await throttleES();
-  const maxAttempts = 3;
-  for (let a = 1; a <= maxAttempts; a++) {
-    try {
-      const { data } = await httpES.get('', esParams(params));
-      if (data?.status === '1') return data.result;
-      const msg = data?.result || data?.message || 'Etherscan error';
-      if (a === maxAttempts) throw new Error(`Etherscan v2: ${msg}`);
-    } catch (e) { if (a === maxAttempts) throw e; }
-    await new Promise(r => setTimeout(r, 350 * a));
+const ES_RPS = Math.min(5, Math.max(1, Number(process.env.ETHERSCAN_RPS || 5)));
+let last = 0, chain = Promise.resolve();
+async function throttle(){ await (chain = chain.then(async () => {
+  const wait = Math.max(0, last + Math.ceil(1000/ES_RPS) - Date.now());
+  if (wait) await new Promise(r=>setTimeout(r, wait));
+  last = Date.now();
+}));}
+const q = (o)=>({ params: { chainid: ES_CHAIN, apikey: ES_KEY, ...o }});
+async function esGET(params){
+  await throttle();
+  const MAX=3;
+  for (let i=1;i<=MAX;i++){
+    try{
+      const {data}=await httpES.get('', q(params));
+      if (data?.status==='1') return data.result;
+      if (i===MAX) throw new Error(data?.result||data?.message||'Etherscan error');
+    }catch(e){ if (i===MAX) throw e; await new Promise(r=>setTimeout(r, 300*i)); }
   }
-  return [];
 }
 
-/* ==============
-   Quote helpers
-   ============== */
-async function getUsdQuote(ca) {
-  try {
-    const { data } = await axios.get(`https://api.dexscreener.com/tokens/v1/abstract/${ca}`, { timeout: 12_000 });
-    if (Array.isArray(data) && data.length) return Number(data[0]?.priceUsd || 0) || 0;
-    return Number(data?.priceUsd || 0) || 0;
-  } catch { return 0; }
+// ---- quotes ----
+async function getUsdQuote(ca){
+  try{
+    const {data}=await axios.get(`https://api.dexscreener.com/tokens/v1/abstract/${ca}`,{timeout:12_000});
+    const it = Array.isArray(data)?data[0]:data;
+    return { priceUsd: Number(it?.priceUsd||0) || 0 };
+  }catch{ return { priceUsd: 0 }; }
 }
-async function getWethQuote(ca) {
-  try {
-    const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${ca}`, { timeout: 12_000 });
-    const ps = Array.isArray(data?.pairs) ? data.pairs : [];
-    const abs = ps.filter(p => String(p?.chainId).toLowerCase() === 'abstract');
-    abs.sort((a,b) =>
-      (Number(b?.liquidity?.usd||0) - Number(a?.liquidity?.usd||0)) ||
-      (Number(b?.volume?.h24||0)    - Number(a?.volume?.h24||0)));
-    return Number(abs[0]?.priceNative || 0) || 0;
-  } catch { return 0; }
+async function getWethQuote(ca){
+  try{
+    const {data}=await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${ca}`,{timeout:12_000});
+    const pairs=(data?.pairs||[]).filter(p=>p?.chainId==='abstract');
+    pairs.sort((a,b)=>(Number(b?.liquidity?.usd||0)-Number(a?.liquidity?.usd||0))||(Number(b?.volume?.h24||0)-Number(a?.volume?.h24||0)));
+    return { priceWeth: Number(pairs[0]?.priceNative||0) || 0 };
+  }catch{ return { priceWeth: 0 }; }
 }
-async function getQuotes(ca) {
-  const [usd, weth] = await Promise.all([getUsdQuote(ca), getWethQuote(ca)]);
-  return { priceUsd: usd, priceWeth: weth };
-}
+async function getQuotes(ca){ const [u,w]=await Promise.all([getUsdQuote(ca),getWethQuote(ca)]); return { priceUsd:u.priceUsd, priceWeth:w.priceWeth }; }
 
-/* ======================
-   Etherscan pull helpers
-   ====================== */
-async function getWalletNormalTxs(wallet, { fromTs = 0 } = {}) {
-  wallet = wallet.toLowerCase();
-  const out = [];
-  let page = 1;
-  const PAGE = 10000;
-  while (true) {
-    const res = await esGET({
-      module: 'account', action: 'txlist', address: wallet,
-      startblock: 0, endblock: 999999999, page, offset: PAGE, sort: 'asc'
-    });
-    if (!Array.isArray(res) || !res.length) break;
-    for (const r of res) {
-      if (Number(r.timeStamp || 0) >= fromTs) out.push(r);
-    }
-    if (res.length < PAGE || page >= 5) break;
-    page++;
-  }
-  return out;
+// ---- pulls ----
+async function getWalletERC20Txs(address,{fromTs=0}={}){
+  const wallet=String(address).toLowerCase(); const out=[]; let page=1;
+  while(true){
+    const res=await esGET({module:'account',action:'tokentx',address:wallet,startblock:0,endblock:999999999,page,offset:1000,sort:'asc'});
+    if(!Array.isArray(res)||res.length===0)break;
+    for(const r of res) if(Number(r.timeStamp||0)>=fromTs) out.push(r);
+    if(res.length<1000)break; if(++page>50)break;
+  } return out;
 }
-
-async function getWalletERC20Txs(wallet, { fromTs = 0 } = {}) {
-  wallet = wallet.toLowerCase();
-  const out = [];
-  let page = 1;
-  const PAGE = 1000;
-  while (true) {
-    const res = await esGET({
-      module: 'account', action: 'tokentx', address: wallet,
-      startblock: 0, endblock: 999999999, page, offset: PAGE, sort: 'asc'
-    });
-    if (!Array.isArray(res) || !res.length) break;
-    for (const r of res) {
-      if (Number(r.timeStamp || 0) >= fromTs) out.push(r);
-    }
-    if (res.length < PAGE || page >= 50) break;
-    page++;
-  }
-  return out;
+async function getWalletNormalTxs(address,{fromTs=0}={}){
+  const wallet=String(address).toLowerCase(); const out=[]; let page=1;
+  while(true){
+    const res=await esGET({module:'account',action:'txlist',address:wallet,startblock:0,endblock:999999999,page,offset:10000,sort:'asc'});
+    if(!Array.isArray(res)||res.length===0)break;
+    for(const r of res) if(Number(r.timeStamp||0)>=fromTs) out.push(r);
+    if(res.length<10000)break; if(++page>5)break;
+  } return out;
+}
+async function getWalletInternalTxs(address,{fromTs=0}={}){
+  const wallet=String(address).toLowerCase(); const out=[]; let page=1;
+  while(true){
+    const res=await esGET({module:'account',action:'txlistinternal',address:wallet,startblock:0,endblock:999999999,page,offset:10000,sort:'asc'});
+    if(!Array.isArray(res)||res.length===0)break;
+    for(const r of res) if(Number(r.timeStamp||0)>=fromTs) out.push(r);
+    if(res.length<10000)break; if(++page>5)break;
+  } return out;
+}
+async function getWalletNFTTxs(address,{fromTs=0}={}){
+  const wallet=String(address).toLowerCase(); const out=[]; let page=1;
+  while(true){
+    const res=await esGET({module:'account',action:'tokennfttx',address:wallet,startblock:0,endblock:999999999,page,offset:1000,sort:'asc'});
+    if(!Array.isArray(res)||res.length===0)break;
+    for(const r of res) if(Number(r.timeStamp||0)>=fromTs) out.push(r);
+    if(res.length<1000)break; if(++page>50)break;
+  } return out;
+}
+async function getEthBalance(addr){
+  try{ const r=await esGET({module:'account',action:'balance',address:addr,tag:'latest'}); return typeof r==='string'?r:(r?.result||'0'); }
+  catch{ return '0'; }
 }
 
-async function getWalletERC721Txs(wallet, { fromTs = 0 } = {}) {
-  wallet = wallet.toLowerCase();
-  const out = [];
-  let page = 1;
-  const PAGE = 1000;
-  while (true) {
-    const res = await esGET({
-      module: 'account', action: 'tokennfttx', address: wallet,
-      startblock: 0, endblock: 999999999, page, offset: PAGE, sort: 'asc'
-    });
-    if (!Array.isArray(res) || !res.length) break;
-    for (const r of res) {
-      if (Number(r.timeStamp || 0) >= fromTs) out.push(r);
-    }
-    if (res.length < PAGE || page >= 20) break;
-    page++;
-  }
-  return out;
-}
+// ---- helpers ----
+const toBig = (x)=>BigInt(String(x||'0'));
+const add = (a,b)=>(a||0n)+(b||0n);
 
-async function getEthBalance(wallet) {
-  try {
-    const r = await esGET({ module: 'account', action: 'balance', address: wallet, tag: 'latest' });
-    return typeof r === 'string' ? r : String(r?.result || '0');
-  } catch { return '0'; }
-}
+// ---- core ----
+async function computePnL(wallet,{sinceTs=0}){
+  wallet=wallet.toLowerCase();
 
-/* =========
-   Utilities
-   ========= */
-const toBig = (x) => BigInt(String(x || '0'));
-const add   = (a,b) => (a||0n) + (b||0n);
-const ZERO  = 0n;
-
-function bnToFloatEth(wei) { return Number(wei) / 1e18; }
-function clampBig(n) { return n < 0n ? 0n : n; }
-
-/* ===========================
-   Core: computePnL per wallet
-   =========================== */
-async function computePnL(wallet, { sinceTs = 0 }) {
-  wallet = wallet.toLowerCase();
-
-  const [normal, erc20, erc721, ethBalWeiStr] = await Promise.all([
-    getWalletNormalTxs(wallet, { fromTs: sinceTs }),
-    getWalletERC20Txs(wallet, { fromTs: sinceTs }),
-    getWalletERC721Txs(wallet, { fromTs: sinceTs }),
+  const [erc20, normal, internals, nftTxs, ethBalWeiStr] = await Promise.all([
+    getWalletERC20Txs(wallet,{fromTs:sinceTs}),
+    getWalletNormalTxs(wallet,{fromTs:sinceTs}),
+    getWalletInternalTxs(wallet,{fromTs:sinceTs}),
+    getWalletNFTTxs(wallet,{fromTs:sinceTs}),
     getEthBalance(wallet),
   ]);
+  const ethBalanceFloat = Number(ethBalWeiStr)/1e18;
 
-  const ethBalanceFloat = bnToFloatEth(toBig(ethBalWeiStr));
+  // ETH/WETH deltas
+  const ethDeltaByHash=new Map(), wethDeltaByHash=new Map();
+  const blockEthNet=new Map(), blockWethNet=new Map();
 
-  // ---- Hash aggregators ----
-  /** hash -> { bn, ts, eth: bigint, weth: bigint, baseNet: bigint, tokenMoves: Map(token => {in:bigint,out:bigint,froms:Set,tos:Set,decimals, symbol}) } */
-  const byHash = new Map();
-  function ensureHash(h, bn, ts) {
-    if (!byHash.has(h)) byHash.set(h, {
-      bn: Number(bn||0), ts: Number(ts||0),
-      eth: ZERO, weth: ZERO, baseNet: ZERO,
-      tokenMoves: new Map(),
-    });
-    return byHash.get(h);
+  // Normal ETH
+  for(const tx of normal){
+    const bn=Number(tx.blockNumber||0), hash=String(tx.hash);
+    const from=String(tx.from||'').toLowerCase(), to=String(tx.to||'').toLowerCase();
+    const val=toBig(tx.value||'0'); let d=0n;
+    if(to===wallet && val>0n) d=val; else if(from===wallet && val>0n) d=-val;
+    if(d!==0n){ ethDeltaByHash.set(hash, add(ethDeltaByHash.get(hash), d)); blockEthNet.set(bn, add(blockEthNet.get(bn), d)); }
+  }
+  // Internal ETH
+  for(const itx of internals){
+    const bn=Number(itx.blockNumber||0), hash=String(itx.hash);
+    const from=String(itx.from||'').toLowerCase(), to=String(itx.to||'').toLowerCase();
+    const val=toBig(itx.value||'0'); let d=0n;
+    if(to===wallet && val>0n) d=val; else if(from===wallet && val>0n) d=-val;
+    if(d!==0n){ ethDeltaByHash.set(hash, add(ethDeltaByHash.get(hash), d)); blockEthNet.set(bn, add(blockEthNet.get(bn), d)); }
   }
 
-  // 1) Native ETH deltas
-  for (const tx of normal) {
-    const h  = String(tx.hash);
-    const to = String(tx.to || '').toLowerCase();
-    const fr = String(tx.from || '').toLowerCase();
-    const v  = toBig(tx.value || '0');
-    const bn = tx.blockNumber, ts = tx.timeStamp;
-
-    const rec = ensureHash(h, bn, ts);
-    if (to === wallet && v > 0n) rec.eth = add(rec.eth, v);
-    else if (fr === wallet && v > 0n) rec.eth = add(rec.eth, -v);
-  }
-
-  // 2) ERC20 deltas (WETH & tokens)
-  const seenLog = new Set();
-  for (const r of erc20) {
-    const key = `${r.hash}:${r.logIndex || r.transactionIndex || ''}`;
-    if (seenLog.has(key)) continue;
-    seenLog.add(key);
-
-    const h  = String(r.hash);
-    const bn = r.blockNumber, ts = r.timeStamp;
-    const token = String(r.contractAddress || '').toLowerCase();
-    const to = String(r.to || '').toLowerCase();
-    const fr = String(r.from || '').toLowerCase();
-    const v  = toBig(r.value || '0');
-
-    const rec = ensureHash(h, bn, ts);
-
-    if (token === WETH) {
-      if (to === wallet) rec.weth = add(rec.weth, v);
-      else if (fr === wallet) rec.weth = add(rec.weth, -v);
-    } else {
-      if (!rec.tokenMoves.has(token)) {
-        rec.tokenMoves.set(token, {
-          in: ZERO, out: ZERO, froms: new Set(), tos: new Set(),
-          decimals: Math.max(0, Number(r.tokenDecimal || 18)),
-          symbol: r.tokenSymbol || '',
-        });
-      }
-      const tm = rec.tokenMoves.get(token);
-      if (to === wallet) { tm.in = add(tm.in, v); tm.froms.add(fr); }
-      if (fr === wallet) { tm.out = add(tm.out, v); tm.tos.add(to); }
+  // Group token txs, track WETH
+  const tokenTxsByToken=new Map();
+  for(const r of erc20){
+    const bn=Number(r.blockNumber||0), hash=String(r.hash);
+    const token=String(r.contractAddress||'').toLowerCase();
+    const to=String(r.to||'').toLowerCase(), from=String(r.from||'').toLowerCase();
+    const v=toBig(r.value||'0');
+    if(token===WETH){
+      let d=0n; if(to===wallet) d=v; else if(from===wallet) d=-v;
+      if(d!==0n){ wethDeltaByHash.set(hash, add(wethDeltaByHash.get(hash), d)); blockWethNet.set(bn, add(blockWethNet.get(bn), d)); }
+      continue;
     }
+    if(to!==wallet && from!==wallet) continue;
+    if(!tokenTxsByToken.has(token)) tokenTxsByToken.set(token,[]);
+    tokenTxsByToken.get(token).push(r);
   }
 
-  // Compute baseNet (ETH + WETH) per hash
-  for (const rec of byHash.values()) {
-    rec.baseNet = add(rec.eth, rec.weth); // >0 net in (sell), <0 net out (buy)
-  }
+  const perToken=[];
+  for(const [token,txsRaw] of tokenTxsByToken.entries()){
+    // sort and de-dup by hash:logIndex to ensure we never process the same ERC20 log twice
+    const seen = new Set();
+    const txs = txsRaw
+      .sort((a,b)=>(Number(a.timeStamp)-Number(b.timeStamp))||(Number(a.blockNumber)-Number(b.blockNumber))||(Number(a.transactionIndex||0)-Number(b.transactionIndex||0))||(Number(a.logIndex||0)-Number(b.logIndex||0)))
+      .filter(r => { const k=`${r.hash}:${r.logIndex}`; if(seen.has(k)) return false; seen.add(k); return true; });
 
-  // 3) Block-level base net map (fallback for router-settled sells)
-  const baseByBlock = new Map(); // blockNumber -> baseNet sum
-  for (const rec of byHash.values()) {
-    baseByBlock.set(rec.bn, add(baseByBlock.get(rec.bn), rec.baseNet));
-  }
+    const { priceUsd, priceWeth } = await getQuotes(token);
 
-  // 4) Per-token running PnL
-  const perToken = new Map(); // token -> state
-  function getTokenState(token, symbol, decimals) {
-    if (!perToken.has(token)) perToken.set(token, {
-      token, symbol, decimals,
-      qty: ZERO,         // units
-      costWei: ZERO,     // remaining cost-basis in wei
-      realizedWei: ZERO, // realized PnL in wei (can be <0)
-      buyWei: ZERO,      // gross spent (for summaries)
-      sellWei: ZERO,     // gross received (for summaries)
-      airdropsUnits: ZERO,
-      hasTrade: false,
-    });
-    return perToken.get(token);
-  }
+    let qty=0n, costWeth=0n, realizedWeth=0n;
+    let buysUnits=0n, sellsUnits=0n;
+    let totalBuysEthWei=0n, totalSellsEthWei=0n;
 
-  // Iterate hashes in chronological order
-  const hashes = [...byHash.entries()]
-    .sort((a,b) => (a[1].ts - b[1].ts) || (a[1].bn - b[1].bn));
+    const decimals = Math.max(0, Number(txs[0]?.tokenDecimal||18));
+    const scale = 10n ** BigInt(decimals);
+    const airdrops=[];
 
-  for (const [hash, rec] of hashes) {
-    if (!rec.tokenMoves.size) continue; // ignore pure base transfers
+    for(const r of txs){
+      const hash=String(r.hash), bn=Number(r.blockNumber||0);
+      const to=String(r.to||'').toLowerCase(), from=String(r.from||'').toLowerCase();
+      const amt=toBig(r.value||'0');
 
-    // If exactly one token is involved, we can allocate the entire baseNet to it.
-    const tokensHere = [...rec.tokenMoves.keys()];
-    const singleToken = tokensHere.length === 1 ? tokensHere[0] : null;
+      const ethH = ethDeltaByHash.get(hash)||0n;
+      const wethH= wethDeltaByHash.get(hash)||0n;
+      const paidWei = (ethH<0n?-ethH:0n)+(wethH<0n?-wethH:0n);
+      const recvWei = (ethH>0n? ethH:0n)+(wethH>0n? wethH:0n);
 
-    for (const [token, tm] of rec.tokenMoves.entries()) {
-      const st = getTokenState(token, tm.symbol, tm.decimals);
-      const scale = 10n ** BigInt(tm.decimals || 18);
-
-      // Base flows for this token in this hash
-      let paidWei = 0n, recvWei = 0n;
-
-      // PRIMARY: hash-level base net + direction
-      if (singleToken) {
-        if (tm.in > 0n && rec.baseNet < 0n) paidWei = -rec.baseNet;      // BUY
-        if (tm.out > 0n && rec.baseNet > 0n) recvWei = rec.baseNet;      // SELL
+      // BUY
+      if (to===wallet && (paidWei>0n || from===token)){
+        qty+=amt; buysUnits+=amt;
+        costWeth+=paidWei; totalBuysEthWei+=paidWei;
+        continue;
       }
 
-      // SECONDARY: bonding/token mint or router settlement in same block
-      if (paidWei === 0n && recvWei === 0n) {
-        const fromIsToken = tm.froms.has(token);
-        const toIsRouter  = [...tm.tos].some(a => KNOWN_ROUTERS.has(String(a)));
-        if (tm.in > 0n && (fromIsToken || rec.baseNet < 0n)) {
-          // mint / bonding buy or swap buy with missing base; use block net if positive outflow
-          const blk = baseByBlock.get(rec.bn) || 0n;
-          if (blk < 0n) paidWei = -blk;
-        } else if (tm.out > 0n && (toIsRouter || rec.baseNet === 0n)) {
-          const blk = baseByBlock.get(rec.bn) || 0n;
-          if (blk > 0n) recvWei = blk;
+      // SELL (same-hash proceeds)
+      if (from===wallet && recvWei>0n){
+        sellsUnits+=amt; totalSellsEthWei+=recvWei;
+        const avg = qty>0n ? (costWeth*1_000_000_000_000_000_000n)/qty : 0n;
+        const useAmt = amt>qty ? qty : amt;
+        const costSold = (avg*useAmt)/1_000_000_000_000_000_000n;
+        realizedWeth += (recvWei - costSold);
+        const newQty = qty>useAmt ? (qty-useAmt) : 0n;
+        costWeth = newQty>0n ? (avg*newQty)/1_000_000_000_000_000_000n : 0n;
+        qty = newQty;
+        continue;
+      }
+
+      // SELL (router/proxy block settle)
+      if (from===wallet && recvWei===0n && (KNOWN_ROUTERS.has(String(r.to||'').toLowerCase()) || String(r.to||'').toLowerCase()===token)){
+        let proceeds = add(blockEthNet.get(bn), blockWethNet.get(bn)) || 0n;
+        if (proceeds<0n) proceeds = 0n;
+        if (proceeds===0n && priceWeth>0){
+          const amtWeiEq = scale>0n ? (amt*1_000_000_000_000_000_000n)/scale : 0n;
+          proceeds = toBig(Math.floor(Number(amtWeiEq)*Number(priceWeth)));
         }
+        totalSellsEthWei += proceeds;
+        const avg = qty>0n ? (costWeth*1_000_000_000_000_000_000n)/qty : 0n;
+        const useAmt = amt>qty ? qty : amt;
+        const costSold = (avg*useAmt)/1_000_000_000_000_000_000n;
+        realizedWeth += (proceeds - costSold);
+        const newQty = qty>useAmt ? (qty-useAmt) : 0n;
+        costWeth = newQty>0n ? (avg*newQty)/1_000_000_000_000_000_000n : 0n;
+        qty = newQty;
+        sellsUnits += amt;
+        continue;
       }
 
-      // FINAL FALLBACK: Dexscreener price (only when base is still zero)
-      if ((tm.in > 0n && paidWei === 0n) || (tm.out > 0n && recvWei === 0n)) {
-        const { priceWeth } = await getQuotes(token);
-        if (priceWeth > 0) {
-          // tokens * priceWeth (WETH per token) -> wei
-          const amt = tm.in > 0n ? tm.in : tm.out;
-          const amt_1e18 = (amt * 1_000_000_000_000_000_000n) / (scale || 1n);
-          const estWei = toBig(Math.floor(Number(amt_1e18) * Number(priceWeth)));
-          if (tm.in > 0n && paidWei === 0n)  paidWei = estWei;
-          if (tm.out > 0n && recvWei === 0n) recvWei = estWei;
+      // OUT no proceeds (gift/burn)
+      if (from===wallet && recvWei===0n){
+        if (qty>0n){
+          const avg=(costWeth*1_000_000_000_000_000_000n)/(qty||1n);
+          const useAmt=amt>qty?qty:amt;
+          const dec=(avg*useAmt)/1_000_000_000_000_000_000n;
+          qty-=useAmt; costWeth = costWeth>dec ? (costWeth-dec) : 0n;
+          sellsUnits += useAmt;
         }
+        continue;
       }
 
-      // Classify actions and update running average-cost PnL
-      if (tm.in > 0n && (paidWei > 0n || tm.froms.has(token))) {
-        // BUY (swap or bonding mint). If mint with no cost, paidWei may be 0.
-        st.qty = add(st.qty, tm.in);
-        st.costWei = add(st.costWei, paidWei);
-        st.buyWei = add(st.buyWei, paidWei);
-        st.hasTrade = true;
-      }
-
-      if (tm.out > 0n && (recvWei > 0n || KNOWN_ROUTERS.has([...tm.tos][0] || ''))) {
-        // SELL (swap or router settlement)
-        const sellAmt = tm.out > st.qty ? st.qty : tm.out;
-        const avgCostPerUnitWei = st.qty > 0n ? (st.costWei * 1_000_000_000_000_000_000n) / st.qty : 0n;
-        const costOfSold = (avgCostPerUnitWei * sellAmt) / 1_000_000_000_000_000_000n;
-
-        st.realizedWei = add(st.realizedWei, add(recvWei, -costOfSold));
-        st.sellWei = add(st.sellWei, recvWei);
-
-        const newQty = st.qty - sellAmt;
-        st.qty = newQty < 0n ? 0n : newQty;
-        st.costWei = st.qty > 0n ? (avgCostPerUnitWei * st.qty) / 1_000_000_000_000_000_000n : 0n;
-        st.hasTrade = true;
-      }
-
-      // Token "airdrops": inbound with zero base & not from token? we’ll log as token airdrop units.
-      if (tm.in > 0n && paidWei === 0n && !tm.froms.has(token)) {
-        st.airdropsUnits = add(st.airdropsUnits, tm.in);
+      // AIRDROP (token)
+      if (to===wallet && paidWei===0n && from!==token){
+        airdrops.push({hash,amount:amt});
+        qty+=amt;
       }
     }
-  }
 
-  // Mark-to-market for open positions (USD)
-  const tokensOut = [];
-  let totalRealized = 0;
-  let totalUnrealized = 0;
-  let totalHoldUsd = 0;
-  let totalAirdropUsd = 0;
-
-  for (const st of perToken.values()) {
-    const { priceUsd, priceWeth } = await getQuotes(st.token);
-    const scale = 10n ** BigInt(st.decimals || 18);
-
-    const qtyFloat = Number(st.qty) / Number(scale || 1n);
-    const invCostW = bnToFloatEth(st.costWei);
-    const mtmW = qtyFloat * (Number(priceWeth || 0));
+    // MTM / USD
+    const qtyFloat = Number(qty)/Number(scale||1n);
+    const invCostW = Number(costWeth)/1e18;
+    const mtmW = qtyFloat * Number((await getWethQuote(token)).priceWeth || 0); // slight refresh safe
     const unrealW = mtmW - invCostW;
-    const usdValue = qtyFloat * (Number(priceUsd || 0));
+    const usdValue = qtyFloat * Number((await getUsdQuote(token)).priceUsd || 0);
 
-    totalRealized += bnToFloatEth(st.realizedWei);
-    totalUnrealized += unrealW;
-    totalHoldUsd += usdValue;
+    let adUnits=0n; for(const a of airdrops) adUnits+=a.amount;
+    const adQty = Number(adUnits)/Number(scale||1n);
+    const adUsd = adQty * Number((await getUsdQuote(token)).priceUsd || 0);
 
-    // Airdrops USD (ERC20)
-    const adQty = Number(st.airdropsUnits) / Number(scale || 1n);
-    totalAirdropUsd += adQty * (Number(priceUsd || 0));
+    // open filter: keep only ≥$1
+    perToken.push({
+      token,
+      symbol: txs[0]?.tokenSymbol || '',
+      decimals,
+      buys: buysUnits.toString(),
+      sells: sellsUnits.toString(),
+      remaining: qty.toString(),
 
-    tokensOut.push({
-      token: st.token,
-      symbol: st.symbol,
-      decimals: st.decimals,
-      remainingUnits: st.qty.toString(),
-      remainingUsd: usdValue,
-      inventoryCostWeth: invCostW,
+      realizedWeth: Number(realizedWeth)/1e18,
       unrealizedWeth: unrealW,
-      realizedWeth: bnToFloatEth(st.realizedWei),
-      totalBuyWeth: bnToFloatEth(st.buyWei),
-      totalSellWeth: bnToFloatEth(st.sellWei),
-      airdropsUnits: st.airdropsUnits.toString(),
+      inventoryCostWeth: Number(costWeth)/1e18,
+
+      priceUsd: Number((await getUsdQuote(token)).priceUsd || 0),
+      priceWeth: Number((await getWethQuote(token)).priceWeth || 0),
+      usdValueRemaining: usdValue,
+
+      totalBuysEth: Number(totalBuysEthWei)/1e18,
+      totalSellsEth: Number(totalSellsEthWei)/1e18,
+
+      isOpen: qty>0n && usdValue>=1,
+
+      airdrops: { count: airdrops.length, units: adUnits.toString(), estUsd: adUsd }
     });
   }
 
-  // ETH/WETH IN/OUT that are related to token activity only
-  let baseIn = 0n, baseOut = 0n;
-  for (const rec of byHash.values()) {
-    if (!rec.tokenMoves.size) continue; // ignore pure base transfers
-    if (rec.baseNet > 0n) baseIn = add(baseIn, rec.baseNet);
-    if (rec.baseNet < 0n) baseOut = add(baseOut, -rec.baseNet);
+  // NFT airdrops (name + qty)
+  const nftAirdropsMap = new Map();
+  for (const n of nftTxs){
+    const hash = String(n.hash);
+    const to = String(n.to||'').toLowerCase();
+    const from = String(n.from||'').toLowerCase();
+    // ETH/WETH out in same hash? then it's a purchase, skip
+    const ethH = toBig((ethDeltaByHash.get(hash)||0n) < 0n ? -(ethDeltaByHash.get(hash)||0n) : 0n);
+    const wethH = toBig((wethDeltaByHash.get(hash)||0n) < 0n ? -(wethDeltaByHash.get(hash)||0n) : 0n);
+    const paid = (ethH + wethH);
+    if (to === wallet && paid === 0n){
+      const name = n.tokenName || 'NFT';
+      const key = name;
+      nftAirdropsMap.set(key, (nftAirdropsMap.get(key)||0) + 1);
+    }
   }
+  const nftAirdrops = [...nftAirdropsMap.entries()].map(([name,qty])=>({ name, qty }));
 
-  const baseInF  = bnToFloatEth(baseIn);
-  const baseOutF = bnToFloatEth(baseOut);
+  // Aggregates (trade-only)
+  let sumBuy=0, sumSell=0, sumReal=0, sumUnreal=0, sumHoldUsd=0, sumAirUsd=0;
+  for (const t of perToken){
+    sumBuy += Number(t.totalBuysEth||0);
+    sumSell+= Number(t.totalSellsEth||0);
+    sumReal+= Number(t.realizedWeth||0);
+    sumUnreal += Number(t.unrealizedWeth||0);
+    sumHoldUsd += Number(t.usdValueRemaining||0);
+    sumAirUsd  += Number(t.airdrops?.estUsd||0);
+  }
+  const totalPnlWeth = sumReal + sumUnreal;
+  const pnlPct = sumBuy>0 ? (totalPnlWeth/sumBuy)*100 : 0;
 
-  const totalPnlWeth = totalRealized + totalUnrealized;
-  const spentBase    = baseOutF;
-  const pnlPct       = spentBase > 0 ? (totalPnlWeth / spentBase) * 100 : 0;
+  // Derived views
+  const openPositions = perToken.filter(t =>
+    t.isOpen && !['ETH','WETH'].includes(String(t.symbol).toUpperCase())
+  );
 
-  // ----- Build derived lists (robust) -----
-  // A position is considered closed if no units remain OR the remaining USD value is < $1.
-  const realizedClosed = perToken.filter(t => {
-    const sym = String(t.symbol || '').toUpperCase();
-    const isEthLike = sym === 'ETH' || sym === 'WETH' || t.token === WETH;
-    if (isEthLike) return false;
+  // realized leaders (only tokens, not ETH/WETH)
+  const realizedOnly = perToken
+    .filter(t => Math.abs(Number(t.realizedWeth)||0)>1e-10 && !['ETH','WETH'].includes(String(t.symbol).toUpperCase()))
+    .map(t => {
+      const spent = Number(t.totalBuysEth||0);
+      const pct = spent>0 ? (Number(t.realizedWeth)/spent)*100 : 0;
+      return {
+        symbol: t.symbol,
+        realizedWeth: Number(t.realizedWeth),
+        pct,
+        buysEth: Number(t.totalBuysEth||0),
+        sellsEth: Number(t.totalSellsEth||0),
+        remaining: t.remaining,
+        decimals: t.decimals
+      };
+    });
+  const best = realizedOnly.filter(x=>x.realizedWeth>0).sort((a,b)=>b.realizedWeth-a.realizedWeth);
+  const worst= realizedOnly.filter(x=>x.realizedWeth<0).sort((a,b)=>a.realizedWeth-b.realizedWeth);
 
-    const remUnits = BigInt(t.remaining || '0');
-    const isClosed = remUnits === 0n || Number(t.usdValueRemaining || 0) < 1;
-
-    const realized = Number(t.realizedWeth || 0);
-    const hasRealized = Math.abs(realized) > 1e-9;
-
-    return isClosed && hasRealized;
-  });
-
-  // Sort results
-  const profits = realizedClosed
-    .filter(t => Number(t.realizedWeth) > 0)
-    .sort((a, b) => Number(b.realizedWeth) - Number(a.realizedWeth));
-
-  const losses = realizedClosed
-    .filter(t => Number(t.realizedWeth) < 0)
-    .sort((a, b) => Number(a.realizedWeth) - Number(b.realizedWeth));
-
-  // Open positions: hide ETH/WETH and <$1 value; renderer will not show MTM lines.
-  const open = perToken.filter(t => {
-    const sym = String(t.symbol || '').toUpperCase();
-    const isEthLike = sym === 'ETH' || sym === 'WETH' || t.token === WETH;
-    const remUnits = BigInt(t.remaining || '0');
-    return !isEthLike && remUnits > 0n && Number(t.usdValueRemaining || 0) >= 1;
-  });
-
-  result = {
+  return {
     wallet,
     sinceTs,
-    totals: {
-      ...result?.totals, // keep what you already compute (ethBalance, ethIn/out, realized, etc.)
+    totals:{
+      ethBalance: ethBalanceFloat,
+      ethInFloat:  sumSell,
+      ethOutFloat: sumBuy,
+      realizedWeth: sumReal,
+      unrealizedWeth: sumUnreal,
+      totalPnlWeth,
+      pnlPct,
+      airdropsUsd: sumAirUsd,
+      holdingsUsd: sumHoldUsd
     },
     tokens: perToken,
     derived: {
-      open,
-      profits,
-      losses,
-      ...(result?.derived?.nfts ? { nfts: result.derived.nfts } : {})
+      open: openPositions,
+      best,           // full lists (renderer does top-3 for home)
+      worst,
+      nftAirdrops     // {name, qty}
     }
   };
-  return result;
+}
 
-
-
-/* ================================
-   Public API + cache + worker/queue
-   ================================ */
+// ---- exports / cache / worker ----
 const bullRedis = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: null, enableReadyCheck: false });
-
 export const pnlQueueName = 'tabs_pnl';
-export const pnlQueue     = new Queue(pnlQueueName, { connection: bullRedis });
+export const pnlQueue = new Queue(pnlQueueName, { connection: bullRedis });
 
-export async function refreshPnl(wallet, window) {
-  const sinceMap = {
-    '24h': 60*60*24,
-    '7d':  60*60*24*7,
-    '30d': 60*60*24*30,
-    '90d': 60*60*24*90,
-    'all': 0
-  };
-  const sinceSec = sinceMap[window] ?? sinceMap['30d'];
-  const sinceTs = sinceSec ? Math.floor(Date.now()/1000) - sinceSec : 0;
-
+export async function refreshPnl(wallet, window){
+  const since = { '24h':86400, '7d':604800, '30d':2592000, '90d':7776000, 'all':0 }[window] ?? 2592000;
+  const sinceTs = since ? Math.floor(Date.now()/1000)-since : 0;
   const key = `pnl:${String(wallet).toLowerCase()}:${window}`;
-  return withLock(`lock:${key}`, 60, async () => {
+
+  return withLock(`lock:${key}`, 60, async ()=>{
     const cached = await getJSON(key);
     if (cached) return cached;
-    const data = await computePnL(wallet, { sinceTs });
-    await setJSON(key, data, 120); // 2 min cache
+    const data = await computePnL(wallet,{ sinceTs });
+    await setJSON(key, data, 120);
     return data;
   });
 }
 
-// Worker to warm/recompute
 new Worker(
   pnlQueueName,
-  async (job) => {
+  async (job)=> {
     const { wallet, window } = job.data || {};
-    const res = await refreshPnl(String(wallet||''), String(window||'30d'));
-    return res;
+    return await refreshPnl(String(wallet||''), String(window||'30d'));
   },
   { connection: bullRedis }
 );
