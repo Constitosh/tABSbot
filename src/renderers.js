@@ -257,8 +257,6 @@ export function renderAbout() {
     '',
     '<i>Made for Abstract chain token analytics.</i>'
   ].join('\n');
-
-const text = lines.join('\n');
   
   const extra = {
     reply_markup: {
