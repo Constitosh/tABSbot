@@ -407,57 +407,46 @@ async function computePnL(wallet, { sinceTs = 0 }) {
   const spentBase    = baseOutF;
   const pnlPct       = spentBase > 0 ? (totalPnlWeth / spentBase) * 100 : 0;
 
-  // Build derived lists
-  const closedOnly = tokensOut.filter(t => {
-    const dec = Math.max(0, Number(t.decimals||18));
-    const minUnits = 5n * (10n ** BigInt(dec));
-    const rem = BigInt(t.remainingUnits || '0');
-    return rem === 0n || rem < minUnits; // closed or dust
-  }).filter(t => t.symbol.toUpperCase() !== 'ETH' && t.symbol.toUpperCase() !== 'WETH');
+  // ----- Build derived lists (robust) -----
+  // A position counts as closed if remaining units are zero, or it's just dust (<$1).
+  const realizedClosed = tokensOut
+    .filter(t => {
+      const isEthLike = (t.symbol || '').toUpperCase() === 'ETH' ||
+                        (t.symbol || '').toUpperCase() === 'WETH' ||
+                        t.token === WETH;
+      if (isEthLike) return false;
+      const remUnits = BigInt(t.remainingUnits || '0');
+      const isClosed = remUnits === 0n || Number(t.remainingUsd || 0) < 1;
+      const hasRealized = Math.abs(Number(t.realizedWeth || 0)) > 1e-9;
+      return isClosed && hasRealized;
+    });
 
-  const profits = closedOnly
-    .filter(t => (t.totalBuyWeth || 0) > 0 && (t.totalSellWeth || 0) > 0)
-    .map(t => ({ ...t, realizedOnly: t.totalSellWeth - t.totalBuyWeth }))
-    .sort((a,b) => b.realizedOnly - a.realizedOnly)
-    .filter(t => t.realizedOnly > 0);
+  // Sort: profits high→low, losses low→high (most negative first)
+  const profits = realizedClosed
+    .filter(t => Number(t.realizedWeth) > 0)
+    .sort((a,b) => Number(b.realizedWeth) - Number(a.realizedWeth));
 
-  const losses = closedOnly
-    .filter(t => (t.totalBuyWeth || 0) > 0 && (t.totalSellWeth || 0) > 0)
-    .map(t => ({ ...t, realizedOnly: t.totalSellWeth - t.totalBuyWeth }))
-    .sort((a,b) => a.realizedOnly - b.realizedOnly)
-    .filter(t => t.realizedOnly < 0);
+  const losses = realizedClosed
+    .filter(t => Number(t.realizedWeth) < 0)
+    .sort((a,b) => Number(a.realizedWeth) - Number(b.realizedWeth));
 
-  // Open positions (hide ETH/WETH, hide <$1)
+  // Open positions: hide ETH/WETH, hide <$1, and do not show MTM in UI (renderer).
   const open = tokensOut.filter(t => {
-    const rem = BigInt(t.remainingUnits || '0');
-    const isEth = t.symbol.toUpperCase() === 'ETH' || t.symbol.toUpperCase() === 'WETH' || t.token === WETH;
-    return rem > 0n && !isEth && Number(t.remainingUsd || 0) >= 1;
+    const isEthLike = (t.symbol || '').toUpperCase() === 'ETH' ||
+                      (t.symbol || '').toUpperCase() === 'WETH' ||
+                      t.token === WETH;
+    const remUnits = BigInt(t.remainingUnits || '0');
+    return !isEthLike && remUnits > 0n && Number(t.remainingUsd || 0) >= 1;
   });
 
-  // NFT airdrops summary
-  const nftDrops = [];
-  if (Array.isArray(erc721) && erc721.length) {
-    const inbound = erc721.filter(x => String(x.to).toLowerCase() === wallet);
-    const byCol = new Map(); // contract -> {name, count}
-    for (const n of inbound) {
-      const h = String(n.hash);
-      const rec = byHash.get(h);
-      // Count as airdrop when there is no base cost tied to a token swap for this tx
-      if (!rec || rec.baseNet === 0n) {
-        const k = String(n.contractAddress).toLowerCase();
-        if (!byCol.has(k)) byCol.set(k, { name: n.tokenName || 'NFT', count: 0 });
-        byCol.get(k).count += 1;
-      }
-    }
-    for (const [k, v] of byCol.entries()) nftDrops.push({ contract: k, name: v.name, qty: v.count });
-  }
+  // NFT airdrops were already computed above as `nftDrops`.
 
   return {
     wallet,
     sinceTs,
     totals: {
       ethBalance: ethBalanceFloat,
-      ethInFloat: baseInF,   // ETH+WETH combined, token-related only
+      ethInFloat: baseInF,    // token-related base only
       ethOutFloat: baseOutF,
       realizedWeth: totalRealized,
       unrealizedWeth: totalUnrealized,
@@ -469,12 +458,12 @@ async function computePnL(wallet, { sinceTs = 0 }) {
     tokens: tokensOut,
     derived: {
       open,
-      profits, // sorted desc
-      losses,  // sorted asc (most negative first)
+      profits,
+      losses,
       nfts: nftDrops,
     }
   };
-}
+
 
 /* ================================
    Public API + cache + worker/queue
