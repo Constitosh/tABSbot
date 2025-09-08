@@ -1,206 +1,213 @@
 // src/renderers_pnl.js
+// Telegram-safe HTML renderers for PnL
+import { esc } from './ui_html.js';
 
-const wins = ['24h','7d','30d','90d','all'];
-const views = [
-  { key:'overview', label:'🏠 Home' },
-  { key:'profits',  label:'🟢 Profits' },
-  { key:'losses',   label:'🔴 Losses' },
-  { key:'open',     label:'📦 Open' },
-  { key:'airdrops', label:'🎁 Airdrops' },
-];
+const BR = '\u200B'; // forced blank line
 
-const fmt4 = (n)=> (Math.round(Number(n||0)*1e4)/1e4).toFixed(4);
-const fmtUsd = (n)=> `$${Number(n||0).toLocaleString(undefined,{maximumFractionDigits:2})}`;
-const esc = (s='')=> String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-
-function keyboard(wallet, window, view){
-  const rows=[];
-  rows.push(wins.map(w=>({ text: w===window?`· ${w} ·`:w, callback_data:`pnlv:${wallet}:${w}:${view}`})));
-  const r1=[], r2=[];
-  for(const v of views) (r1.length<3?r1:r2).push({ text:v.label, callback_data:`pnlv:${wallet}:${window}:${v.key}` });
-  rows.push(r1); rows.push(r2);
-  rows.push([{text:'↻ Refresh', callback_data:`pnl_refresh:${wallet}:${window}`}]);
-  return { inline_keyboard: rows };
+// ----- number formatting -----
+const fmtEth = (x) => (Number(x||0)).toFixed(4);
+function fmtPct(x) {
+  const n = Number(x||0);
+  const s = (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
+  return s;
+}
+function abbrTokens(units, decimals) {
+  // show plain up to 9,999; then k/m with 2 decimals
+  const n = Number(units) / Math.max(1, Number(10 ** (decimals||0)));
+  if (!isFinite(n)) return '0';
+  if (Math.abs(n) < 10000) return n.toLocaleString(undefined, { maximumFractionDigits: 4 });
+  const abs = Math.abs(n);
+  const sign = n < 0 ? '-' : '';
+  if (abs < 1e6) return sign + (abs/1e3).toFixed(2) + 'k';
+  if (abs < 1e9) return sign + (abs/1e6).toFixed(2) + 'm';
+  return sign + (abs/1e9).toFixed(2) + 'b';
 }
 
-function realizedLists(data){
-  // Build normalized realized entries (exclude ETH/WETH)
-  const map = new Map();
-  for (const t of (data.tokens || [])) {
-    const sym = t.symbol || '';
-    if (!sym || ['ETH','WETH'].includes(sym.toUpperCase())) continue;
+// Build buy/sell totals & realized list (closed or partial)
+function buildRealizedLists(tokens) {
+  // For each token we only have realizedWeth (sum of partial sells).
+  // We also want totalBuyEth & totalSellEth to show beneath each line.
+  // Re-derive from per-token movements: approximate via avg cost math:
+  // Here we sum realized (provided) and estimate buy/sell legs from realized sign + inventory cost.
+  // Simpler: we recompute buy/sell legs from deltas embedded in the token object:
+  //   buys = token.buys units at effective avg cost ~ (inventoryCost + costOfSold)
+  // But we didn't persist costOfSold. So we’ll show a compact line:
+  //   "Bought X ETH · Sold Y ETH" using realized + priceWeth snapshots is unreliable.
+  // Therefore we’ll derive per token: totalBuyEth ~ inventoryCostWeth + realizedPositiveAdds
+  // and totalSellEth ~ realizedPositiveAdds - realizedNegativeAbs + ??? — This gets hairy.
+  //
+  // Better: we show realized PnL and omit the buy/sell split if we cannot guarantee exactness.
+  // Per user request we *do* want those lines. We'll approximate:
+  //   Let r = realizedWeth. Let inv = inventoryCostWeth, priceWeth = priceWeth, remaining = units.
+  //   We can't recover historical exact buy/sell ETH without replaying legs. That’s done in worker now
+  //   via tradeOutEth and tradeInEth at totals, but not per-token split. So:
+  // Update: we will compute per-token "avg buy price" and "sold ETH" by allocating trade flows
+  // from realizedWeth using avg-cost: SoldEth = CostOfSold + Realized (unknown CostOfSold).
+  // We can't reconstruct CostOfSold. So instead, show **Bought/Sold in UNITS** and keep PnL ETH accurate.
+  //
+  // That matches the user's latest requirement to see tokens bought, tokens sold, tokens held.
+  const realized = [];
+  for (const t of (tokens||[])) {
+    const remUnits = BigInt(t.remaining||'0');
+    const buyUnits = BigInt(t.buys||'0');
+    const sellUnits = BigInt(t.sells||'0');
+    const pnl = Number(t.realizedWeth)||0;
 
-    const realized = Number(t.realizedWeth || 0);
-    if (Math.abs(realized) < 1e-12) continue; // ignore true zeros
-
-    const buys = Number(t.totalBuysEth || 0);
-    const pct  = buys > 0 ? (realized / buys) * 100 : 0;
-
-    // Dedup by symbol (merge if repeated symbols appear)
-    const prev = map.get(sym);
-    if (prev) {
-      prev.realized += realized;
-      prev.buys     += buys;
-      prev.sells    += Number(t.totalSellsEth || 0);
-      prev.pct       = prev.buys > 0 ? (prev.realized / prev.buys) * 100 : 0;
-    } else {
-      map.set(sym, {
-        symbol: sym,
-        realized,
-        pct,
-        buys,
-        sells: Number(t.totalSellsEth || 0)
-      });
-    }
+    // closed if remaining == 0
+    const closed = remUnits === 0n;
+    realized.push({
+      token: t.token,
+      symbol: t.symbol || '—',
+      pnl,
+      closed,
+      buysUnits: buyUnits,
+      sellsUnits: sellUnits,
+      decimals: t.decimals||18,
+      priceWeth: Number(t.priceWeth||0),
+    });
   }
-
-  const arr = [...map.values()];
-
-  // Sort profits: highest realized → lowest; tie-break by % desc, then buys desc
-  const profits = arr
-    .filter(x => x.realized > 0)
-    .sort((a, b) =>
-      b.realized - a.realized ||
-      b.pct      - a.pct      ||
-      b.buys     - a.buys
-    );
-
-  // Sort losses: most negative → least negative; tie-break by % asc (more negative first), then buys desc
-  const losses = arr
-    .filter(x => x.realized < 0)
-    .sort((a, b) =>
-      a.realized - b.realized ||    // e.g. -1.5 < -0.2 ⇒ a first
-      a.pct      - b.pct      ||
-      b.buys     - a.buys
-    );
-
-  return { profits, losses };
+  return realized;
 }
 
+function colorDot(n) {
+  if (n > 0) return '🟢';
+  if (n < 0) return '🔴';
+  return '⚪️';
+}
 
-function renderOverview(data, window){
-  const w = data.wallet.slice(0,6)+'…'+data.wallet.slice(-4);
-  const t = data.totals||{};
-  const total = Number(t.totalPnlWeth||0);
-  const pct = Number(t.pnlPct||0);
-  const dot = total>0?'🟢':(total<0?'🔴':'⚪️');
+function rankTop(realizedAll) {
+  const arr = buildRealizedLists(realizedAll);
+  const pos = arr.filter(x => x.pnl > 0).sort((a,b)=> b.pnl - a.pnl);
+  const neg = arr.filter(x => x.pnl < 0).sort((a,b)=> a.pnl - b.pnl);
+  return { pos, neg };
+}
 
-  const lines = [
-    `💼 <b>Wallet PnL — ${esc(w)}</b>`,
-    `<i>Window: ${esc(window)}</i>`,
-    `💰 <b>Wallet Balance:</b> ${fmt4(t.ethBalance||0)} ETH`,
-    '',
-    `💧 <b>ETH IN:</b> ${fmt4(t.ethInFloat||0)} ETH`,
-    `🔥 <b>ETH OUT:</b> ${fmt4(t.ethOutFloat||0)} ETH`,
-    `📈 <b>Realized:</b> ${fmt4(t.realizedWeth||0)} ETH`,
-    `📊 <b>Unrealized:</b> ${fmt4(t.unrealizedWeth||0)} ETH`,
-    `📦 <b>Holdings:</b> ${fmtUsd(t.holdingsUsd||0)}`,
-    `🎁 <b>Airdrops:</b> ${fmtUsd(t.airdropsUsd||0)}`,
-    `${dot} <b>Total PnL:</b> ${fmt4(total)} ETH  (${total>=0?'🟢':'🔴'} ${fmt4(Math.abs(pct))}%)`,
-    '',
-    ''
+function buildHeader(data, window) {
+  const bal = fmtEth(data.totals.ethBalance);
+  const ein = fmtEth(data.totals.tradeInEth || 0);
+  const eout= fmtEth(data.totals.tradeOutEth || 0);
+  const realized = fmtEth(data.totals.realizedWeth || 0);
+  const unreal   = fmtEth(data.totals.unrealizedWeth || 0);
+  const holdUsd  = (data.totals.holdingsUsd || 0);
+  const adUsd    = (data.totals.airdropsUsd || 0);
+  const total    = fmtEth(data.totals.totalPnlWeth || 0);
+  const pct      = Number(data.totals.pnlPct||0);
+  const pcStr    = (pct>=0?`🟢 +${pct.toFixed(2)}%`:`🔴 ${pct.toFixed(2)}%`);
+  const dot      = (Number(total)>0?'🟢':Number(total)<0?'🔴':'⚪️');
+
+  return [
+    `💼 <b>Wallet PnL — <code>${esc(data.wallet.slice(0,6))}…${esc(data.wallet.slice(-4))}</code></b>`,
+    `Window: ${esc(window)}`,
+    `💰 Wallet Balance: ${bal} ETH`,
+    BR,
+    `💧 ETH IN: ${ein} ETH`,
+    `🔥 ETH OUT: ${eout} ETH`,
+    `📈 Realized: ${realized} ETH`,
+    `📊 Unrealized: ${unreal} ETH`,
+    `📦 Holdings: $${Math.round(holdUsd).toLocaleString()}`,
+    `🎁 Airdrops: $${adUsd.toFixed(2)}`,
+    `${dot} Total PnL: ${total} ETH  (${pcStr})`,
+    BR,
+  ].join('\n');
+}
+
+function lineRealized(r) {
+  const dot = colorDot(r.pnl);
+  const pnl = `${dot} ${r.pnl>=0?'+':''}${fmtEth(r.pnl)} ETH`;
+  // show units bought/sold/held — per user: units scaled & abbreviated
+  const boughtU = abbrTokens(r.buysUnits.toString(), r.decimals);
+  const soldU   = abbrTokens(r.sellsUnits.toString(), r.decimals);
+  const heldU   = abbrTokens((BigInt(r.buysUnits)-BigInt(r.sellsUnits)).toString(), r.decimals);
+  return [
+    `• ${esc(r.symbol||'—')} — ${dot}`,
+    `${pnl}`,
+    `Bought ${boughtU}`,
+    `Sold ${soldU}`,
+    BR,
+  ].join('\n');
+}
+
+function renderTopSection(pos, neg, limitPos=3, limitNeg=3) {
+  const topP = pos.slice(0, limitPos).map(lineRealized).join('\n') || 'No items';
+  const topL = neg.slice(0, limitNeg).map(lineRealized).join('\n') || 'No items';
+  return [
+    `<b>Top Profits (realized)</b>`,
+    topP,
+    `<b>Top Losses (realized)</b>`,
+    topL,
+  ].join('\n');
+}
+
+function viewButtons(wallet, window, active) {
+  const views = [
+    ['overview','🏠 Overview'],
+    ['profits','🟢 Profits'],
+    ['losses','🔴 Losses'],
+    ['open','📦 Open'],
+    ['airdrops','🎁 Airdrops'],
   ];
+  const row1 = views.map(([v,label]) => ({
+    text: v===active ? `● ${label}` : label,
+    callback_data: `pnlv:${wallet}:${window}:${v}`
+  }));
+  const windows = ['24h','7d','30d','90d','all'];
+  const row2 = windows.map(w => ({
+    text: (w===window ? `● ${w}` : w),
+    callback_data: `pnl:${wallet}:${w}`
+  }));
+  const row3 = [{ text:'↻ Refresh', callback_data:`pnl_refresh:${wallet}:${window}`}];
 
-  const {profits, losses} = realizedLists(data);
-  const topP = profits.slice(0,3).map(p=>[
-    `• ${esc(p.symbol)} — 🟢`,
-    `🟢 +${fmt4(p.realized)} ETH (🟢 +${fmt4(p.pct)}%)`,
-    `Bought ${fmt4(p.buys)} ETH`,
-    `Sold ${fmt4(p.sells)} ETH`,
-    ''
-  ].join('\n')).join('\n') || 'No items';
-
-  const topL = losses.slice(0,3).map(p=>[
-    `• ${esc(p.symbol)} — 🔴`,
-    `🔴 −${fmt4(Math.abs(p.realized))} ETH (🔴 -${fmt4(Math.abs(p.pct))}%)`,
-    `Bought ${fmt4(p.buys)} ETH`,
-    `Sold ${fmt4(p.sells)} ETH`,
-    ''
-  ].join('\n')).join('\n') || 'No items';
-
-  return lines.join('\n') + `<b>Top Profits (realized)</b>\n${topP}\n<b>Top Losses (realized)</b>\n${topL}`;
-}
-
-function renderProfits(data){
-  const {profits} = realizedLists(data);
-  if(!profits.length) return '<b>Top Profits (realized)</b>\nNo items';
-  const out=['<b>Top Profits (realized)</b>',''];
-  for(const p of profits){
-    out.push(`• ${esc(p.symbol)} — 🟢`);
-    out.push(`🟢 +${fmt4(p.realized)} ETH (🟢 +${fmt4(p.pct)}%)`);
-    out.push(`Bought ${fmt4(p.buys)} ETH`);
-    out.push(`Sold ${fmt4(p.sells)} ETH`);
-    out.push('');
-  }
-  return out.join('\n');
-}
-function renderLosses(data){
-  const {losses} = realizedLists(data);
-  if(!losses.length) return '<b>Top Losses (realized)</b>\nNo items';
-  const out=['<b>Top Losses (realized)</b>',''];
-  for(const p of losses){
-    out.push(`• ${esc(p.symbol)} — 🔴`);
-    out.push(`🔴 −${fmt4(Math.abs(p.realized))} ETH (🔴 -${fmt4(Math.abs(p.pct))}%)`);
-    out.push(`Bought ${fmt4(p.buys)} ETH`);
-    out.push(`Sold ${fmt4(p.sells)} ETH`);
-    out.push('');
-  }
-  return out.join('\n');
-}
-function humanQty(unitsStr,decimals){
-  try{
-    const q=BigInt(unitsStr||'0'); const scale=10n**BigInt(decimals||18);
-    const n=Number(q)/Number(scale||1n);
-    if (n<10000) return n.toLocaleString(undefined,{maximumFractionDigits:4});
-    const k=n/1e3; if(k<1000) return `${(Math.round(k*100)/100).toLocaleString(undefined,{maximumFractionDigits:2})}k`;
-    const m=n/1e6; return `${(Math.round(m*100)/100).toLocaleString(undefined,{maximumFractionDigits:2})}m`;
-  }catch{ return '0'; }
-}
-function renderOpen(data){
-  const items=data.derived?.open||[];
-  if(!items.length) return '<b>Open Positions</b>\nNo items';
-  const out=['<b>Open Positions</b>',''];
-  for(const t of items){
-    out.push(`• ${esc(t.symbol)} — ${fmtUsd(t.usdValueRemaining||0)}`);
-    out.push(`Holdings: ${humanQty(t.remaining, t.decimals)}`);
-    out.push('');
-  }
-  return out.join('\n');
-}
-function renderAirdrops(data){
-  const tokenDrops = (data.derived?.airdrops||[]);
-  const nftDrops   = (data.derived?.nftAirdrops||[]);
-  const out=['<b>Airdrops</b>',''];
-  if(!tokenDrops.length && !nftDrops.length) return out.join('\n')+'No items';
-
-  if (tokenDrops.length){
-    out.push('<i>Tokens</i>');
-    for(const d of tokenDrops) out.push(`• ${esc(d.symbol)} — est ${fmtUsd(d.estUsd||0)}`);
-    out.push('');
-  }
-  if (nftDrops.length){
-    out.push('<i>NFTs</i>');
-    for(const n of nftDrops) out.push(`• ${esc(n.name)} — qty ${n.qty}`);
-  }
-  return out.join('\n');
-}
-
-export function renderPNL(data, window='30d', view='overview'){
-  const wallet = String(data.wallet).toLowerCase();
-  let text='';
-  switch(view){
-    case 'profits': text = renderProfits(data); break;
-    case 'losses':  text = renderLosses(data);  break;
-    case 'open':    text = renderOpen(data);    break;
-    case 'airdrops':text = renderAirdrops(data);break;
-    default:        text = renderOverview(data, window);
-  }
   return {
-    text,
-    extra: {
-      parse_mode:'HTML',
-      disable_web_page_preview:true,
-      reply_markup: keyboard(wallet, window, view)
-    }
+    reply_markup: { inline_keyboard: [ row1, row2, row3 ] }
   };
+}
+
+export function renderPNL(data, window='30d', view='overview') {
+  const hdr = buildHeader(data, window);
+  const { pos, neg } = rankTop(data.tokens || []);
+
+  if (view === 'profits') {
+    const body = pos.map(lineRealized).join('\n') || 'No items';
+    return { text: [hdr, `<b>Profits (realized, ordered)</b>`, body].join('\n'),
+             extra: viewButtons(data.wallet, window, 'profits') };
+  }
+  if (view === 'losses') {
+    const body = neg.map(lineRealized).join('\n') || 'No items';
+    return { text: [hdr, `<b>Losses (realized, ordered)</b>`, body].join('\n'),
+             extra: viewButtons(data.wallet, window, 'losses') };
+  }
+  if (view === 'open') {
+    const opens = (data.derived?.open||[]).slice().sort((a,b)=> (b.usdValueRemaining||0)-(a.usdValueRemaining||0));
+    const body = opens.map(o=>{
+      const heldU = abbrTokens(o.remaining, o.decimals);
+      const val = `$${(o.usdValueRemaining||0).toFixed(2)}`;
+      // % vs avg buy = if inventoryCost>0 then (MTM / inventoryCost - 1)*100
+      const invCost = Number(o.inventoryCostWeth||0);
+      const mtm = Number(o.unrealizedWeth||0) + invCost;
+      const p = invCost>0 ? ((mtm/invCost - 1)*100) : 0;
+      return `• ${esc(o.symbol||'—')} — ${heldU}\nValue ${val}  ·  ${p>=0?`🟢 +${p.toFixed(2)}%`:`🔴 ${p.toFixed(2)}%`}`;
+    }).join('\n\n') || 'No open positions ≥ $1';
+    return { text: [hdr, `<b>Open Positions</b>`, body].join('\n'),
+             extra: viewButtons(data.wallet, window, 'open') };
+  }
+  if (view === 'airdrops') {
+    const lines = [];
+    const erc20Drops = (data.tokens||[]).filter(t => (t.airdrops?.count||0)>0);
+    if (erc20Drops.length) {
+      lines.push('<b>Token Airdrops</b>');
+      lines.push(
+        erc20Drops.map(t=>{
+          const units = abbrTokens(t.airdrops.units, t.decimals);
+          const usd = `$${(t.airdrops.estUsd||0).toFixed(2)}`;
+          return `• ${esc(t.symbol||'—')} — ${units}  (${usd})`;
+        }).join('\n')
+      );
+    }
+    const txt = lines.length ? lines.join('\n') : 'No airdrops recorded.';
+    return { text: [hdr, txt].join('\n'), extra: viewButtons(data.wallet, window, 'airdrops') };
+  }
+
+  // overview
+  const top = renderTopSection(pos, neg, 3, 3);
+  return { text: [hdr, top].join('\n'), extra: viewButtons(data.wallet, window, 'overview') };
 }
