@@ -2,7 +2,7 @@
 // Etherscan v2 helpers for Abstract (chainid=2741)
 
 const BASE = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
-const CHAIN_ID = process.env.ETHERSCAN_CHAIN_ID || '56';
+const CHAIN_ID = process.env.ETHERSCAN_CHAIN_ID || '137';
 const API_KEY = process.env.ETHERSCAN_API_KEY || process.env.ETHERSCAN_APIKEY || '';
 
 function qs(obj) {
