@@ -32,34 +32,63 @@ const KNOWN_ROUTERS = new Set([
   '0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f'.toLowerCase(), // TG bot forwarder (user provided)
 ]);
 
-// ---------- Etherscan throttled client ----------
+// ----- Etherscan throttled client (safe @ <5/sec) -----
 const httpES = axios.create({ baseURL: ES_BASE, timeout: 45_000 });
-const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
-const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS);
+
+// If you set ETHERSCAN_RPS=5, we still keep a safety margin below 5/sec.
+const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 4)); // default 4/sec
+const SAFETY_GAP_MS = 60;                            // small margin over ideal interval
+const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS) + SAFETY_GAP_MS;
+
 let esLastTs = 0;
 let esChain = Promise.resolve();
 
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
 async function throttleES() {
   await (esChain = esChain.then(async () => {
-    const wait = Math.max(0, esLastTs + ES_MIN_INTERVAL - Date.now());
-    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    const now = Date.now();
+    // add tiny jitter so bursts don't align on the same millisecond
+    const jitter = Math.floor(Math.random()*25); // 0–24ms
+    const wait = Math.max(0, esLastTs + ES_MIN_INTERVAL - now + jitter);
+    if (wait > 0) await sleep(wait);
     esLastTs = Date.now();
   }));
 }
-function esParams(params) { return { params: { chainid: ES_CHAIN, apikey: ES_KEY, ...params } }; }
+
+function esParams(params) {
+  return { params: { chainid: ES_CHAIN, apikey: ES_KEY, ...params } };
+}
+
 async function esGET(params) {
+  // global throttle
   await throttleES();
-  const maxAttempts = 3;
-  for (let a=1; a<=maxAttempts; a++) {
+
+  const maxAttempts = 5; // a bit more forgiving on bursts
+  for (let a = 1; a <= maxAttempts; a++) {
     try {
       const { data } = await httpES.get('', esParams(params));
       if (data?.status === '1') return data.result;
-      const msg = data?.result || data?.message || 'Etherscan error';
+
+      const msg = String(data?.result || data?.message || 'Etherscan error');
+      // Specific handling for rate limit
+      if (/Max calls per sec/i.test(msg) || /rate limit/i.test(msg)) {
+        // exponential-ish backoff + extra cushion
+        await sleep(250 * a + 150);
+        continue;
+      }
+
       if (a === maxAttempts) throw new Error(msg);
-    } catch (e) { if (a === maxAttempts) throw e; }
-    await new Promise(r => setTimeout(r, 300*a));
+    } catch (e) {
+      // network/timeout — backoff and retry
+      if (a === maxAttempts) throw e;
+      await sleep(300 * a);
+    }
   }
+  // Should not reach here
+  throw new Error('Etherscan: unexpected retry fallthrough');
 }
+
 
 // ---------- Quotes (Dexscreener) ----------
 async function getUsdQuote(ca) {
@@ -212,13 +241,17 @@ async function computePnL(wallet, { sinceTs=0 }) {
   }
 
   // Internal tx by hash (lazy cache; only for hashes that include a token transfer)
-  const allHashes = new Set();
-  for (const arr of tokenTxsByToken.values()) for (const r of arr) allHashes.add(String(r.hash));
-  const internalMap = new Map(); // hash => [{from,to,value},...]
-  await Promise.all([...allHashes].map(async (h) => {
-    const inTx = await getInternalByHash(h);
-    internalMap.set(h, Array.isArray(inTx) ? inTx : []);
-  }));
+const allHashes = new Set();
+for (const arr of tokenTxsByToken.values()) {
+  for (const r of arr) allHashes.add(String(r.hash));
+}
+const internalMap = new Map();
+// sequential to avoid any burstiness
+for (const h of allHashes) {
+  const inTx = await getInternalByHash(h);
+  internalMap.set(h, Array.isArray(inTx) ? inTx : []);
+}
+
 
   const perToken = [];
   const processedByTokenHashSide = new Set(); // dedupe “counted already” pairs
