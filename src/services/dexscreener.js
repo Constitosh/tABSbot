@@ -59,7 +59,7 @@ export async function getDexscreenerTokenStats(ca) {
 
   // ---- IMPORTANT: use unique variable names (no duplicate "pairs") ----
   const allPairs = Array.isArray(data?.pairs) ? data.pairs : [];
-  const abstractPairs = allPairs.filter(p => p?.chainId === 'bsc');
+  const abstractPairs = allPairs.filter(p => p?.chainId === 'polygon');
 
   // pick AMM & Moonshot
   const { bestAMM, moon } = choosePairs(abstractPairs);
