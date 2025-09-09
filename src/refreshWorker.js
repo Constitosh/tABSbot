@@ -12,6 +12,19 @@ import { Worker, Queue } from 'bullmq';
 
 import { setJSON, withLock } from './cache.js';
 import { getDexscreenerTokenStats } from './services/dexscreener.js';
+// wherever you build the token “summary” object used by /stats:
+import { buildHoldersSnapshot } from './holdersIndex.js';
+
+// ...
+const snap = await buildHoldersSnapshot(tokenAddress);
+// Merge into your summary object:
+summary.holdersCount       = snap.holdersCount;
+summary.holdersTop20       = snap.holdersTop20;
+summary.top10CombinedPct   = snap.top10CombinedPct;
+summary.burnedPct          = snap.burnedPct;
+// Optional (lets renderers show “all holders” stats):
+summary.holdersAllPerc     = snap.holdersAllPerc;
+
 
 // ---------- Dexscreener helpers ----------
 async function getDexCreator(ca) {
