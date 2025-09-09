@@ -9,8 +9,6 @@ import { isAddress } from './util.js';
 // PNL imports (queue optional; see notes below)
 import { refreshPnl } from './pnlWorker.js'; // ⬅ only refreshPnl to avoid export mismatch
 import { renderPNL } from './renderers_pnl.js';
-import { analyzeBundlesForToken } from './services/bundles.js';
-import { renderBundlesView } from './renderers_bundles.js';
 
 // --- Bot with longer handler timeout + global error catcher ---
 const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 15_000 });
@@ -203,31 +201,6 @@ bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
   } catch (e) {
     console.error('[stats/buyers/holders cb] error:', e?.response?.description || e);
     try { await ctx.answerCbQuery('Error — try again', { show_alert: true }); } catch {}
-  }
-});
-
-    // bundle view (on-demand)
-bot.action(/^bundles:/, async (ctx) => {
-  try {
-    const [, ca] = ctx.callbackQuery.data.split(':');
-    const data = await analyzeBundlesForToken(ca, { force: false });
-    const { text, extra } = renderBundlesView(data);
-    return ctx.editMessageText(text, { ...extra, parse_mode:'HTML', disable_web_page_preview:true });
-  } catch (e) {
-    console.error(e);
-    return ctx.answerCbQuery('Bundle scan failed', { show_alert:true });
-  }
-});
-
-bot.action(/^bundles_refresh:/, async (ctx) => {
-  try {
-    const [, ca] = ctx.callbackQuery.data.split(':');
-    const data = await analyzeBundlesForToken(ca, { force: true });
-    const { text, extra } = renderBundlesView(data);
-    return ctx.editMessageText(text, { ...extra, parse_mode:'HTML', disable_web_page_preview:true });
-  } catch (e) {
-    console.error(e);
-    return ctx.answerCbQuery('Rescan failed', { show_alert:true });
   }
 });
 
