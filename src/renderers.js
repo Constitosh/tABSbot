@@ -306,7 +306,7 @@ export function renderBuyers(data, page = 1, pageSize = 10) {
     default: return status || 'N/A';
   }
 }
-    return `${n}. <code>${esc(shortAddr(r.address))}</code> — ${esc(r.status)}`;
+    return `${n}. <code>${esc(shortAddr(r.address))}</code> — ${formatStatus(r.status)}`;
   }).join('\n') || '<i>No buyers found yet</i>';
 
   const totalPages = Math.ceil((data.first20Buyers || []).length / pageSize) || 1;
