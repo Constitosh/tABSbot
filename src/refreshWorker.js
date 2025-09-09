@@ -597,6 +597,22 @@ export async function refreshToken(tokenAddress) {
       console.log('[WORKER] compute failed:', e?.message || e);
     }
 
+    // --- STEP S: Build full holders snapshot (percents for all holders + supply/decimals) ---
+    // This is where you add the 'const snap' and merge into the final payload.
+    let holdersAllPerc = [];
+    let totalSupply = String(totalSupplyRaw || '0');
+    let decimals = 18;
+
+    try {
+      const snap = await buildHoldersSnapshot(ca);
+      // Merge only if provided (keeps backward compatibility)
+      if (Array.isArray(snap?.holdersAllPerc)) holdersAllPerc = snap.holdersAllPerc;
+      if (snap?.totalSupply) totalSupply = String(snap.totalSupply);
+      if (typeof snap?.decimals === 'number') decimals = snap.decimals;
+    } catch (e) {
+      console.log('[WORKER] holders snapshot failed:', e?.message || e);
+    }
+
     // 4) Final payload
     const payload = {
       tokenAddress: ca,
@@ -612,6 +628,11 @@ export async function refreshToken(tokenAddress) {
       first20Buyers,
 
       creator: { address: creatorAddr, percent: creatorPercent },
+
+      // <-- NEW fields used by Distribution tab and other analytics
+      holdersAllPerc,           // array of % per holder (may be empty if not yet indexed)
+      totalSupply,              // string (raw)
+      decimals,                 // number
     };
 
     // 5) Cache
@@ -629,6 +650,7 @@ export async function refreshToken(tokenAddress) {
     return payload;
   });
 }
+
 
 // ---------- Worker (consumer) ----------
 new Worker(
