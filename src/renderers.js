@@ -158,7 +158,17 @@ export function renderBuyers(data, page = 1, pageSize = 10) {
 
   const body = rows.map((r, i) => {
     const n = String(start + i + 1).padStart(2, '0');
-    return `${n}. <code>${esc(shortAddr(r.address))}</code> — ${esc(r.status)}`;
+    function formatStatus(status) {
+  switch ((status || '').toLowerCase()) {
+    case 'hold': return '🟢 Hold';
+    case 'sold all': return '🔴 Sold All';
+    case 'sold some': return '🟠 Sold Some';
+    case 'bought more': return '🔵 Bought More';
+    default: return status || 'N/A';
+  }
+}
+
+   return `${n}. <code>${esc(shortAddr(r.address))}</code> — ${formatStatus(r.status)}`;
   }).join('\n') || '<i>No buyers found yet</i>';
 
   const totalPages = Math.ceil((data.first20Buyers || []).length / pageSize) || 1;
