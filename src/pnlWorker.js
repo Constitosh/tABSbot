@@ -1,57 +1,40 @@
 // src/pnlWorker.js
-// Accurate average-cost PnL for Abstract chain — ETH+WETH merged
-// - Realized = proceeds - costOfSold (avg cost)
-// - Unrealized = MTM(remaining) - remainingCost (avg cost)
-// - Token BUY = wallet receives ERC20 units; SELL = wallet sends ERC20 units
-// - Pair proceeds/costs with ETH or WETH legs at TX-HASH level, plus INTERNAL TX by TX-HASH (router/relayer settlement)
-// - Bonding-phase: from===tokenContract & zero-ETH -> treated as buy at zero cost (not an airdrop)
-// - Airdrops: ERC20 = inbound token w/ zero-ETH and not from token contract; ERC721 inbound (zero-ETH) aggregated by collection
-// - Trade-only ETH in/out: only ETH/WETH connected to a token transfer are counted
-// - Open positions filtered by USD >= $1; ETH/WETH hidden in open list
-// - Exports: refreshPnl(wallet, window)
+// PnL engine for /pnl <wallet>
+// - Unifies ETH + WETH
+// - Per-tx join: token in/out ↔ ETH(+WETH) out/in (same txhash), with a safe fallback
+// - Average price method (moving average / single bucket) for realized PnL
+// - Dust (<5 tokens) => treat as fully closed
+// - Open positions show token holdings + $ value only (no ETH on that page)
+// - Etherscan v2 (5 rps throttle). Dexscreener only for pricing of open positions + quick labels
+//
+// Exports:
+//   export async function refreshPnl(wallet, window = '30d')
+//
+// Used by: renderers_pnl.js
 
 import './configEnv.js';
 import axios from 'axios';
-import Redis from 'ioredis';
-import { withLock, getJSON, setJSON } from './cache.js';
 
-// ---------- Config / Env ----------
+// ---------- Config ----------
+
+// Etherscan V2 (Abstract)
 const ES_BASE  = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
 const ES_KEY   = process.env.ETHERSCAN_API_KEY;
-const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741';
-const ALCHEMY_URL = process.env.ALCHEMY_URL || ''; // optional
-const REDIS_URL   = process.env.REDIS_URL;
+const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741'; // Abstract chain-id
 
-if (!ES_KEY) console.warn('[PNL] ETHERSCAN_API_KEY missing (will fail to fetch)');
+if (!ES_KEY) console.warn('[PNL] ETHERSCAN_API_KEY is missing — set it in env');
 
-const WETH = '0x3439153eb7af838ad19d56e1571fbd09333c2809'.toLowerCase();
-
-// Routers / relayers / TG bot forwarders observed on Abstract
-const KNOWN_ROUTERS = new Set([
-  '0x0d6848e39114abe69054407452b8aab82f8a44ba'.toLowerCase(), // Moonshot router/bonding
-  '0x1c4ae91dfa56e49fca849ede553759e1f5f04d9f'.toLowerCase(), // TG bot forwarder (user provided)
-]);
-
-// ----- Etherscan throttled client (safe @ <5/sec) -----
 const httpES = axios.create({ baseURL: ES_BASE, timeout: 45_000 });
 
-// If you set ETHERSCAN_RPS=5, we still keep a safety margin below 5/sec.
-const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 4)); // default 4/sec
-const SAFETY_GAP_MS = 60;                            // small margin over ideal interval
-const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS) + SAFETY_GAP_MS;
-
+// 5 calls/sec max (200ms per call)
+const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
+const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS);
 let esLastTs = 0;
 let esChain = Promise.resolve();
-
-function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-
 async function throttleES() {
   await (esChain = esChain.then(async () => {
-    const now = Date.now();
-    // add tiny jitter so bursts don't align on the same millisecond
-    const jitter = Math.floor(Math.random()*25); // 0–24ms
-    const wait = Math.max(0, esLastTs + ES_MIN_INTERVAL - now + jitter);
-    if (wait > 0) await sleep(wait);
+    const wait = Math.max(0, esLastTs + ES_MIN_INTERVAL - Date.now());
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
     esLastTs = Date.now();
   }));
 }
@@ -59,421 +42,565 @@ async function throttleES() {
 function esParams(params) {
   return { params: { chainid: ES_CHAIN, apikey: ES_KEY, ...params } };
 }
-
-async function esGET(params) {
-  // global throttle
+async function esGET(params, { tag = '' } = {}) {
   await throttleES();
-
-  const maxAttempts = 5; // a bit more forgiving on bursts
+  const maxAttempts = 3;
   for (let a = 1; a <= maxAttempts; a++) {
     try {
       const { data } = await httpES.get('', esParams(params));
       if (data?.status === '1') return data.result;
-
-      const msg = String(data?.result || data?.message || 'Etherscan error');
-      // Specific handling for rate limit
-      if (/Max calls per sec/i.test(msg) || /rate limit/i.test(msg)) {
-        // exponential-ish backoff + extra cushion
-        await sleep(250 * a + 150);
-        continue;
-      }
-
+      const msg = data?.result || data?.message || 'ES v2 unknown error';
       if (a === maxAttempts) throw new Error(msg);
     } catch (e) {
-      // network/timeout — backoff and retry
       if (a === maxAttempts) throw e;
-      await sleep(300 * a);
     }
+    await new Promise(r => setTimeout(r, 300 * a));
   }
-  // Should not reach here
-  throw new Error('Etherscan: unexpected retry fallthrough');
 }
 
+// Dexscreener (for pricing & names)
+const httpDS = axios.create({ timeout: 15_000 });
 
-// ---------- Quotes (Dexscreener) ----------
-async function getUsdQuote(ca) {
+// If you know Abstract WETH addresses, list them here or via ENV (comma-separated)
+const WETH_SET = new Set(
+  String(process.env.PNL_WETH_ADDRESSES || '')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean)
+);
+
+// Also treat tokenSymbol === 'WETH' as WETH unless explicitly disabled
+const USE_SYMBOL_DETECT_WETH = true;
+
+// Dust threshold: < 5 tokens considered "closed"
+const DUST_THRESHOLD = 5n;
+
+// ---------- Helpers ----------
+const toBig = (x) => BigInt(String(x));
+const ONE_E18 = 10n ** 18n;
+
+function shortAddr(a) {
+  if (!a) return '';
+  const s = String(a);
+  return s.slice(0, 6) + '…' + s.slice(-4);
+}
+function round4(x) {
+  if (!Number.isFinite(x)) return '0.0000';
+  return (Math.round(x * 1e4) / 1e4).toFixed(4);
+}
+function kfmt(num) {
+  // 10000 -> "10k", 135450 -> "135.45k", 3340000 -> "3.34m"
+  const n = Number(num);
+  if (!Number.isFinite(n)) return '0';
+  if (Math.abs(n) < 10_000) return String(Math.round(n * 100) / 100);
+  if (Math.abs(n) < 1_000_000) return (Math.round(n / 10) / 100).toFixed(2) + 'k';
+  if (Math.abs(n) < 1_000_000_000) return (Math.round(n / 10_000) / 100).toFixed(2) + 'm';
+  return (Math.round(n / 10_000_000) / 100).toFixed(2) + 'b';
+}
+function parseWindow(win) {
+  const now = Math.floor(Date.now() / 1000);
+  if (win === '24h') return now - 24 * 3600;
+  if (win === '7d')  return now - 7  * 24 * 3600;
+  if (win === '30d') return now - 30 * 24 * 3600;
+  if (win === '90d') return now - 90 * 24 * 3600;
+  return 0; // 'all'
+}
+
+function bnToNum(raw, decimals) {
   try {
-    const { data } = await axios.get(`https://api.dexscreener.com/tokens/v1/abstract/${ca}`, { timeout: 15_000 });
-    if (Array.isArray(data) && data.length > 0) return { priceUsd: Number(data[0]?.priceUsd || 0) || 0 };
-    return { priceUsd: Number(data?.priceUsd || 0) || 0 };
-  } catch { return { priceUsd: 0 }; }
-}
-async function getWethQuote(ca) {
-  try {
-    const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${ca}`, { timeout: 15_000 });
-    const ps = Array.isArray(data?.pairs) ? data.pairs : [];
-    const abs = ps.filter(p => p?.chainId === 'abstract');
-    abs.sort((a,b) =>
-      (Number(b?.liquidity?.usd||0) - Number(a?.liquidity?.usd||0)) ||
-      (Number(b?.volume?.h24||0)    - Number(a?.volume?.h24||0))
-    );
-    const best = abs[0];
-    return { priceWeth: Number(best?.priceNative || 0) || 0 };
-  } catch { return { priceWeth: 0 }; }
-}
-async function getQuotes(ca) {
-  const [{ priceUsd }, { priceWeth }] = await Promise.all([ getUsdQuote(ca), getWethQuote(ca) ]);
-  return { priceUsd, priceWeth };
+    const bi = toBig(raw);
+    const d  = BigInt(Math.max(0, Number(decimals || 18)));
+    if (d === 0n) return Number(bi);
+    const base = 10n ** d;
+    const whole = bi / base;
+    const frac  = Number(bi % base) / Number(base);
+    return Number(whole) + frac;
+  } catch {
+    return 0;
+  }
 }
 
-// ---------- Wallet history ----------
-async function getWalletERC20Txs(wallet, { fromTs=0 }={}) {
-  wallet = wallet.toLowerCase();
-  let page = 1;
-  const PAGE = 1000;
+// ---------- Fetch account activity ----------
+async function getTokentxByAddress(address, { pageSize = 100, maxPages = 100 } = {}) {
   const out = [];
-  while (true) {
-    const res = await esGET({
-      module: 'account', action: 'tokentx', address: wallet,
-      page, offset: PAGE, sort: 'asc', startblock: 0, endblock: 999999999
+  for (let page = 1; page <= maxPages; page++) {
+    const batch = await esGET({
+      module: 'account',
+      action: 'tokentx',
+      address,
+      page,
+      offset: pageSize,
+      startblock: 0,
+      endblock: 9_223_372_036,
+      sort: 'asc'
     });
-    if (!Array.isArray(res) || res.length === 0) break;
-    for (const r of res) { if (Number(r.timeStamp || 0) >= fromTs) out.push(r); }
-    if (res.length < PAGE) break;
-    page++; if (page > 50) break;
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    out.push(...batch);
+    if (batch.length < pageSize) break;
   }
   return out;
 }
-async function getWalletNormalTxs(wallet, { fromTs=0 }={}) {
-  wallet = wallet.toLowerCase();
-  let page = 1;
-  const PAGE = 5000;
+async function getTxList(address, { pageSize = 100, maxPages = 100 } = {}) {
   const out = [];
-  while (true) {
-    const res = await esGET({
-      module: 'account', action: 'txlist', address: wallet,
-      page, offset: PAGE, sort: 'asc', startblock: 0, endblock: 999999999
+  for (let page = 1; page <= maxPages; page++) {
+    const batch = await esGET({
+      module: 'account',
+      action: 'txlist',
+      address,
+      page,
+      offset: pageSize,
+      startblock: 0,
+      endblock: 9_223_372_036,
+      sort: 'asc'
     });
-    if (!Array.isArray(res) || res.length === 0) break;
-    for (const r of res) { if (Number(r.timeStamp || 0) >= fromTs) out.push(r); }
-    if (res.length < PAGE) break;
-    page++; if (page > 10) break;
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    out.push(...batch);
+    if (batch.length < pageSize) break;
   }
   return out;
 }
-// Etherscan internal tx BY HASH (most precise to pair router/relayer ETH)
-async function getInternalByHash(hash) {
-  const key = `intx:${hash}`;
-  const cached = await getJSON(key);
-  if (cached) return cached;
-  const res = await esGET({ module:'account', action:'txlistinternal', txhash: hash });
-  await setJSON(key, res || [], 600);
-  return res || [];
-}
-async function getEthBalance(wallet) {
-  try {
-    const r = await esGET({ module: 'account', action: 'balance', address: wallet, tag: 'latest' });
-    const s = typeof r === 'string' ? r : (r?.result || '0');
-    return s;
-  } catch { return '0'; }
-}
-
-// ---------- Optional: Alchemy balances (erc20) ----------
-async function getAlchemyBalances(wallet) {
-  if (!ALCHEMY_URL) return null;
-  try {
-    const { data } = await axios.post(ALCHEMY_URL, {
-      id: 1, jsonrpc: '2.0', method: 'alchemy_getTokenBalances',
-      params: [ wallet, 'erc20' ]
-    }, { timeout: 20_000, headers: { 'Accept':'application/json','Content-Type':'application/json' }});
-    return Array.isArray(data?.result?.tokenBalances) ? data.result.tokenBalances : null;
-  } catch { return null; }
-}
-
-// ---------- Math helpers ----------
-const toBig = (x) => BigInt(String(x||'0'));
-const add   = (a,b) => (a||0n) + (b||0n);
-
-// ---------- Core compute ----------
-async function computePnL(wallet, { sinceTs=0 }) {
-  wallet = wallet.toLowerCase();
-
-  const [erc20, normal, ethBalWeiStr] = await Promise.all([
-    getWalletERC20Txs(wallet, { fromTs: sinceTs }),
-    getWalletNormalTxs(wallet, { fromTs: sinceTs }),
-    getEthBalance(wallet),
-  ]);
-  const ethBalanceFloat = Number(ethBalWeiStr) / 1e18;
-
-  // Map txHash => ETH/WETH net (from normal + erc20 WETH + internal)
-  const ethDeltaByHash = new Map(); // +in/-out wei (native)
-  const wethDeltaByHash = new Map(); // +in/-out wei (weth erc20)
-  const blockEthNet = new Map();
-  const blockWethNet = new Map();
-
-  // Normal (native)
-  for (const tx of normal) {
-    const hash = String(tx.hash);
-    const bn   = Number(tx.blockNumber||0);
-    const from = String(tx.from||'').toLowerCase();
-    const to   = String(tx.to||'').toLowerCase();
-    const val  = toBig(tx.value||'0');
-    let d = 0n;
-    if (to === wallet && val > 0n) d = val; else if (from === wallet && val > 0n) d = -val;
-    if (d !== 0n) {
-      ethDeltaByHash.set(hash, add(ethDeltaByHash.get(hash), d));
-      blockEthNet.set(bn, add(blockEthNet.get(bn), d));
-    }
+async function getInternalByAddress(address, { pageSize = 100, maxPages = 100 } = {}) {
+  const out = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const batch = await esGET({
+      module: 'account',
+      action: 'txlistinternal',
+      address,
+      page,
+      offset: pageSize,
+      startblock: 0,
+      endblock: 9_223_372_036,
+      sort: 'asc'
+    });
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    out.push(...batch);
+    if (batch.length < pageSize) break;
   }
+  return out;
+}
 
-  // ERC20 (WETH leg + group other tokens)
-  const tokenTxsByToken = new Map();
-  for (const r of erc20) {
-    const hash  = String(r.hash);
-    const bn    = Number(r.blockNumber||0);
-    const token = String(r.contractAddress||'').toLowerCase();
-    const to    = String(r.to||'').toLowerCase();
-    const from  = String(r.from||'').toLowerCase();
-    const v     = toBig(r.value||'0');
-
-    if (token === WETH) {
-      let d = 0n;
-      if (to === wallet) d = v; else if (from === wallet) d = -v;
-      if (d !== 0n) {
-        wethDeltaByHash.set(hash, add(wethDeltaByHash.get(hash), d));
-        blockWethNet.set(bn, add(blockWethNet.get(bn), d));
+// ---------- Dexscreener helpers ----------
+async function getTokenPairsBulk(tokenAddresses /* array of 0x.. */) {
+  // dexscreener lets multiple tokens: /latest/dex/tokens/<comma>
+  const uniq = [...new Set(tokenAddresses.map(s => s.toLowerCase()))];
+  if (!uniq.length) return {};
+  const chunks = [];
+  const out = {};
+  for (let i = 0; i < uniq.length; i += 20) chunks.push(uniq.slice(i, i + 20)); // be kind
+  for (const group of chunks) {
+    const url = `https://api.dexscreener.com/latest/dex/tokens/${group.join(',')}`;
+    try {
+      const { data } = await httpDS.get(url);
+      const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
+      // pick the best Abstract pair per token
+      const best = {};
+      for (const p of pairs) {
+        if (String(p?.chainId) !== 'abstract') continue;
+        const ca = String(p?.baseToken?.address || '').toLowerCase();
+        if (!ca) continue;
+        const score = Number(p?.liquidity?.usd || 0) + Number(p?.volume?.h24 || 0);
+        if (!best[ca] || score > best[ca].score) {
+          best[ca] = {
+            score,
+            symbol: p?.baseToken?.symbol || '',
+            name: p?.baseToken?.name || '',
+            priceUsd: Number(p?.priceUsd || 0),
+          };
+        }
       }
+      for (const [ca, v] of Object.entries(best)) out[ca] = v;
+    } catch {
+      // ignore this chunk
+    }
+  }
+  return out; // { ca -> {symbol,name,priceUsd} }
+}
+
+// ---------- Tx join + trade extraction ----------
+function detectWeth(contractAddress, tokenSymbol) {
+  const ca = String(contractAddress || '').toLowerCase();
+  if (WETH_SET.has(ca)) return true;
+  if (USE_SYMBOL_DETECT_WETH && String(tokenSymbol).toUpperCase() === 'WETH') return true;
+  return false;
+}
+
+export async function refreshPnl(wallet, window = '30d') {
+  const acct = String(wallet || '').trim().toLowerCase();
+  if (!/^0x[a-f0-9]{40}$/.test(acct)) throw new Error('Bad wallet');
+
+  const sinceTs = parseWindow(window);
+
+  // 1) Pull account activity
+  const [tokentx, normal, internal] = await Promise.all([
+    getTokentxByAddress(acct),
+    getTxList(acct),
+    getInternalByAddress(acct)
+  ]);
+
+  // Build per-hash envelope
+  // txmap[hash] = {
+  //   ts,
+  //   ethInWei, ethOutWei,
+  //   tokenDeltas: { [token]: { deltaRaw(bigint), decimals, symbol, name } }
+  // }
+  const txmap = new Map();
+
+  // normal ETH (top-level value)
+  for (const t of normal) {
+    const h = t.hash;
+    const ts = Number(t.timeStamp || 0);
+    const from = String(t.from || '').toLowerCase();
+    const to   = String(t.to   || '').toLowerCase();
+    const valWei = toBig(t.value || '0');
+
+    let rec = txmap.get(h);
+    if (!rec) txmap.set(h, rec = { ts, ethInWei: 0n, ethOutWei: 0n, tokenDeltas: {} });
+
+    if (from === acct && valWei > 0n) rec.ethOutWei += valWei;
+    if (to   === acct && valWei > 0n) rec.ethInWei  += valWei;
+    if (!rec.ts) rec.ts = ts;
+  }
+
+  // internal ETH (router → wallet for sells, wallet → contract for buys, etc.)
+  for (const i of internal) {
+    const h = i.hash;
+    const ts = Number(i.timeStamp || 0);
+    const from = String(i.from || '').toLowerCase();
+    const to   = String(i.to   || '').toLowerCase();
+    const valWei = toBig(i.value || '0');
+
+    let rec = txmap.get(h);
+    if (!rec) txmap.set(h, rec = { ts, ethInWei: 0n, ethOutWei: 0n, tokenDeltas: {} });
+
+    if (from === acct && valWei > 0n) rec.ethOutWei += valWei;
+    if (to   === acct && valWei > 0n) rec.ethInWei  += valWei;
+    if (!rec.ts) rec.ts = ts;
+  }
+
+  // token transfers (ERC20 + WETH unify)
+  for (const ev of tokentx) {
+    const h  = ev.hash;
+    const ts = Number(ev.timeStamp || 0);
+    const from = String(ev.from || '').toLowerCase();
+    const to   = String(ev.to   || '').toLowerCase();
+    const ca   = String(ev.contractAddress || '').toLowerCase();
+    const sym  = String(ev.tokenSymbol || '');
+    const name = String(ev.tokenName || '');
+    const dec  = Number(ev.tokenDecimal || 18);
+    const raw  = toBig(ev.value || '0');
+    if (raw === 0n) continue;
+
+    let rec = txmap.get(h);
+    if (!rec) txmap.set(h, rec = { ts, ethInWei: 0n, ethOutWei: 0n, tokenDeltas: {} });
+
+    // WETH as ETH: treat wallet WETH in/out as ethIn/ethOut (unified)
+    const isW = detectWeth(ca, sym);
+    if (isW) {
+      // wallet receiving WETH == ETH in
+      if (to === acct)  rec.ethInWei  += raw * (ONE_E18 / (10n ** BigInt(dec)));
+      if (from === acct) rec.ethOutWei += raw * (ONE_E18 / (10n ** BigInt(dec)));
+      if (!rec.ts) rec.ts = ts;
       continue;
     }
-    if (to !== wallet && from !== wallet) continue;
-    if (!tokenTxsByToken.has(token)) tokenTxsByToken.set(token, []);
-    tokenTxsByToken.get(token).push(r);
+
+    // non-WETH token delta
+    if (!rec.tokenDeltas[ca]) rec.tokenDeltas[ca] = { deltaRaw: 0n, decimals: dec, symbol: sym, name };
+    // Incoming tokens = buy(+) ; Outgoing tokens = sell(-)
+    if (to === acct)   rec.tokenDeltas[ca].deltaRaw += raw;
+    if (from === acct) rec.tokenDeltas[ca].deltaRaw -= raw;
+    if (!rec.ts) rec.ts = ts;
   }
 
-  // Internal tx by hash (lazy cache; only for hashes that include a token transfer)
-const allHashes = new Set();
-for (const arr of tokenTxsByToken.values()) {
-  for (const r of arr) allHashes.add(String(r.hash));
-}
-const internalMap = new Map();
-// sequential to avoid any burstiness
-for (const h of allHashes) {
-  const inTx = await getInternalByHash(h);
-  internalMap.set(h, Array.isArray(inTx) ? inTx : []);
-}
-
-
-  const perToken = [];
-  const processedByTokenHashSide = new Set(); // dedupe “counted already” pairs
-
-  // For trade-only ETH in/out totals
-  let tradeEthInWei  = 0n;
-  let tradeEthOutWei = 0n;
-
-  // NFT airdrops (ERC721) — minimal, by address
-  // (Optional: You can add a separate tokennfttx pull if needed; here we detect via ERC721 decimals==0 inbound with zero-ETH)
-  const nftAirdrops = new Map(); // contract => { name?, symbol?, count }
-
-  for (const [token, txs] of tokenTxsByToken.entries()) {
-    txs.sort((a,b) =>
-      (Number(a.timeStamp)-Number(b.timeStamp)) ||
-      (Number(a.blockNumber)-Number(b.blockNumber)) ||
-      (Number(a.transactionIndex||0)-Number(b.transactionIndex||0)) ||
-      (Number(a.logIndex||0)-Number(b.logIndex||0))
-    );
-
-    const { priceUsd, priceWeth } = await getQuotes(token);
-
-    let qty = 0n;              // units
-    let costWeth = 0n;         // wei cost of remaining qty
-    let realizedWeth = 0n;     // wei PnL realized
-    let buys = 0n, sells = 0n;
-
-    const tokenDecimals = Math.max(0, Number(txs[0]?.tokenDecimal ?? 18));
-    const scale = 10n ** BigInt(tokenDecimals);
-    const sym   = String(txs[0]?.tokenSymbol || '');
-
-    // Treat pure NFT (decimals 0 + huge tokenID) as collection airdrops if inbound w/ zero-ETH
-    const isProbablyNFT = tokenDecimals === 0 && !sym; // conservative
-
-    const airdrops = []; // ERC20 airdrops (units)
-
-    for (const r of txs) {
-      const hash   = String(r.hash);
-      const bn     = Number(r.blockNumber||0);
-      const to     = String(r.to||'').toLowerCase();
-      const from   = String(r.from||'').toLowerCase();
-      const amt    = toBig(r.value||'0');
-
-      // ETH/WETH hash-level legs
-      const wethHash = wethDeltaByHash.get(hash) || 0n;
-      const ethHash  = ethDeltaByHash.get(hash)  || 0n;
-
-      // Internal tx in the same hash
-      const internals = internalMap.get(hash) || [];
-      let internalNetWei = 0n;
-      for (const itx of internals) {
-        const f = String(itx.from||'').toLowerCase();
-        const t = String(itx.to||'').toLowerCase();
-        const val = toBig(itx.value||'0');
-        if (t === wallet && val > 0n) internalNetWei += val;
-        else if (f === wallet && val > 0n) internalNetWei -= val;
-      }
-
-      let paidWei = 0n, recvWei = 0n;
-      // merge native + weth + internals
-      const net = (ethHash + wethHash + internalNetWei);
-      if (net < 0n) paidWei = -net; else recvWei = net;
-
-      // If still zero and router bonding/relayer: fallback to block net
-      if (paidWei === 0n && recvWei === 0n && (KNOWN_ROUTERS.has(to) || KNOWN_ROUTERS.has(from) || to === token)) {
-        const blk = (blockEthNet.get(bn)||0n) + (blockWethNet.get(bn)||0n);
-        if (blk > 0n) recvWei = blk; else if (blk < 0n) paidWei = -blk;
-      }
-
-      // BUY (wallet receives token)
-      if (to === wallet) {
-        // Bonding buy: from === token && zero ETH in hash → zero-cost buy
-        const isBonding = (from === token) && (paidWei === 0n) && (recvWei === 0n);
-        buys += amt;
-        qty  += amt;
-        if (!isBonding) {
-          costWeth += paidWei;
-          tradeEthOutWei += paidWei; // trade-only: ETH paid for token
-        } else {
-          // still inventory, cost=0
-        }
-        continue;
-      }
-
-      // SELL (wallet sends token)
-      if (from === wallet) {
-        // If no ETH/WETH arrived here but it’s a router/relayer: recvWei may be 0 — handled above with block/internal
-        const avgCostPerUnitWei = qty > 0n ? (costWeth * 1_000_000_000_000_000_000n) / qty : 0n;
-        const sellUnits = amt > qty ? qty : amt;
-        const costOfSold = (avgCostPerUnitWei * sellUnits) / 1_000_000_000_000_000_000n;
-        realizedWeth += (recvWei - costOfSold);
-
-        // reduce inventory
-        const newQty = qty > sellUnits ? (qty - sellUnits) : 0n;
-        costWeth = newQty > 0n ? (avgCostPerUnitWei * newQty) / 1_000_000_000_000_000_000n : 0n;
-        qty = newQty;
-        sells += amt;
-
-        // trade-only ETH in (proceeds)
-        if (recvWei > 0n) tradeEthInWei += recvWei;
-        continue;
-      }
-
-      // If inbound token with zero ETH and not from token => airdrop
-      if (to === wallet && paidWei === 0n && recvWei === 0n && from !== token) {
-        airdrops.push({ hash, amount: amt });
-        qty += amt; // zero-cost inventory
-        continue;
-      }
-
-      // If outbound token with zero ETH and not router => transfer/gift: reduce qty + cost proportionally
-      if (from === wallet && paidWei === 0n && recvWei === 0n && !KNOWN_ROUTERS.has(to) && to !== token) {
-        if (qty > 0n) {
-          const avgCostPerUnitWei = (costWeth * 1_000_000_000_000_000_000n) / (qty || 1n);
-          const used = amt > qty ? qty : amt;
-          const costReduction = (avgCostPerUnitWei * used) / 1_000_000_000_000_000_000n;
-          qty -= used;
-          costWeth = costWeth > costReduction ? (costWeth - costReduction) : 0n;
-        }
-      }
-    } // tx loop
-
-    // Mark-to-market & USD
-    const qtyFloat  = Number(qty) / Number(scale || 1n);
-    const invCostW  = Number(costWeth) / 1e18;
-    const mtmW      = qtyFloat * Number(priceWeth || 0);
-    const unrealW   = mtmW - invCostW;
-    const usdValue  = qtyFloat * Number(priceUsd || 0);
-
-    // ERC20 airdrop USD
-    let aUnits = 0n;
-    for (const a of airdrops) aUnits += a.amount;
-    const adQty = Number(aUnits) / Number(scale || 1n);
-    const adUsd = adQty * Number(priceUsd || 0);
-
-    const symbolUp = sym?.toUpperCase?.() || '';
-    const isEthLike = symbolUp === 'ETH' || symbolUp === 'WETH' || token === WETH;
-
-    perToken.push({
+  // 2) Extract trades by txhash (only hashes that have exactly ONE non-WETH token involved)
+  const trades = []; // { ts, hash, token, tokenDeltaRaw, decimals, symbol, ethInWei, ethOutWei }
+  for (const [hash, rec] of txmap.entries()) {
+    if (sinceTs && rec.ts && rec.ts < sinceTs) continue;
+    const tokens = Object.keys(rec.tokenDeltas);
+    const nonZero = tokens.filter(t => txmap.get(hash).tokenDeltas[t].deltaRaw !== 0n);
+    if (nonZero.length !== 1) continue; // skip multi-token or no-token txs
+    const token = nonZero[0];
+    const info = rec.tokenDeltas[token];
+    trades.push({
+      hash,
+      ts: rec.ts || 0,
       token,
-      symbol: sym || '',
-      decimals: tokenDecimals,
-      buys: buys.toString(),
-      sells: sells.toString(),
-      remaining: qty.toString(),
-      realizedWeth: Number(realizedWeth) / 1e18,
-      inventoryCostWeth: Number(costWeth) / 1e18,
-      priceUsd: Number(priceUsd || 0),
-      priceWeth: Number(priceWeth || 0),
-      unrealizedWeth: unrealW,
-      usdValueRemaining: usdValue,
-      isEthLike,
-      airdrops: { count: airdrops.length, units: aUnits.toString(), estUsd: adUsd },
+      symbol: info.symbol || '',
+      decimals: info.decimals || 18,
+      tokenDeltaRaw: info.deltaRaw, // >0 buy, <0 sell
+      ethInWei:  rec.ethInWei,
+      ethOutWei: rec.ethOutWei,
     });
-  } // per token
-
-  // Totals
-  let totalRealized = 0, totalUnreal = 0, totalAirdropsUsd = 0, totalHoldingsUsd = 0;
-  for (const r of perToken) {
-    totalRealized += Number(r.realizedWeth) || 0;
-    totalUnreal   += Number(r.unrealizedWeth) || 0;
-    totalAirdropsUsd += Number(r.airdrops?.estUsd || 0);
-    totalHoldingsUsd += Number(r.usdValueRemaining || 0);
   }
 
-  // Merge ETH flows (trade-only)
-  const totalPnlWeth = totalRealized + totalUnreal;
-  const spentBase = Number(tradeEthOutWei) / 1e18;
-  const pnlPct = spentBase > 0 ? (totalPnlWeth / spentBase) * 100 : 0;
+  // 3) Per-token rollup with average-cost accounting
+  // positions[token] = {
+  //   symbol, decimals,
+  //   qtyBoughtRaw, qtySoldRaw,
+  //   ethSpentWei,  ethRecvWei,
+  //   realizedWei,
+  // }
+  const positions = new Map();
 
-  // Open positions (no ETH-like), USD >= $1
-  const opens = perToken.filter(t => !t.isEthLike && Number(t.remaining) > 0 && (t.usdValueRemaining || 0) >= 1);
+  function posFor(token, symbol, decimals) {
+    let p = positions.get(token);
+    if (!p) {
+      p = {
+        token,
+        symbol: symbol || '',
+        decimals: decimals || 18,
+        qtyBoughtRaw: 0n,
+        qtySoldRaw:   0n,
+        ethSpentWei:  0n,  // only for buys
+        ethRecvWei:   0n,  // only for sells
+        realizedWei:  0n
+      };
+      positions.set(token, p);
+    }
+    return p;
+  }
 
-  // Realized leaders (closed or partially realized), order applied in renderer; we provide full dataset
-  const realizedOnly = perToken
-    .filter(t => Math.abs(Number(t.realizedWeth) || 0) > 0)
-    .map(t => ({
-      token: t.token, symbol: t.symbol, realizedWeth: t.realizedWeth,
-      buyEth: Math.max(0, +(t.inventoryCostWeth || 0) + 0), // not used directly; renderer gets aggregated
-    }));
+  // Sum per tx: allocate ETH leg entirely to the single token in that tx
+  for (const tr of trades) {
+    const p = posFor(tr.token, tr.symbol, tr.decimals);
+
+    if (tr.tokenDeltaRaw > 0n) {
+      // BUY: need ETH out (or WETH out) as cost; if zero, it's likely a true airdrop/mint (no cost)
+      const ethSpent = tr.ethOutWei > 0n ? tr.ethOutWei : 0n;
+      p.qtyBoughtRaw += tr.tokenDeltaRaw;
+      p.ethSpentWei  += ethSpent;
+    } else {
+      // SELL: need ETH in as proceeds
+      const qtySold = -tr.tokenDeltaRaw;
+      const ethIn   = tr.ethInWei > 0n ? tr.ethInWei : 0n;
+      p.qtySoldRaw += qtySold;
+      p.ethRecvWei += ethIn;
+    }
+  }
+
+  // Realized PnL using average cost
+  for (const p of positions.values()) {
+    const bought = p.qtyBoughtRaw;
+    const sold   = p.qtySoldRaw;
+    const costWei = p.ethSpentWei;
+
+    if (bought > 0n && sold > 0n) {
+      const avgCostPerTokenWei = costWei === 0n ? 0n : (costWei * ONE_E18) / bought; // scaled (per 1 token in wei terms * 1e18)
+      // cost basis of sold qty = avg * sold
+      const cbSoldWei = (avgCostPerTokenWei * sold) / ONE_E18; // back to wei
+      const proceedsWei = p.ethRecvWei;
+      p.realizedWei = proceedsWei - cbSoldWei;
+    } else {
+      p.realizedWei = 0n;
+    }
+  }
+
+  // 4) Open positions & airdrops
+  // open: tokens held > 5; dust <=5 -> treat as closed
+  const tokenList = [...positions.values()];
+  const openTokens = [];
+  const realizedItems = [];
+  const priceNeeded = [];
+
+  for (const p of tokenList) {
+    const heldRaw = p.qtyBoughtRaw - p.qtySoldRaw;
+    const heldBig = heldRaw > 0n ? heldRaw : 0n;
+
+    // classify realized item (closed if held <= DUST)
+    const closed = heldBig <= DUST_THRESHOLD;
+    const boughtNum = bnToNum(p.qtyBoughtRaw, p.decimals);
+    const soldNum   = bnToNum(p.qtySoldRaw,   p.decimals);
+
+    const avgBuy = (p.qtyBoughtRaw > 0n && p.ethSpentWei > 0n)
+      ? Number(p.ethSpentWei) / 1e18 / boughtNum
+      : 0;
+
+    const realizedEth = Number(p.realizedWei) / 1e18;
+    const realizedPct = (avgBuy > 0 && soldNum > 0)
+      ? (Number(p.ethRecvWei) / 1e18 - avgBuy * soldNum) / (avgBuy * soldNum) * 100
+      : 0;
+
+    if (closed) {
+      realizedItems.push({
+        token: p.token,
+        symbol: p.symbol,
+        decimals: p.decimals,
+        buyEth: Number(p.ethSpentWei) / 1e18,
+        sellEth: Number(p.ethRecvWei) / 1e18,
+        realizedEth,
+        realizedPct
+      });
+    } else {
+      // Need $ price for open pos
+      const heldNum = bnToNum(heldBig, p.decimals);
+      openTokens.push({
+        token: p.token,
+        symbol: p.symbol,
+        decimals: p.decimals,
+        heldNum,
+        avgBuyEth: avgBuy
+      });
+      priceNeeded.push(p.token);
+    }
+  }
+
+  // 5) Price lookup for open positions (+ symbols)
+  const priceMap = await getTokenPairsBulk(priceNeeded);
+
+  // fill open with USD + implied ETH value (via priceUsd / spot ethUsd)
+  // We don’t have ETH/USD spot here — Dexscreener priceUsd is already per token.
+  let holdingsUsd = 0;
+  const openEnriched = openTokens.map(op => {
+    const info = priceMap[op.token?.toLowerCase()] || {};
+    const usd = (Number(info.priceUsd || 0) * op.heldNum) || 0;
+    holdingsUsd += usd;
+    return {
+      ...op,
+      name: info.name || '',
+      symbol: info.symbol || op.symbol || '',
+      usdNow: usd
+    };
+  });
+
+  // 6) Airdrops: token/NFT received with no ethOut in that tx
+  // Use trade list we skipped (zero token? No) + original tokentx to catch zero-cost token ins
+  // We'll detect any txhash where wallet got tokens and no ETH/WETH out.
+  const tokenAirdrops = {};
+  for (const [hash, rec] of txmap.entries()) {
+    if (sinceTs && rec.ts && rec.ts < sinceTs) continue;
+    const tokens = Object.keys(rec.tokenDeltas);
+    for (const ca of tokens) {
+      const d = rec.tokenDeltas[ca];
+      if (d.deltaRaw > 0n && rec.ethOutWei === 0n) {
+        const key = ca.toLowerCase();
+        if (!tokenAirdrops[key]) tokenAirdrops[key] = { ca: key, qtyRaw: 0n, decimals: d.decimals, symbol: d.symbol, name: d.name };
+        tokenAirdrops[key].qtyRaw += d.deltaRaw;
+      }
+    }
+  }
+  // NFT airdrops: pull ERC721 via tokennfttx (cheaper to fetch all? do small pages)
+  let nftDrops = [];
+  try {
+    // One pass of 200 events asc — enough for latest airdrops
+    const res = await esGET({
+      module: 'account',
+      action: 'tokennfttx',
+      address: acct,
+      page: 1,
+      offset: 200,
+      startblock: 0,
+      endblock: 9_223_372_036,
+      sort: 'desc'
+    });
+    if (Array.isArray(res)) {
+      const seen = new Map(); // contract -> count received (only when from != acct)
+      for (const ev of res) {
+        const ts = Number(ev.timeStamp || 0);
+        if (sinceTs && ts < sinceTs) continue;
+        const from = String(ev.from || '').toLowerCase();
+        const to   = String(ev.to   || '').toLowerCase();
+        if (to !== acct) continue;
+        // treat as airdrop if the paired tx had no ethOut
+        const rec = txmap.get(ev.hash);
+        if (rec && rec.ethOutWei === 0n) {
+          const key = String(ev.contractAddress || '').toLowerCase();
+          const name = String(ev.tokenName || '');
+          seen.set(key, {
+            contract: key,
+            name,
+            qty: (seen.get(key)?.qty || 0) + 1
+          });
+        }
+      }
+      nftDrops = [...seen.values()];
+    }
+  } catch {}
+
+  // 7) Totals (ONLY from trades we recognized)
+  let ETH_IN  = 0;
+  let ETH_OUT = 0;
+  for (const tr of trades) {
+    if (tr.tokenDeltaRaw > 0n) { // buy
+      ETH_OUT += Number(tr.ethOutWei) / 1e18;
+    } else if (tr.tokenDeltaRaw < 0n) { // sell
+      ETH_IN += Number(tr.ethInWei) / 1e18;
+    }
+  }
+
+  // realized summary
+  const realizedTotal = tokenList.reduce((acc, p) => acc + (Number(p.realizedWei) / 1e18), 0);
+
+  // Sort realized for top 3
+  const realizedPos = realizedItems
+    .filter(x => x.realizedEth > 0)
+    .sort((a,b) => b.realizedPct - a.realizedPct);
+
+  const realizedNeg = realizedItems
+    .filter(x => x.realizedEth < 0)
+    .sort((a,b) => a.realizedPct - b.realizedPct); // most negative first
+
+  // Make full lists (profits & losses) for deeper pages
+  const fullProfits = realizedItems
+    .filter(x => x.realizedEth > 0)
+    .sort((a,b) => b.realizedPct - a.realizedPct);
+
+  const fullLosses = realizedItems
+    .filter(x => x.realizedEth < 0)
+    .sort((a,b) => a.realizedPct - b.realizedPct);
+
+  // “Unrealized”: value of open positions minus their cost basis portion
+  // We only display $ value in Open Positions; for a simple ETH unrealized we approximate via avgBuy
+  let unrealizedEth = 0;
+  for (const op of openTokens) {
+    const avgBuy = op.avgBuyEth || 0;
+    // cost basis of current holding in ETH
+    const cost = avgBuy * op.heldNum;
+    // approximate ETH value via USD: priceUsd / ethUsd would be needed; we don’t fetch ethUsd here,
+    // so we’ll keep unrealized in ETH as 0 and leave $ value in holdings only (per your spec).
+  }
+
+  // Airdrops $ (tokens only). We’ll price if we have DS info:
+  let airdropsUsd = 0;
+  for (const v of Object.values(tokenAirdrops)) {
+    const info = priceMap[v.ca] || {};
+    const qty = bnToNum(v.qtyRaw, v.decimals);
+    airdropsUsd += Number(info.priceUsd || 0) * qty;
+  }
+
+  // Total PnL (ETH): realized only (since unrealized ETH we keep at 0 by design)
+  const totalPnlEth = realizedTotal;
+  // Total %: realized / (ETH_OUT on trades)
+  const totalPct = (ETH_OUT > 0) ? (realizedTotal / ETH_OUT) * 100 : 0;
 
   return {
-    wallet,
-    sinceTs,
+    wallet: acct,
+    window,
     totals: {
-      ethBalance: ethBalanceFloat,      // wallet balance
-      tradeInEth: Number(tradeEthInWei)  / 1e18,  // proceeds only for token sells
-      tradeOutEth: Number(tradeEthOutWei)/ 1e18,  // spend only for token buys
-      realizedWeth: totalRealized,
-      unrealizedWeth: totalUnreal,
-      totalPnlWeth,
-      pnlPct,
-      airdropsUsd: totalAirdropsUsd,
-      holdingsUsd: totalHoldingsUsd
+      ethIn: +round4(ETH_IN),
+      ethOut: +round4(ETH_OUT),
+      realizedEth: +round4(realizedTotal),
+      unrealizedEth: 0, // we don’t show ETH unrealized; open shows $ value
+      holdingsUsd: Math.round(holdingsUsd * 100) / 100,
+      airdropsUsd: Math.round(airdropsUsd * 100) / 100,
+      totalEth: +round4(totalPnlEth),
+      totalPct: +round4(totalPct),
     },
-    tokens: perToken,
-    derived: {
-      open: opens,
-      realizedAll: realizedOnly, // renderer builds buy/sell aggregates & top lists
-      nftAirdrops: Array.from(nftAirdrops.values())
+    topProfits: realizedPos.slice(0, 3),
+    topLosses:  realizedNeg.slice(0, 3),
+    fullProfits,
+    fullLosses,
+    open: openEnriched.sort((a,b) => b.usdNow - a.usdNow),
+    airdrops: {
+      tokens: Object.values(tokenAirdrops).map(v => ({
+        ca: v.ca,
+        symbol: v.symbol,
+        name: v.name,
+        qty: bnToNum(v.qtyRaw, v.decimals)
+      })),
+      nfts: nftDrops
+    },
+    // for renderer convenience
+    _meta: {
+      now: Date.now(),
     }
   };
-}
-
-// ---------- Public API with caching ----------
-export async function refreshPnl(wallet, window) {
-  const sinceMap = {
-    '24h':  60*60*24,
-    '7d':   60*60*24*7,
-    '30d':  60*60*24*30,
-    '90d':  60*60*24*90,
-    'all':  0
-  };
-  const sinceSec = sinceMap[window] ?? sinceMap['30d'];
-  const sinceTs = sinceSec ? Math.floor(Date.now()/1000) - sinceSec : 0;
-
-  const key = `pnl:${String(wallet).toLowerCase()}:${window}`;
-  return withLock(`lock:${key}`, 60, async () => {
-    const cached = await getJSON(key);
-    if (cached) return cached;
-    const data = await computePnL(wallet, { sinceTs });
-    await setJSON(key, data, 120); // cache 2m
-    return data;
-  });
 }
