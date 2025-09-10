@@ -10,6 +10,7 @@ import './configEnv.js';
 import Redis from 'ioredis';
 import { Worker, Queue } from 'bullmq';
 import { refreshToken } from './queueCore.js'; // <- your real refresh function
+import { buildHoldersSnapshot } from './holdersIndex.js';
 
 const bullRedis = new Redis(process.env.REDIS_URL, {
   maxRetriesPerRequest: null,
@@ -607,9 +608,42 @@ export async function refreshToken(tokenAddress) {
 
     // --- STEP S: Build full holders snapshot (percents for all holders + supply/decimals) ---
     // This is where you add the 'const snap' and merge into the final payload.
-    let holdersAllPerc = [];
-    let totalSupply = String(totalSupplyRaw || '0');
-    let decimals = 18;
+ // --- STEP S: Build full holders snapshot (percents for all holders + supply/decimals) ---
+let holdersAllPerc = [];
+let totalSupply = String(totalSupplyRaw || '0');
+let decimals = 18;
+
+try {
+  // Optional hints let the snapshot skip recomputing some things
+  const snap = await buildHoldersSnapshot(ca, {
+    balancesHint: typeof balances !== 'undefined' ? balances : null,
+    totalSupplyHint: totalSupplyRaw || null,
+  });
+
+  // NEW fields (for Distribution / analytics tabs)
+  holdersAllPerc = Array.isArray(snap?.holdersAllPerc) ? snap.holdersAllPerc : [];
+
+  // Prefer snapshot totals/decimals if it knows better; fall back to what we already have
+  totalSupply = String(snap?.totalSupply || totalSupplyRaw || '0');
+  if (Number.isFinite(snap?.decimals)) decimals = snap.decimals;
+
+  // If your earlier compute didn’t fill these, trust the snapshot’s versions
+  if (!holdersTop20?.length && Array.isArray(snap?.holdersTop20)) {
+    holdersTop20 = snap.holdersTop20;
+  }
+  if (!holdersCount && Number.isFinite(snap?.holdersCount)) {
+    holdersCount = snap.holdersCount;
+  }
+  if (!top10CombinedPct && Number.isFinite(snap?.top10CombinedPct)) {
+    top10CombinedPct = snap.top10CombinedPct;
+  }
+  if (!burnedPct && Number.isFinite(snap?.burnedPct)) {
+    burnedPct = snap.burnedPct;
+  }
+} catch (e) {
+  console.warn('[WORKER] holders snapshot failed:', e?.message || e);
+}
+
 
     // 4) Final payload
     const payload = {
