@@ -94,7 +94,7 @@ export function renderOverview(data) {
     BR,
     holdersLine,
     top10Line,
-    `Creator: <code>${creatorAddr}</code><b>${creatorPct}</b>`,
+    `Creator: <code>${creatorAddr}</code>: <b>${creatorPct}</b>`,
     burnedLine,
     '',
   BR,
