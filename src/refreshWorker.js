@@ -12,11 +12,6 @@ import { Worker, Queue } from 'bullmq';
 import { refreshToken } from './queueCore.js'; // <- your real refresh function
 import { buildHoldersSnapshot } from './holdersIndex.js';
 
-const bullRedis = new Redis(process.env.REDIS_URL, {
-  maxRetriesPerRequest: null,
-  enableReadyCheck: false,
-});
-
 export const refreshQueueName = 'tabs_refresh';
 export const refreshQueue = new Queue(refreshQueueName, { connection: bullRedis });
 
