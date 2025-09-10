@@ -1,5 +1,5 @@
 // src/renderers.js
-// HTML renderers for Telegram UI (safe against MarkdownV2 issues)
+// HTML renderers for Telegram UI (safe against Markdown/HTML issues)
 import { esc, pct, money, shortAddr, trendBadge } from './ui_html.js';
 
 /** tiny text progress bar (10 slots) */
@@ -11,21 +11,27 @@ function progressBar(pctNum) {
   return `[${'█'.repeat(filled)}${'░'.repeat(empty)}] ${p.toFixed(2)}%`;
 }
 
+/* ---------- helpers ---------- */
+function hasHolders(data) {
+  return Array.isArray(data.holdersTop20) && data.holdersTop20.length > 0;
+}
+const BR = '\u200B';
+
 /**
- * Overview screen
+ * Overview screen (ordered for readability)
  */
 export function renderOverview(data) {
   const m = data.market || null;
   const name = esc(m?.name || 'Token');
   const sym  = esc(m?.symbol || '');
   const ca   = esc(data.tokenAddress);
-  const t24  = trendBadge(m?.priceChange?.h24);
 
+  const capLabel = (m?.marketCapSource === 'fdv') ? 'FDV (as cap)' : 'Market Cap';
   const vol = m?.volume || {};
   const chg = m?.priceChange || {};
-  const capLabel = (m?.marketCapSource === 'fdv') ? 'FDV (as cap)' : 'Market Cap';
+  const t24 = trendBadge(m?.priceChange?.h24);
 
-  // ---- Moonshot detection & line ----
+  // Moonshot detection
   const isMoonshot =
     !!m?.launchPadPair ||
     String(m?.dexId || '').toLowerCase() === 'moonshot' ||
@@ -35,16 +41,14 @@ export function renderOverview(data) {
     ? Math.max(0, Math.min(100, Number(m.moonshot.progress)))
     : null;
 
-  // Header icon: 🌙 only if moonshot
   const moonshotHeaderIcon = isMoonshot ? '🌙 ' : '';
-
-  // Dedicated Moonshot line
   const moonshotLine = isMoonshot
     ? (moonProgress != null
         ? `Moonshot: <b>Yes</b>  ${esc(progressBar(moonProgress))}`
         : `Moonshot: <b>Yes</b>`)
     : `Moonshot: <b>No</b>`;
 
+  // info lines
   const holdersLine =
     typeof data.holdersCount === 'number'
       ? `Holders: <b>${data.holdersCount.toLocaleString()}</b>`
@@ -61,43 +65,50 @@ export function renderOverview(data) {
       : `Burned: <i>N/A</i>`;
 
   const creatorAddr = data.creator?.address ? esc(shortAddr(data.creator.address)) : 'unknown';
+  const creatorPct  = data.creator?.percent != null ? esc(pct(data.creator.percent)) : 'N/A';
 
+  // ----- layout (your requested order) -----
   const lines = [
     `${moonshotHeaderIcon}<b>${name}${sym ? ` (${sym})` : ''}</b>`,
     `<code>${ca}</code>`,
     moonshotLine,
-    ``,
-    ``,
-    (m ? `${capLabel}: <b>${esc(money(m.marketCap))}</b>` : undefined),
+
+    '',
+    BR,
+
+    (m ? `${capLabel}: <b>${esc(money(m.marketCap))}</b>` : `<i>No market data yet</i>`),
     (m && typeof m.priceUsd === 'number')
       ? `Price: <b>${esc(money(m.priceUsd, 8))}</b>   ${t24}`
-      : `<i>No market data yet (no Abstract pair indexed)</i>`,
-    ``,
-    ``,
-    `Volume:`,
-    (m ? `5m <b>${esc(money(vol.m5))}</b> • 1h <b>${esc(money(vol.h1))}</b> • 6h <b>${esc(money(vol.h6))}</b> • 24h <b>${esc(money(vol.h24))}</b>` : undefined),
-    `Change:`,
-    (m ? `5m <b>${esc(pct(chg.m5))}</b> • 1h <b>${esc(pct(chg.h1))}</b> • 6h <b>${esc(pct(chg.h6))}</b> • 24h <b>${esc(pct(chg.h24))}</b>` : undefined),
-    ``,
-    ``,
+      : `<i>Price unavailable</i>`,
+    '',
+    BR,
+    'Volume:',
+    (m ? `24h <b>${esc(money(vol.h24))}</b>` : undefined),
+    (m ? `5m <b>${esc(money(vol.m5))}</b> • 1h <b>${esc(money(vol.h1))}</b> • 6h <b>${esc(money(vol.h6))}</b>` : undefined),
+    '',
+    BR,
+    'Change:',
+    (m ? `24h <b>${esc(pct(chg.h24))}</b>` : undefined),
+    (m ? `5m <b>${esc(pct(chg.m5))}</b> • 1h <b>${esc(pct(chg.h1))}</b> • 6h <b>${esc(pct(chg.h6))}</b>` : undefined),
+    '',
+    BR,
     holdersLine,
-    `Creator: <code>${creatorAddr}</code> — <b>${esc(pct(data.creator?.percent))}</b>`,
     top10Line,
+    `Creator: <code>${creatorAddr}</code><b>${creatorPct}</b>`,
     burnedLine,
-    ``,
-    ``,
+    '',
+  BR,
     `<i>Pick a section:</i>`,
     `• <b>Buyers</b> — first 20 buyers + status`,
     ...(hasHolders(data) ? [`• <b>Holders</b> — top 20 holder percentages`] : []),
-    ``,
-    ``,
+    BR,
     `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>`,
     `<i>Source: Dexscreener · Explorer</i>`
   ].filter(Boolean);
 
   const text = lines.join('\n');
 
-  // Keyboard (no extra moonshot link button anymore)
+  // ----- keyboard -----
   const navRow = hasHolders(data)
     ? [
         { text:'🧑‍🤝‍🧑 Buyers',  callback_data:`buyers:${data.tokenAddress}:1` },
@@ -110,26 +121,26 @@ export function renderOverview(data) {
   const kb = {
     reply_markup: {
       inline_keyboard: [
-        // socials row will be unshifted below if present
+        // socials row (added below if any)
         [],
         navRow,
         [
-          { text:'↻ Refresh',      callback_data:`refresh:${data.tokenAddress}` },
-          { text:'ℹ️ About',       callback_data:'about' }
+          { text:'↻ Refresh', callback_data:`refresh:${data.tokenAddress}` },
+          { text:'ℹ️ About',  callback_data:'about' }
         ]
       ].filter(row => row.length)
     }
   };
 
-  // Socials row (use only string URLs)
+  // socials row (urls only)
   const linkRow = [];
   const t = m?.socials?.twitter;
   const g = m?.socials?.telegram;
   const w = m?.socials?.website;
 
-  if (typeof t === 'string' && t.length) linkRow.push({ text: '𝕏 Twitter', url: t });
-  if (typeof g === 'string' && g.length) linkRow.push({ text: 'Telegram',  url: g });
-  if (typeof w === 'string' && w.length) linkRow.push({ text: 'Website',   url: w });
+  if (typeof t === 'string' && t.length) linkRow.push({ text:'𝕏 Twitter', url:t });
+  if (typeof g === 'string' && g.length) linkRow.push({ text:'Telegram',  url:g });
+  if (typeof w === 'string' && w.length) linkRow.push({ text:'Website',   url:w });
 
   if (linkRow.length) kb.reply_markup.inline_keyboard.unshift(linkRow);
 
@@ -156,11 +167,11 @@ export function renderBuyers(data, page = 1, pageSize = 10) {
 
   const text = [
     `🧑‍🤝‍🧑 <b>First 20 Buyers — ${name}</b>`,
-    ``,
+    '',
     body,
-    ``,
-    `Tip: Status uses final balance vs buy/sell history.`,
-    ``,
+    '',
+    'Tip: Status uses final balance vs buy/sell history.',
+    '',
     `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>  ·  <i>Page ${page}/${totalPages}</i>`
   ].join('\n');
 
@@ -177,7 +188,7 @@ export function renderBuyers(data, page = 1, pageSize = 10) {
         ],
         [
           { text:'🏠 Overview', callback_data:`stats:${data.tokenAddress}` },
-          ...(hasHolders(data) ? [{ text:'📊 Holders',  callback_data:`holders:${data.tokenAddress}:1` }] : [])
+          ...(hasHolders(data) ? [{ text:'📊 Holders', callback_data:`holders:${data.tokenAddress}:1` }] : [])
         ]
       ]
     }
@@ -208,13 +219,13 @@ export function renderHolders(data, page = 1, pageSize = 10) {
 
   const text = [
     `📊 <b>Top Holders — ${name}</b>`,
-    ``,
+    '',
     body,
-    ``,
-    `Notes:`,
-    `• Burn addresses (0x0 / 0xdead) are included in burned%.`,
-    `• Top-10 combined is shown in the overview.`,
-    ``,
+    '',
+    'Notes:',
+    '• Burn addresses (0x0 / 0xdead) are included in burned%.',
+    '• Top-10 combined is shown in the overview.',
+    '',
     `<i>Updated: ${esc(new Date(data.updatedAt).toLocaleString())}</i>  ·  <i>Page ${page}/${totalPages}</i>`
   ].join('\n');
 
@@ -240,32 +251,23 @@ export function renderHolders(data, page = 1, pageSize = 10) {
   return { text, extra: kb };
 }
 
-/**
- * Optional: About screen content
- */
+/** Optional: About screen */
 export function renderAbout() {
   const text = [
-    `🤖 <b>tABS Tools</b>`,
-    ``,
-    `• Market: Dexscreener (Abstract)`,
-    `• Transfers & creator: Explorer`,
-    `• Refresh cooldown: 30s`,
-    `• Data cache: 3 minutes`,
-    ``,
-    `<i>Made for Abstract chain token analytics.</i>`
+    '🤖 <b>tABS Tools</b>',
+    '',
+    '• Market: Dexscreener (Abstract)',
+    '• Transfers & creator: Explorer',
+    '• Refresh cooldown: 30s',
+    '• Data cache: 3 minutes',
+    '',
+    '<i>Made for Abstract chain token analytics.</i>'
   ].join('\n');
-
+  
   const extra = {
     reply_markup: {
-      inline_keyboard: [
-        [{ text:'Back', callback_data: 'noop' }]
-      ]
+      inline_keyboard: [[{ text:'Back', callback_data: 'noop' }]]
     }
   };
   return { text, extra };
-}
-
-/* ---------- helpers ---------- */
-function hasHolders(data) {
-  return Array.isArray(data.holdersTop20) && data.holdersTop20.length > 0;
 }
