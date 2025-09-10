@@ -5,30 +5,13 @@
 //    stats.tokensupply, account.tokenbalance
 // Queue: BullMQ
 
-// src/refreshWorker.js
 import './configEnv.js';
+import axios from 'axios';
 import Redis from 'ioredis';
 import { Worker, Queue } from 'bullmq';
-import { refreshToken } from './queueCore.js'; // <- your real refresh function
-import { buildHoldersSnapshot } from './holdersIndex.js';
 
-export const refreshQueueName = 'tabs_refresh';
-export const refreshQueue = new Queue(refreshQueueName, { connection: bullRedis });
-
-// Consumer
-new Worker(
-  refreshQueueName,
-  async (job) => {
-    const ca = job.data?.tokenAddress;
-    if (!ca) throw new Error('tokenAddress missing in job.data');
-    console.log('[WORKER] job received:', job.name, job.id, ca);
-    const res = await refreshToken(ca);
-    console.log('[WORKER] job OK:', job.id);
-    return res;
-  },
-  { connection: bullRedis }
-);
-
+import { setJSON, withLock } from './cache.js';
+import { getDexscreenerTokenStats } from './services/dexscreener.js';
 
 // ---------- Dexscreener helpers ----------
 async function getDexCreator(ca) {
@@ -601,45 +584,6 @@ export async function refreshToken(tokenAddress) {
       console.log('[WORKER] compute failed:', e?.message || e);
     }
 
-    // --- STEP S: Build full holders snapshot (percents for all holders + supply/decimals) ---
-    // This is where you add the 'const snap' and merge into the final payload.
- // --- STEP S: Build full holders snapshot (percents for all holders + supply/decimals) ---
-let holdersAllPerc = [];
-let totalSupply = String(totalSupplyRaw || '0');
-let decimals = 18;
-
-try {
-  // Optional hints let the snapshot skip recomputing some things
-  const snap = await buildHoldersSnapshot(ca, {
-    balancesHint: typeof balances !== 'undefined' ? balances : null,
-    totalSupplyHint: totalSupplyRaw || null,
-  });
-
-  // NEW fields (for Distribution / analytics tabs)
-  holdersAllPerc = Array.isArray(snap?.holdersAllPerc) ? snap.holdersAllPerc : [];
-
-  // Prefer snapshot totals/decimals if it knows better; fall back to what we already have
-  totalSupply = String(snap?.totalSupply || totalSupplyRaw || '0');
-  if (Number.isFinite(snap?.decimals)) decimals = snap.decimals;
-
-  // If your earlier compute didn’t fill these, trust the snapshot’s versions
-  if (!holdersTop20?.length && Array.isArray(snap?.holdersTop20)) {
-    holdersTop20 = snap.holdersTop20;
-  }
-  if (!holdersCount && Number.isFinite(snap?.holdersCount)) {
-    holdersCount = snap.holdersCount;
-  }
-  if (!top10CombinedPct && Number.isFinite(snap?.top10CombinedPct)) {
-    top10CombinedPct = snap.top10CombinedPct;
-  }
-  if (!burnedPct && Number.isFinite(snap?.burnedPct)) {
-    burnedPct = snap.burnedPct;
-  }
-} catch (e) {
-  console.warn('[WORKER] holders snapshot failed:', e?.message || e);
-}
-
-
     // 4) Final payload
     const payload = {
       tokenAddress: ca,
@@ -655,11 +599,6 @@ try {
       first20Buyers,
 
       creator: { address: creatorAddr, percent: creatorPercent },
-
-      // <-- NEW fields used by Distribution tab and other analytics
-      holdersAllPerc,           // array of % per holder (may be empty if not yet indexed)
-      totalSupply,              // string (raw)
-      decimals,                 // number
     };
 
     // 5) Cache
@@ -678,6 +617,23 @@ try {
   });
 }
 
+// ---------- Worker (consumer) ----------
+new Worker(
+  'tabs_refresh',
+  async (job) => {
+    const ca = job.data?.tokenAddress;
+    console.log('[WORKER] job received:', job.name, job.id, ca);
+    try {
+      const res = await refreshToken(ca);
+      console.log('[WORKER] job OK:', job.id);
+      return res;
+    } catch (e) {
+      console.log('[WORKER] job FAIL:', job.id, e?.message || e);
+      throw e;
+    }
+  },
+  { connection: bullRedis }
+);
 
 // ---------- Optional cron refresher ----------
 if (process.argv.includes('--cron') && process.env.DEFAULT_TOKENS) {
