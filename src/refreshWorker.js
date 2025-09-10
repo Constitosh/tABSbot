@@ -679,24 +679,6 @@ try {
 }
 
 
-// ---------- Worker (consumer) ----------
-new Worker(
-  'tabs_refresh',
-  async (job) => {
-    const ca = job.data?.tokenAddress;
-    console.log('[WORKER] job received:', job.name, job.id, ca);
-    try {
-      const res = await refreshToken(ca);
-      console.log('[WORKER] job OK:', job.id);
-      return res;
-    } catch (e) {
-      console.log('[WORKER] job FAIL:', job.id, e?.message || e);
-      throw e;
-    }
-  },
-  { connection: bullRedis }
-);
-
 // ---------- Optional cron refresher ----------
 if (process.argv.includes('--cron') && process.env.DEFAULT_TOKENS) {
   const list = process.env.DEFAULT_TOKENS.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
