@@ -2,7 +2,8 @@
 import './configEnv.js';
 import { Telegraf } from 'telegraf';
 import { getJSON, setJSON } from './cache.js';
-import { queue, refreshToken } from './queueCore.js';
+import { queue } from './queueCore.js';
+import { refreshToken } from './refreshWorker.js'; // if you do a cold-start refresh
 import { isAddress } from './util.js';
 import { renderOverview, renderBuyers, renderHolders } from './renderers.js';
 import { renderDistribution } from './renderers.js'; // <-- same file, new export
