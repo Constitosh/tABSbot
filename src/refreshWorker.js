@@ -5,25 +5,33 @@
 //    stats.tokensupply, account.tokenbalance
 // Queue: BullMQ
 
+// src/refreshWorker.js
 import './configEnv.js';
-import axios from 'axios';
 import Redis from 'ioredis';
 import { Worker, Queue } from 'bullmq';
+import { refreshToken } from './queueCore.js'; // <- your real refresh function
 
-import { setJSON, withLock } from './cache.js';
-import { getDexscreenerTokenStats } from './services/dexscreener.js';
-// wherever you build the token “summary” object used by /stats:
-import { buildHoldersSnapshot } from './holdersIndex.js';
+const bullRedis = new Redis(process.env.REDIS_URL, {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false,
+});
 
-// ...
-const snap = await buildHoldersSnapshot(tokenAddress);
-// Merge into your summary object:
-summary.holdersCount       = snap.holdersCount;
-summary.holdersTop20       = snap.holdersTop20;
-summary.top10CombinedPct   = snap.top10CombinedPct;
-summary.burnedPct          = snap.burnedPct;
-// Optional (lets renderers show “all holders” stats):
-summary.holdersAllPerc     = snap.holdersAllPerc;
+export const refreshQueueName = 'tabs_refresh';
+export const refreshQueue = new Queue(refreshQueueName, { connection: bullRedis });
+
+// Consumer
+new Worker(
+  refreshQueueName,
+  async (job) => {
+    const ca = job.data?.tokenAddress;
+    if (!ca) throw new Error('tokenAddress missing in job.data');
+    console.log('[WORKER] job received:', job.name, job.id, ca);
+    const res = await refreshToken(ca);
+    console.log('[WORKER] job OK:', job.id);
+    return res;
+  },
+  { connection: bullRedis }
+);
 
 
 // ---------- Dexscreener helpers ----------
@@ -602,16 +610,6 @@ export async function refreshToken(tokenAddress) {
     let holdersAllPerc = [];
     let totalSupply = String(totalSupplyRaw || '0');
     let decimals = 18;
-
-    try {
-      const snap = await buildHoldersSnapshot(ca);
-      // Merge only if provided (keeps backward compatibility)
-      if (Array.isArray(snap?.holdersAllPerc)) holdersAllPerc = snap.holdersAllPerc;
-      if (snap?.totalSupply) totalSupply = String(snap.totalSupply);
-      if (typeof snap?.decimals === 'number') decimals = snap.decimals;
-    } catch (e) {
-      console.log('[WORKER] holders snapshot failed:', e?.message || e);
-    }
 
     // 4) Final payload
     const payload = {
