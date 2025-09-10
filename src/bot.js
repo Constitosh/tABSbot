@@ -2,17 +2,13 @@
 import './configEnv.js';
 import { Telegraf } from 'telegraf';
 import { getJSON, setJSON } from './cache.js';
-import { queue } from './queueCore.js';
-import { refreshToken } from './refreshWorker.js'; // if you do a cold-start refresh
+import { queue, refreshToken } from './queueCore.js';
+import { renderOverview, renderBuyers, renderHolders, renderAbout } from './renderers.js';
 import { isAddress } from './util.js';
-import { renderOverview, renderBuyers, renderHolders } from './renderers.js';
-import { renderDistribution } from './renderers.js'; // <-- same file, new export
 
 // PNL imports (queue optional; see notes below)
 import { refreshPnl } from './pnlWorker.js'; // ⬅ only refreshPnl to avoid export mismatch
-import * as R from './renderers.js';      // R.renderOverview, R.renderBuyers, ...
 import { renderPNL } from './renderers_pnl.js';
-
 
 // --- Bot with longer handler timeout + global error catcher ---
 const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 15_000 });
@@ -110,7 +106,7 @@ bot.command('stats', async (ctx) => {
   const data = await ensureData(ca);
   if (!data) return ctx.reply('Initializing… try again in a few seconds.');
 
-  const { text, extra } = R.renderOverview(data);
+  const { text, extra } = renderOverview(data);
   return sendHTML(ctx, text, extra);
 });
 
@@ -158,12 +154,25 @@ bot.command('pnl', async (ctx) => {
 bot.action('noop', (ctx) => ctx.answerCbQuery(''));
 
 // Main action router for stats/buyers/holders/refresh
-bot.action(/^(stats|buyers|holders|dist):/, async (ctx) => {
+bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
   const dataStr = ctx.callbackQuery?.data || '';
   try {
+    // ack asap
     try { await ctx.answerCbQuery('Working…'); } catch {}
 
     const [kind, ca, maybePage] = dataStr.split(':');
+
+    if (kind === 'refresh') {
+      const res = await requestRefresh(ca);
+      const msg = res.ok
+        ? 'Refreshing…'
+        : (typeof res.age === 'number'
+            ? `Recently refreshed (${res.age.toFixed(0)}s ago). Try again shortly.`
+            : `Couldn't queue refresh${res.error ? `: ${res.error}` : ''}`);
+      try { await ctx.answerCbQuery(msg, { show_alert: false }); } catch {}
+      return;
+    }
+
     const data = await ensureData(ca);
     if (!data) {
       try { await ctx.answerCbQuery('Initializing… try again shortly.', { show_alert: true }); } catch {}
@@ -171,34 +180,29 @@ bot.action(/^(stats|buyers|holders|dist):/, async (ctx) => {
     }
 
     if (kind === 'stats') {
-      const { text, extra } = R.renderOverview(data);
+      const { text, extra } = renderOverview(data);
       await editHTML(ctx, text, extra);
       return;
     }
+
     if (kind === 'buyers') {
       const page = Number(maybePage || 1);
-      const { text, extra } = R.renderBuyers(data, page);
+      const { text, extra } = renderBuyers(data, page);
       await editHTML(ctx, text, extra);
       return;
     }
+
     if (kind === 'holders') {
       const page = Number(maybePage || 1);
-      const { text, extra } = R.renderHolders(data, page);
-      await editHTML(ctx, text, extra);
-      return;
-    }
-    if (kind === 'dist') {
-      const page = Number(maybePage || 1);
-      const { text, extra } = R.renderDistribution(data, page);
+      const { text, extra } = renderHolders(data, page);
       await editHTML(ctx, text, extra);
       return;
     }
   } catch (e) {
-    console.error('[stats/buyers/holders/dist cb] error:', e?.response?.description || e);
+    console.error('[stats/buyers/holders cb] error:', e?.response?.description || e);
     try { await ctx.answerCbQuery('Error — try again', { show_alert: true }); } catch {}
   }
 });
-
 
 // ----- PNL callbacks (windows / views / refresh) -----
 // Supports:
