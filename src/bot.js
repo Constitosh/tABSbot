@@ -3,14 +3,15 @@ import './configEnv.js';
 import { Telegraf } from 'telegraf';
 import { getJSON, setJSON } from './cache.js';
 import { queue, refreshToken } from './queueCore.js';
-import { renderOverview, renderBuyers, renderHolders, renderAbout } from './renderers.js';
 import { isAddress } from './util.js';
 import { renderOverview, renderBuyers, renderHolders } from './renderers.js';
 import { renderDistribution } from './renderers.js'; // <-- same file, new export
 
 // PNL imports (queue optional; see notes below)
 import { refreshPnl } from './pnlWorker.js'; // ⬅ only refreshPnl to avoid export mismatch
+import * as R from './renderers.js';      // R.renderOverview, R.renderBuyers, ...
 import { renderPNL } from './renderers_pnl.js';
+
 
 // --- Bot with longer handler timeout + global error catcher ---
 const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 15_000 });
@@ -108,7 +109,7 @@ bot.command('stats', async (ctx) => {
   const data = await ensureData(ca);
   if (!data) return ctx.reply('Initializing… try again in a few seconds.');
 
-  const { text, extra } = renderOverview(data);
+  const { text, extra } = R.renderOverview(data);
   return sendHTML(ctx, text, extra);
 });
 
@@ -169,25 +170,25 @@ bot.action(/^(stats|buyers|holders|dist):/, async (ctx) => {
     }
 
     if (kind === 'stats') {
-      const { text, extra } = renderOverview(data);
+      const { text, extra } = R.renderOverview(data);
       await editHTML(ctx, text, extra);
       return;
     }
     if (kind === 'buyers') {
       const page = Number(maybePage || 1);
-      const { text, extra } = renderBuyers(data, page);
+      const { text, extra } = R.renderBuyers(data, page);
       await editHTML(ctx, text, extra);
       return;
     }
     if (kind === 'holders') {
       const page = Number(maybePage || 1);
-      const { text, extra } = renderHolders(data, page);
+      const { text, extra } = R.renderHolders(data, page);
       await editHTML(ctx, text, extra);
       return;
     }
     if (kind === 'dist') {
       const page = Number(maybePage || 1);
-      const { text, extra } = renderDistribution(data, page);
+      const { text, extra } = R.renderDistribution(data, page);
       await editHTML(ctx, text, extra);
       return;
     }
