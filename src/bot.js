@@ -9,6 +9,8 @@ import { isAddress } from './util.js';
 // PNL imports (queue optional; see notes below)
 import { refreshPnl } from './pnlWorker.js'; // ⬅ only refreshPnl to avoid export mismatch
 import { renderPNL } from './renderers_pnl.js';
+import { renderBundles } from './renderers_bundles.js';
+
 
 // --- Bot with longer handler timeout + global error catcher ---
 const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 15_000 });
@@ -198,6 +200,15 @@ bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
       await editHTML(ctx, text, extra);
       return;
     }
+
+    if (kind === 'bundles') {
+      const page = Number(maybePage || 1);
+      const { text, extra } = renderBundles(data, page);
+      await editHTML(ctx, text, extra);
+      return;
+    }
+
+    
   } catch (e) {
     console.error('[stats/buyers/holders cb] error:', e?.response?.description || e);
     try { await ctx.answerCbQuery('Error — try again', { show_alert: true }); } catch {}
