@@ -176,6 +176,23 @@ bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
       try { await ctx.answerCbQuery(msg, { show_alert: false }); } catch {}
       return;
     }
+    
+bot.action(/^bundles:/, async (ctx) => {
+  try {
+    const dataStr = ctx.callbackQuery?.data || '';
+    const [, ca] = dataStr.split(':');
+    try { await ctx.answerCbQuery('Scanning early buys…'); } catch {}
+    // get the light summary we already cache (for name + CA):
+    const summary = await ensureData(ca);
+    // build (or fetch cached) bundles snapshot (fast path if cached)
+    const b = await buildBundlesSnapshot(ca);
+    const { text, extra } = renderBundlesView(summary, b);
+    await ctx.editMessageText(text, extra);
+  } catch (e) {
+    console.error('[bundles cb] error', e?.message || e);
+    try { await ctx.answerCbQuery('Bundles failed — try again'); } catch {}
+  }
+});
 
     const data = await ensureData(ca);
     if (!data) {
