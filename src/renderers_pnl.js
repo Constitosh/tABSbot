@@ -42,10 +42,6 @@ function header(data, window) {
   const emReal  = signEmoji(t.realizedEth || 0);
   const emUnr   = signEmoji(t.unrealizedEth || 0);
 
-  b.push(`💧 ETH IN: ${fmtEth(t.ethIn || 0)} ETH`);
-  b.push(`🔥 ETH OUT: ${fmtEth(t.ethOut || 0)} ETH`);
-  b.push(`📈 Realized: ${emReal} ${fmtEth(t.realizedEth || 0)} ETH`);
-  b.push(`📊 Unrealized: ${emUnr} ${fmtEth(t.unrealizedEth || 0)} ETH`);
   b.push(`📦 Holdings: ${money(t.holdingsUsd || 0)}`);
   b.push(`🎁 Airdrops: ${money(t.airdropsUsd || 0)}`);
   b.push(`${emTotal} Total PnL: ${fmtEth(t.totalEth || 0)} ETH  (${signEmoji(t.totalPct||0)} ${fmtPct(t.totalPct||0)})`);
