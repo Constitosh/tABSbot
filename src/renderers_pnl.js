@@ -1,19 +1,11 @@
 // src/renderers_pnl.js
-// Renders: overview | profits | losses | open | airdrops
-// Notes:
-// - 4 decimals on numbers
-// - blank lines between positions (we insert real '\n\n' lines)
-// - no ETH in Open Positions; show symbol, holdings (k/m formatting), and $
-// - Overview shows top 3 profits & losses ordered by %
-// - Buttons: windows + pages
 
-function round4(x) {
-  if (!Number.isFinite(x)) return '0.0000';
-  return (Math.round(x * 1e4) / 1e4).toFixed(4);
-}
-function money(x, n = 2) {
-  if (!Number.isFinite(x)) return '$0.00';
-  return '$' + (Math.round(x * 10 ** n) / 10 ** n).toFixed(n);
+function round4(x){ return (Math.round(Number(x)*1e4)/1e4).toFixed(4); }
+function money(x, n=2){ return '$'+(Math.round(Number(x)*10**n)/10**n).toFixed(n); }
+function pct(x){
+  const v = Number(x)||0;
+  const s = v >= 0 ? '🟢 +' : '🔴 ';
+  return `${s}${Math.abs(v).toFixed(2)}%`;
 }
 function kfmt(num) {
   const n = Number(num);
@@ -23,16 +15,7 @@ function kfmt(num) {
   if (Math.abs(n) < 1_000_000_000) return (Math.round(n / 10_000) / 100).toFixed(2) + 'm';
   return (Math.round(n / 10_000_000) / 100).toFixed(2) + 'b';
 }
-function pct(x) {
-  if (!Number.isFinite(x)) return '0.00%';
-  const v = (Math.round(x * 100) / 100).toFixed(2);
-  const s = Number(x) >= 0 ? '🟢 +' : '🔴 ';
-  return `${s}${v}%`;
-}
-function cleanSym(s) {
-  const t = String(s || '').trim();
-  return t || 'Token';
-}
+function cleanSym(s){ const t=String(s||'').trim(); return t||'Token'; }
 
 function windowButtons(wallet, win, view) {
   const WINS = ['24h','7d','30d','90d','all'];
@@ -40,16 +23,13 @@ function windowButtons(wallet, win, view) {
   return [ row ];
 }
 
-export function renderPNL(data, win = '30d', view = 'overview') {
+export function renderPNL(data, win='30d', view='overview') {
   const w = data.wallet;
   const t = data.totals || {};
 
-  // Header / Totals
-  const linesHead = [
+  const head = [
     `💼 <b>Wallet PnL</b> — <code>${w.slice(0,6)}…${w.slice(-4)}</code>`,
     `Window: ${win}`,
-    ``,
-    `💰 Wallet Balance: (not tracked here)`,
     ``,
     `💧 ETH IN:  ${round4(t.ethIn)}`,
     `🔥 ETH OUT: ${round4(t.ethOut)}`,
@@ -60,34 +40,29 @@ export function renderPNL(data, win = '30d', view = 'overview') {
     `${t.totalEth >= 0 ? '🟢' : '🔴'} Total PnL: ${round4(t.totalEth)}  (${pct(t.totalPct)})`
   ];
 
-  // VIEWS
   let body = '';
-  let keyboard = { inline_keyboard: [] };
+  let kb = { inline_keyboard: [] };
 
   if (view === 'overview') {
     const tp = data.topProfits || [];
     const tl = data.topLosses  || [];
 
-    const tpLines = tp.length ? tp.map(x => {
-      return [
-        `• ${cleanSym(x.symbol)} — 🟢`,
-        `🟢 ${round4(x.realizedEth)} (${pct(x.realizedPct)})`,
-        `Bought ${round4(x.buyEth)}`,
-        `Sold ${round4(x.sellEth)}`
-      ].join('\n');
-    }).join('\n\n') : 'No items';
+    const tpLines = tp.length ? tp.map(x => [
+      `• ${cleanSym(x.symbol)} — 🟢`,
+      `🟢 ${round4(x.realizedEth)} (${pct(x.realizedPct)})`,
+      `Bought ${round4(x.buyEth)}`,
+      `Sold ${round4(x.sellEth)}`
+    ].join('\n')).join('\n\n') : 'No items';
 
-    const tlLines = tl.length ? tl.map(x => {
-      return [
-        `• ${cleanSym(x.symbol)} — 🔴`,
-        `🔴 ${round4(x.realizedEth)} (${pct(x.realizedPct)})`,
-        `Bought ${round4(x.buyEth)}`,
-        `Sold ${round4(x.sellEth)}`
-      ].join('\n');
-    }).join('\n\n') : 'No items';
+    const tlLines = tl.length ? tl.map(x => [
+      `• ${cleanSym(x.symbol)} — 🔴`,
+      `🔴 ${round4(x.realizedEth)} (${pct(x.realizedPct)})`,
+      `Bought ${round4(x.buyEth)}`,
+      `Sold ${round4(x.sellEth)}`
+    ].join('\n')).join('\n\n') : 'No items';
 
     body = [
-      ...linesHead,
+      ...head,
       ``,
       `Top Profits (realized)`,
       tpLines,
@@ -96,7 +71,7 @@ export function renderPNL(data, win = '30d', view = 'overview') {
       tlLines
     ].join('\n');
 
-    keyboard.inline_keyboard = [
+    kb.inline_keyboard = [
       [{ text:'📜 Profits', callback_data:`pnlv:${w}:${win}:profits` },
        { text:'📉 Losses',  callback_data:`pnlv:${w}:${win}:losses` }],
       [{ text:'📦 Open',    callback_data:`pnlv:${w}:${win}:open` },
@@ -115,13 +90,13 @@ export function renderPNL(data, win = '30d', view = 'overview') {
     ].join('\n')).join('\n\n') || 'No items';
 
     body = [
-      ...linesHead,
+      ...head,
       ``,
       `All Profits (realized)`,
       items
     ].join('\n');
 
-    keyboard.inline_keyboard = [
+    kb.inline_keyboard = [
       [{ text:'🏠 Overview', callback_data:`pnlv:${w}:${win}:overview` },
        { text:'📉 Losses',   callback_data:`pnlv:${w}:${win}:losses` }],
       [{ text:'📦 Open',     callback_data:`pnlv:${w}:${win}:open` },
@@ -140,13 +115,13 @@ export function renderPNL(data, win = '30d', view = 'overview') {
     ].join('\n')).join('\n\n') || 'No items';
 
     body = [
-      ...linesHead,
+      ...head,
       ``,
       `All Losses (realized)`,
       items
     ].join('\n');
 
-    keyboard.inline_keyboard = [
+    kb.inline_keyboard = [
       [{ text:'🏠 Overview', callback_data:`pnlv:${w}:${win}:overview` },
        { text:'📜 Profits',  callback_data:`pnlv:${w}:${win}:profits` }],
       [{ text:'📦 Open',     callback_data:`pnlv:${w}:${win}:open` },
@@ -157,7 +132,6 @@ export function renderPNL(data, win = '30d', view = 'overview') {
   }
 
   if (view === 'open') {
-    // No ETH figures here; show holdings & USD only
     const items = (data.open || []).map(o => [
       `• ${cleanSym(o.symbol)}`,
       `Hold: ${kfmt(o.heldNum)}`,
@@ -165,13 +139,13 @@ export function renderPNL(data, win = '30d', view = 'overview') {
     ].join('\n')).join('\n\n') || 'No open positions';
 
     body = [
-      ...linesHead,
+      ...head,
       ``,
       `Open Positions`,
       items
     ].join('\n');
 
-    keyboard.inline_keyboard = [
+    kb.inline_keyboard = [
       [{ text:'🏠 Overview', callback_data:`pnlv:${w}:${win}:overview` },
        { text:'📜 Profits',  callback_data:`pnlv:${w}:${win}:profits` }],
       [{ text:'📉 Losses',   callback_data:`pnlv:${w}:${win}:losses` },
@@ -183,10 +157,10 @@ export function renderPNL(data, win = '30d', view = 'overview') {
 
   if (view === 'airdrops') {
     const toks = (data.airdrops?.tokens || []).map(a => `• ${cleanSym(a.symbol)} — qty ${kfmt(a.qty)}`).join('\n') || 'None';
-    const nfts = (data.airdrops?.nfts || []).map(n => `• ${n.name || 'NFT'} — qty ${n.qty}`).join('\n') || 'None';
+    const nfts = (data.airdrops?.nfts   || []).map(n => `• ${n.name || 'NFT'} — qty ${n.qty}`).join('\n') || 'None';
 
     body = [
-      ...linesHead,
+      ...head,
       ``,
       `Token airdrops`,
       toks,
@@ -195,7 +169,7 @@ export function renderPNL(data, win = '30d', view = 'overview') {
       nfts
     ].join('\n');
 
-    keyboard.inline_keyboard = [
+    kb.inline_keyboard = [
       [{ text:'🏠 Overview', callback_data:`pnlv:${w}:${win}:overview` },
        { text:'📜 Profits',  callback_data:`pnlv:${w}:${win}:profits` }],
       [{ text:'📉 Losses',   callback_data:`pnlv:${w}:${win}:losses` },
@@ -205,8 +179,5 @@ export function renderPNL(data, win = '30d', view = 'overview') {
     ];
   }
 
-  return {
-    text: body,
-    extra: { reply_markup: keyboard }
-  };
+  return { text: body, extra: { reply_markup: kb } };
 }
