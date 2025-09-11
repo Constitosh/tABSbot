@@ -9,7 +9,10 @@ import { isAddress } from './util.js';
 // PNL imports (queue optional; see notes below)
 import { refreshPnl } from './pnlWorker.js'; // ⬅ only refreshPnl to avoid export mismatch
 import { renderPNL } from './renderers_pnl.js';
-import { renderBundles } from './renderers_bundles.js';
+
+import { buildBundlesSnapshot } from './bundles.js';
+import { renderBundlesView } from './renderers_bundles.js';
+
 
 
 // --- Bot with longer handler timeout + global error catcher ---
