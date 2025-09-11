@@ -1,163 +1,183 @@
 // src/renderers_pnl.js
-import { esc } from './ui_html.js';
 
-// helpers
-function fmtEth(x){ return Number(x).toFixed(4); }
-function fmtPct(x){ return (Number(x) >= 0 ? '+' : '') + Number(x).toFixed(2) + '%'; }
-function money(x){ return '$' + Number(x).toFixed(2); }
-function signEmoji(x){ return Number(x) >= 0 ? '🟢' : '🔴'; }
-function updown(x){ return Number(x) >= 0 ? '⬆️' : '⬇️'; }
+function round4(x){ return (Math.round(Number(x)*1e4)/1e4).toFixed(4); }
+function money(x, n=2){ return '$'+(Math.round(Number(x)*10**n)/10**n).toFixed(n); }
+function pct(x){
+  const v = Number(x)||0;
+  const s = v >= 0 ? '🟢 +' : '🔴 ';
+  return `${s}${Math.abs(v).toFixed(2)}%`;
+}
+function kfmt(num) {
+  const n = Number(num);
+  if (!Number.isFinite(n)) return '0';
+  if (Math.abs(n) < 10_000) return String(Math.round(n * 100) / 100);
+  if (Math.abs(n) < 1_000_000) return (Math.round(n / 10) / 100).toFixed(2) + 'k';
+  if (Math.abs(n) < 1_000_000_000) return (Math.round(n / 10_000) / 100).toFixed(2) + 'm';
+  return (Math.round(n / 10_000_000) / 100).toFixed(2) + 'b';
+}
+function cleanSym(s){ const t=String(s||'').trim(); return t||'Token'; }
 
-function buttons(wallet, window, view) {
-  const tabs = [
-    { t:'🏠 Overview', cb:`pnlv:${wallet}:${window}:overview` },
-    { t:'📈 Profits',  cb:`pnlv:${wallet}:${window}:profits` },
-    { t:'📉 Losses',   cb:`pnlv:${wallet}:${window}:losses` },
-    { t:'📦 Open',     cb:`pnlv:${wallet}:${window}:open` },
-    { t:'🎁 Airdrops', cb:`pnlv:${wallet}:${window}:airdrops` },
-  ];
-  return {
-    reply_markup: {
-      inline_keyboard: [
-        tabs.map(b => ({ text:b.t, callback_data:b.cb })),
-        [{ text:'↻ Refresh', callback_data:`pnl_refresh:${wallet}:${window}` }]
-      ]
-    },
-    disable_web_page_preview: true,
-    parse_mode: 'HTML'
-  };
+function windowButtons(wallet, win, view) {
+  const WINS = ['24h','7d','30d','90d','all'];
+  const row = WINS.map(w => ({ text: w === win ? `· ${w} ·` : w, callback_data: `pnlv:${wallet}:${w}:${view}` }));
+  return [ row ];
 }
 
-function header(data, window) {
-  const b = [];
-  b.push(`💼 <b>Wallet PnL — ${esc(data.wallet.slice(0,6))}…${esc(data.wallet.slice(-4))}</b>`);
-  b.push(`Window: ${esc(window)}`);
-  // Wallet ETH (WETH) balance
-  const ethStr = (data.walletEthTotal && data.walletEth) ? `${Number(data.walletEthTotal).toFixed(6)} ETH` : `${Number(data.walletEth||0).toFixed(6)} ETH`;
-  b.push(`💰 Wallet Balance: ${esc(ethStr)}`);
-  b.push(''); // blank line
-
+export function renderPNL(data, win='30d', view='overview') {
+  const w = data.wallet;
   const t = data.totals || {};
-  const emTotal = signEmoji(t.totalEth || 0);
-  const emReal  = signEmoji(t.realizedEth || 0);
-  const emUnr   = signEmoji(t.unrealizedEth || 0);
 
-  b.push(`💧 ETH IN: ${fmtEth(t.ethIn || 0)} ETH`);
-  b.push(`🔥 ETH OUT: ${fmtEth(t.ethOut || 0)} ETH`);
-  b.push(`📈 Realized: ${emReal} ${fmtEth(t.realizedEth || 0)} ETH`);
-  b.push(`📊 Unrealized: ${emUnr} ${fmtEth(t.unrealizedEth || 0)} ETH`);
-  b.push(`📦 Holdings: ${money(t.holdingsUsd || 0)}`);
-  b.push(`🎁 Airdrops: ${money(t.airdropsUsd || 0)}`);
-  b.push(`${emTotal} Total PnL: ${fmtEth(t.totalEth || 0)} ETH  (${signEmoji(t.totalPct||0)} ${fmtPct(t.totalPct||0)})`);
-  return b.join('\n');
-}
+  const head = [
+    `💼 <b>Wallet PnL</b> — <code>${w.slice(0,6)}…${w.slice(-4)}</code>`,
+    `Window: ${win}`,
+    ``,
+    `💧 ETH IN:  ${round4(t.ethIn)}`,
+    `🔥 ETH OUT: ${round4(t.ethOut)}`,
+    `📈 Realized: ${round4(t.realizedEth)}`,
+    `📊 Unrealized: ${round4(t.unrealizedEth)}`,
+    `📦 Holdings: ${money(t.holdingsUsd)}`,
+    `🎁 Airdrops: ${money(t.airdropsUsd)}`,
+    `${t.totalEth >= 0 ? '🟢' : '🔴'} Total PnL: ${round4(t.totalEth)}  (${pct(t.totalPct)})`
+  ];
 
-/* ---------- Overview ---------- */
-export function renderPNL(data, window='30d', view='overview') {
-  const wallet = data.wallet;
-  const lines = [header(data, window), ''];
+  let body = '';
+  let kb = { inline_keyboard: [] };
 
   if (view === 'overview') {
-    // top 3 profits
-    lines.push(`Top Profits (realized)`);
-    const prof = (data.topProfits || []).slice(0,3);
-    if (!prof.length) lines.push('<i>No realized profits.</i>');
-    for (const p of prof) {
-      const em = signEmoji(p.realizedEth);
-      lines.push(`• ${esc(p.symbol || p.token)} — ${em}`);
-      lines.push(`${em} ${fmtEth(p.realizedEth)} ETH (${em} ${fmtPct(p.realizedPct)})`);
-      lines.push(`Bought ${fmtEth(p.buyEth)} ETH`);
-      lines.push(`Sold ${fmtEth(p.sellEth)} ETH`);
-      lines.push(''); // blank line
-    }
+    const tp = data.topProfits || [];
+    const tl = data.topLosses  || [];
 
-    // top 3 losses
-    lines.push(`Top Losses (realized)`);
-    const loss = (data.topLosses || []).slice(0,3);
-    if (!loss.length) lines.push('<i>No realized losses.</i>');
-    for (const p of loss) {
-      const em = signEmoji(p.realizedEth); // will be 🔴
-      lines.push(`• ${esc(p.symbol || p.token)} — ${em}`);
-      lines.push(`${em} ${fmtEth(p.realizedEth)} ETH (${em} ${fmtPct(p.realizedPct)})`);
-      lines.push(`Bought ${fmtEth(p.buyEth)} ETH`);
-      lines.push(`Sold ${fmtEth(p.sellEth)} ETH`);
-      lines.push(''); // blank line
-    }
+    const tpLines = tp.length ? tp.map(x => [
+      `• ${cleanSym(x.symbol)} — 🟢`,
+      `🟢 ${round4(x.realizedEth)} (${pct(x.realizedPct)})`,
+      `Bought ${round4(x.buyEth)}`,
+      `Sold ${round4(x.sellEth)}`
+    ].join('\n')).join('\n\n') : 'No items';
 
-    return { text: lines.join('\n'), extra: buttons(wallet, window, 'overview') };
+    const tlLines = tl.length ? tl.map(x => [
+      `• ${cleanSym(x.symbol)} — 🔴`,
+      `🔴 ${round4(x.realizedEth)} (${pct(x.realizedPct)})`,
+      `Bought ${round4(x.buyEth)}`,
+      `Sold ${round4(x.sellEth)}`
+    ].join('\n')).join('\n\n') : 'No items';
+
+    body = [
+      ...head,
+      ``,
+      `Top Profits (realized)`,
+      tpLines,
+      ``,
+      `Top Losses (realized)`,
+      tlLines
+    ].join('\n');
+
+    kb.inline_keyboard = [
+      [{ text:'📜 Profits', callback_data:`pnlv:${w}:${win}:profits` },
+       { text:'📉 Losses',  callback_data:`pnlv:${w}:${win}:losses` }],
+      [{ text:'📦 Open',    callback_data:`pnlv:${w}:${win}:open` },
+       { text:'🎁 Airdrops',callback_data:`pnlv:${w}:${win}:airdrops` }],
+      ...windowButtons(w, win, 'overview'),
+      [{ text:'↻ Refresh',  callback_data:`pnl_refresh:${w}:${win}` }]
+    ];
   }
 
   if (view === 'profits') {
-    lines.push(`📈 <b>All Realized Profits</b>`);
-    const rows = (data.fullProfits || []);
-    if (!rows.length) lines.push('<i>No realized profits.</i>');
-    for (const p of rows) {
-      const em = '🟢';
-      lines.push(`• ${esc(p.symbol || p.token)} — ${em}`);
-      lines.push(`${em} ${fmtEth(p.realizedEth)} ETH (${em} ${fmtPct(p.realizedPct)})`);
-      lines.push(`Bought ${fmtEth(p.buyEth)} ETH`);
-      lines.push(`Sold ${fmtEth(p.sellEth)} ETH`);
-      lines.push('');
-    }
-    return { text: lines.join('\n'), extra: buttons(wallet, window, 'profits') };
+    const items = (data.fullProfits || []).map(x => [
+      `• ${cleanSym(x.symbol)} — 🟢`,
+      `🟢 ${round4(x.realizedEth)} (${pct(x.realizedPct)})`,
+      `Bought ${round4(x.buyEth)}`,
+      `Sold ${round4(x.sellEth)}`
+    ].join('\n')).join('\n\n') || 'No items';
+
+    body = [
+      ...head,
+      ``,
+      `All Profits (realized)`,
+      items
+    ].join('\n');
+
+    kb.inline_keyboard = [
+      [{ text:'🏠 Overview', callback_data:`pnlv:${w}:${win}:overview` },
+       { text:'📉 Losses',   callback_data:`pnlv:${w}:${win}:losses` }],
+      [{ text:'📦 Open',     callback_data:`pnlv:${w}:${win}:open` },
+       { text:'🎁 Airdrops', callback_data:`pnlv:${w}:${win}:airdrops` }],
+      ...windowButtons(w, win, 'profits'),
+      [{ text:'↻ Refresh',   callback_data:`pnl_refresh:${w}:${win}` }]
+    ];
   }
 
   if (view === 'losses') {
-    lines.push(`📉 <b>All Realized Losses</b>`);
-    const rows = (data.fullLosses || []);
-    if (!rows.length) lines.push('<i>No realized losses.</i>');
-    for (const p of rows) {
-      const em = '🔴';
-      // realizedEth will be negative; print negative number
-      lines.push(`• ${esc(p.symbol || p.token)} — ${em}`);
-      lines.push(`${em} ${fmtEth(p.realizedEth)} ETH (${em} ${fmtPct(p.realizedPct)})`);
-      lines.push(`Bought ${fmtEth(p.buyEth)} ETH`);
-      lines.push(`Sold ${fmtEth(p.sellEth)} ETH`);
-      lines.push('');
-    }
-    return { text: lines.join('\n'), extra: buttons(wallet, window, 'losses') };
+    const items = (data.fullLosses || []).map(x => [
+      `• ${cleanSym(x.symbol)} — 🔴`,
+      `🔴 ${round4(x.realizedEth)} (${pct(x.realizedPct)})`,
+      `Bought ${round4(x.buyEth)}`,
+      `Sold ${round4(x.sellEth)}`
+    ].join('\n')).join('\n\n') || 'No items';
+
+    body = [
+      ...head,
+      ``,
+      `All Losses (realized)`,
+      items
+    ].join('\n');
+
+    kb.inline_keyboard = [
+      [{ text:'🏠 Overview', callback_data:`pnlv:${w}:${win}:overview` },
+       { text:'📜 Profits',  callback_data:`pnlv:${w}:${win}:profits` }],
+      [{ text:'📦 Open',     callback_data:`pnlv:${w}:${win}:open` },
+       { text:'🎁 Airdrops', callback_data:`pnlv:${w}:${win}:airdrops` }],
+      ...windowButtons(w, win, 'losses'),
+      [{ text:'↻ Refresh',   callback_data:`pnl_refresh:${w}:${win}` }]
+    ];
   }
 
   if (view === 'open') {
-    lines.push(`📦 <b>Open Positions (>$0.10)</b>`);
-    const rows = (data.open || []);
-    if (!rows.length) lines.push('<i>No open positions.</i>');
-    for (const r of rows) {
-      const em = signEmoji(r.unrealizedEth || 0);
-      const sym = r.symbol || r.token;
-      lines.push(`• ${esc(sym)} — ${em}`);
-      lines.push(`Held: ${Number(r.heldNum).toFixed(4)} — Now: ${money(r.usdNow)} (${fmtEth(r.priceNative||0)} ETH/ea)`);
-      lines.push(`Unrealized: ${em} ${fmtEth(r.unrealizedEth||0)} ETH`);
-      lines.push('');
-    }
-    return { text: lines.join('\n'), extra: buttons(wallet, window, 'open') };
+    const items = (data.open || []).map(o => [
+      `• ${cleanSym(o.symbol)}`,
+      `Hold: ${kfmt(o.heldNum)}`,
+      `Now:  ${money(o.usdNow)}`
+    ].join('\n')).join('\n\n') || 'No open positions';
+
+    body = [
+      ...head,
+      ``,
+      `Open Positions`,
+      items
+    ].join('\n');
+
+    kb.inline_keyboard = [
+      [{ text:'🏠 Overview', callback_data:`pnlv:${w}:${win}:overview` },
+       { text:'📜 Profits',  callback_data:`pnlv:${w}:${win}:profits` }],
+      [{ text:'📉 Losses',   callback_data:`pnlv:${w}:${win}:losses` },
+       { text:'🎁 Airdrops', callback_data:`pnlv:${w}:${win}:airdrops` }],
+      ...windowButtons(w, win, 'open'),
+      [{ text:'↻ Refresh',   callback_data:`pnl_refresh:${w}:${win}` }]
+    ];
   }
 
   if (view === 'airdrops') {
-    lines.push(`🎁 <b>Airdrops</b>`);
-    const t = data.airdrops?.tokens || [];
-    const n = data.airdrops?.nfts   || [];
-    if (!t.length && !n.length) lines.push('<i>No airdrops found.</i>');
+    const toks = (data.airdrops?.tokens || []).map(a => `• ${cleanSym(a.symbol)} — qty ${kfmt(a.qty)}`).join('\n') || 'None';
+    const nfts = (data.airdrops?.nfts   || []).map(n => `• ${n.name || 'NFT'} — qty ${n.qty}`).join('\n') || 'None';
 
-    if (t.length) {
-      lines.push('Tokens:');
-      for (const d of t) {
-        const sym = d.symbol || d.name || d.ca;
-        lines.push(`• ${esc(sym)} — qty ${Number(d.qty).toFixed(4)}`);
-      }
-      lines.push('');
-    }
-    if (n.length) {
-      lines.push('NFTs:');
-      for (const a of n) {
-        lines.push(`• ${esc(a.name || a.contract)} — ${a.qty}x`);
-      }
-      lines.push('');
-    }
+    body = [
+      ...head,
+      ``,
+      `Token airdrops`,
+      toks,
+      ``,
+      `NFT airdrops`,
+      nfts
+    ].join('\n');
 
-    return { text: lines.join('\n'), extra: buttons(wallet, window, 'airdrops') };
+    kb.inline_keyboard = [
+      [{ text:'🏠 Overview', callback_data:`pnlv:${w}:${win}:overview` },
+       { text:'📜 Profits',  callback_data:`pnlv:${w}:${win}:profits` }],
+      [{ text:'📉 Losses',   callback_data:`pnlv:${w}:${win}:losses` },
+       { text:'📦 Open',     callback_data:`pnlv:${w}:${win}:open` }],
+      ...windowButtons(w, win, 'airdrops'),
+      [{ text:'↻ Refresh',   callback_data:`pnl_refresh:${w}:${win}` }]
+    ];
   }
 
-  // default fallback -> overview
-  return { text: lines.join('\n'), extra: buttons(wallet, window, 'overview') };
+  return { text: body, extra: { reply_markup: kb } };
 }
