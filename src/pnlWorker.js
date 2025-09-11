@@ -88,6 +88,19 @@ function detectWETH(addr, sym){
   if (USE_SYMBOL_DETECT_WETH && String(sym||'').toUpperCase()==='WETH') return true;
   return false;
 }
+function isETHLikeSym(sym) {
+  const s = String(sym || '').toUpperCase();
+  return s === 'ETH' || s === 'WETH';
+}
+function isETHLikeAddr(addr) {
+  if (!addr) return false;
+  return WETH_SET.has(String(addr).toLowerCase());
+}
+function isETHLikeMeta(meta) {
+  return isETHLikeAddr(meta?.token) || isETHLikeSym(meta?.symbol);
+}
+
+
 
 /* -------------------- Data pulls -------------------- */
 
@@ -530,11 +543,23 @@ export async function refreshPnl(wallet, window='30d') {
   let realizedTotalEth = 0;
   for (const p of positions.values()) realizedTotalEth += Number(p.realizedWei)/1e18;
 
-  const fullProfits = realizedItems.filter(x => x.realizedEth > 0).sort((a,b) => b.realizedPct - a.realizedPct);
-  const fullLosses  = realizedItems.filter(x => x.realizedEth < 0).sort((a,b) => a.realizedPct - b.realizedPct);
+// Filter out ETH/WETH from realized lists
+const realizedItemsFiltered = realizedItems.filter(
+  x => !isETHLikeMeta({ token: x.token, symbol: x.symbol })
+);
 
-  const topProfits = fullProfits.slice(0,3);
-  const topLosses  = fullLosses.slice(0,3);
+// Sort realized lists (ETH/WETH excluded)
+const fullProfits = realizedItemsFiltered
+  .filter(x => x.realizedEth > 0)
+  .sort((a,b) => b.realizedPct - a.realizedPct);
+
+const fullLosses = realizedItemsFiltered
+  .filter(x => x.realizedEth < 0)
+  .sort((a,b) => a.realizedPct - b.realizedPct);
+
+const topProfits = fullProfits.slice(0, 3);
+const topLosses  = fullLosses.slice(0, 3);
+
 
   const totals = {
     ethIn: Number(+round4(ETH_IN)),
