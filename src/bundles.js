@@ -269,3 +269,4 @@ export async function buildFundingMap(contractAddress) {
 
 // default export with both builders
 export default { buildBundlesSnapshot, buildFundingMap };
+export { buildBundlesSnapshot as detectBundles };
