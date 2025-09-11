@@ -328,15 +328,15 @@ export async function refreshPnl(wallet, window='30d') {
     if (!hasEthLeg) continue;
 
     trades.push({
-      hash,
-      ts: rec.ts || 0,
-      token: Object.entries(rec.tokenDeltas).find(([k,v]) => v === chosen)[0],
-      symbol: chosen.symbol || '',
-      decimals: chosen.decimals || 18,
-      tokenDeltaRaw: chosen.deltaRaw, // >0 buy, <0 sell
-      ethInWei:  rec.ethInWei,
-      ethOutWei: rec.ethOutWei,
-    });
+  hash,
+  ts: rec.ts || 0,
+  token: chosen.ca,           // ✅ use the address directly
+  symbol: chosen.symbol || '',
+  decimals: chosen.decimals || 18,
+  tokenDeltaRaw: chosen.deltaRaw, // >0 buy, <0 sell
+  ethInWei:  rec.ethInWei,
+  ethOutWei: rec.ethOutWei,
+});
   }
 
   // 4) Per-token rollup (average cost)
