@@ -519,7 +519,6 @@ export async function refreshPnl(wallet, window='30d') {
   }
   airdropsUsd = Number(+round2(airdropsUsd));
 
-
   // 9) Totals
   let ETH_IN = 0;
   let ETH_OUT = 0;
