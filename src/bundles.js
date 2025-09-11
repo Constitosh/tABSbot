@@ -8,7 +8,7 @@ const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741';
 
 const httpES = axios.create({ baseURL: ES_BASE, timeout: 30_000 });
 
-// gentle throttle (reuse app-wide defaults)
+// Gentle throttle (reuse app-wide defaults)
 const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
 const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS);
 let _last = 0, _chain = Promise.resolve();
@@ -35,68 +35,67 @@ const DEAD = new Set([
 
 const toBig = (x) => BigInt(String(x));
 
-/**
- * Build a lightweight "bundles" snapshot:
- *  - detect creator + moonshot status
- *  - scan earliest token transfers asc
- *  - consider first ~100 distinct recipients who receive directly from:
- *      • creator, OR
- *      • null address (mint), OR
- *      • token contract itself (if moonshot/bonding-curve)
- *  - group buys that land in the same block and near logIndex
- * Cached 10 minutes in Redis: token:<ca>:bundles
- */
-export async function buildBundlesSnapshot(ca) {
-  ca = String(ca || '').toLowerCase();
-  const cacheKey = `token:${ca}:bundles`;
-  const cached = await getJSON(cacheKey);
-  if (cached) return cached;
-
-  // 1) Try Dexscreener token info (creator + moonshot)
+/** ———————————————————————————————————————————————————————————————
+ * Helper: detect creator + “moonshot” allowance (token-as-sender)
+ * Returns { creator, allowTokenAsSender, meta }
+ * ——————————————————————————————————————————————————————————————— */
+async function detectLaunchMeta(ca) {
   let creator = null;
-  let allowTokenAsSender = false; // <— enable when bonding-curve/moonshot
+  let allowTokenAsSender = false;
+  let meta = {};
+
   try {
     const { data } = await axios.get(`https://api.dexscreener.com/tokens/v1/abstract/${ca}`, { timeout: 12_000 });
     const obj = Array.isArray(data) ? data[0] : data;
 
-    // creator may be present here
     if (obj?.creator) creator = String(obj.creator).toLowerCase();
 
-    // detect moonshot
     const dexId = String(obj?.dexId || '').toLowerCase();
     const hasLaunchPadPair = !!obj?.launchPadPair || !!obj?.moonshot?.pairAddress;
     const progress = Number(obj?.moonshot?.progress ?? 0);
 
-    // If it's moonshot (dexId === 'moonshot' or a launchPadPair is present), let token-address-as-sender count.
-    // We also check progress in (0,100) — during bonding curve this is most relevant.
     if (dexId === 'moonshot' || hasLaunchPadPair || (progress > 0 && progress < 100)) {
       allowTokenAsSender = true;
     }
+    meta = { dexId, hasLaunchPadPair, progress };
   } catch {
     // ignore
   }
 
-  // 2) Fallback for creator via contract creation
   if (!creator) {
     try {
       const r = await esGET({ module:'contract', action:'getcontractcreation', contractaddresses: ca });
       const first = Array.isArray(r) ? r[0] : r;
       creator = String(first?.contractCreator || first?.creatorAddress || '').toLowerCase() || null;
-    } catch {
-      // ignore
-    }
+    } catch { /* ignore */ }
   }
 
-  // If we have neither creator nor token-as-sender allowed, we can't infer bundles well — return empty snapshot.
+  return { creator, allowTokenAsSender, meta };
+}
+
+/** ———————————————————————————————————————————————————————————————
+ * buildBundlesSnapshot(ca)
+ *  • Scans earliest transfers (asc) and clusters first ~100 recipients
+ *    receiving directly from creator / ZERO / token (if moonshot).
+ *  • Useful to detect “bundles” of simultaneous early buys.
+ * Cached 10 minutes.
+ * ——————————————————————————————————————————————————————————————— */
+export async function buildBundlesSnapshot(contractAddress) {
+  const ca = String(contractAddress || '').toLowerCase();
+  const cacheKey = `token:${ca}:bundles`;
+  const cached = await getJSON(cacheKey);
+  if (cached) return cached;
+
+  const { creator, allowTokenAsSender, meta } = await detectLaunchMeta(ca);
+
   if (!creator && !allowTokenAsSender) {
-    const res = { updatedAt: Date.now(), totalBundles: 0, groups: [] };
+    const res = { updatedAt: Date.now(), totalBundles: 0, groups: [], hints: { creator:null, allowTokenAsSender:false, meta } };
     await setJSON(cacheKey, res, 600);
     return res;
   }
 
-  // 3) earliest transfers asc (cap)
   const out = [];
-  const PAGES = 12;   // up to ~2400 events
+  const PAGES = 12;   // ~2400 events max
   const OFFSET = 200;
   for (let page=1; page<=PAGES; page++) {
     const batch = await esGET({ module:'account', action:'tokentx', contractaddress: ca, page, offset: OFFSET, sort:'asc' });
@@ -105,22 +104,18 @@ export async function buildBundlesSnapshot(ca) {
     if (batch.length < OFFSET) break;
   }
 
-  // 4) Find first transfer TO creator (bonding start anchor) — keep behavior if creator exists
-  let startIdx = -1;
+  // anchor (first to creator), else start from 0 when moonshot allows token-as-sender
+  let startIdx = 0;
   if (creator) {
+    startIdx = -1;
     for (let i=0;i<out.length;i++) {
       if (String(out[i]?.to||'').toLowerCase() === creator) { startIdx = i; break; }
     }
+    if (startIdx < 0) startIdx = 0;
   }
-  // If no anchor found but moonshot mode is allowed, we still proceed from the beginning;
-  // we'll filter by "from" (creator / zero / token) below.
-  if (startIdx < 0) startIdx = 0;
 
-  // 5) Collect first ~100 distinct recipients who receive tokens directly from
-  //    creator  OR  ZERO (mint)  OR  token address (moonshot/bonding curve).
-  const recipients = []; // [{addr,value,blockNumber,logIndex}]
+  const recipients = [];
   const seen = new Set();
-
   for (let i=startIdx; i<out.length && recipients.length < 100; i++) {
     const ev   = out[i];
     const from = String(ev?.from || '').toLowerCase();
@@ -128,12 +123,12 @@ export async function buildBundlesSnapshot(ca) {
     if (!to || DEAD.has(to)) continue;
     if (seen.has(to)) continue;
 
-    const fromIsCreator = creator && from === creator;
-    const fromIsZero    = from === ZERO;
-    const fromIsToken   = allowTokenAsSender && from === ca;
+    const ok =
+      (creator && from === creator) ||
+      (from === ZERO) ||
+      (allowTokenAsSender && from === ca);
 
-    // Accept if any of the acceptable sources
-    if (!(fromIsCreator || fromIsZero || fromIsToken)) continue;
+    if (!ok) continue;
 
     const val = toBig(ev.value || '0');
     if (val <= 0n) continue;
@@ -147,16 +142,14 @@ export async function buildBundlesSnapshot(ca) {
     seen.add(to);
   }
 
-  // 6) Group recipients by block and logIndex proximity
   const byBlock = new Map();
   for (const r of recipients) {
-    const b = r.blockNumber;
-    if (!byBlock.has(b)) byBlock.set(b, []);
-    byBlock.get(b).push(r);
+    if (!byBlock.has(r.blockNumber)) byBlock.set(r.blockNumber, []);
+    byBlock.get(r.blockNumber).push(r);
   }
 
   const groups = [];
-  for (const [, arr] of byBlock) {
+  for (const arr of byBlock.values()) {
     if (arr.length < 2) continue;
     arr.sort((a,b)=> a.logIndex - b.logIndex);
     let cur = [arr[0]];
@@ -172,7 +165,6 @@ export async function buildBundlesSnapshot(ca) {
     if (cur.length >= 2) groups.push(cur);
   }
 
-  // 7) Stats
   const totalBought = recipients.reduce((acc, r)=> acc + r.value, 0n) || 1n;
   const groupStats = groups.map(g => {
     const members = g.map(x => x.addr);
@@ -189,15 +181,91 @@ export async function buildBundlesSnapshot(ca) {
     updatedAt: Date.now(),
     totalBundles: groupStats.length,
     groups: groupStats,
-    hints: {
-      creator: creator || null,
-      allowTokenAsSender,
-    }
+    hints: { creator, allowTokenAsSender, meta }
   };
 
   await setJSON(cacheKey, result, 600);
   return result;
 }
 
-// default export (belt & suspenders)
-export default { buildBundlesSnapshot };
+/** ———————————————————————————————————————————————————————————————
+ * buildFundingMap(ca)
+ *  • Very lightweight “who funded early” view.
+ *  • Aggregates value transferred FROM (creator | ZERO | token-if-moonshot)
+ *    TO distinct addresses in the earliest ~2000 transfers.
+ *  • Returns a simple ranked list by amount and a few totals.
+ * Cached 10 minutes.
+ * ——————————————————————————————————————————————————————————————— */
+export async function buildFundingMap(contractAddress) {
+  const ca = String(contractAddress || '').toLowerCase();
+  const cacheKey = `token:${ca}:funding`;
+  const cached = await getJSON(cacheKey);
+  if (cached) return cached;
+
+  const { creator, allowTokenAsSender, meta } = await detectLaunchMeta(ca);
+
+  // If we can't identify any valid funding source, return an empty map
+  if (!creator && !allowTokenAsSender) {
+    const res = { updatedAt: Date.now(), sources: [], uniqueRecipients: 0, totalFundedRaw: '0', hints: { creator:null, allowTokenAsSender:false, meta } };
+    await setJSON(cacheKey, res, 600);
+    return res;
+  }
+
+  // earliest transfers (asc), smaller cap than bundles
+  const out = [];
+  const PAGES = 10;   // ~2000
+  const OFFSET = 200;
+  for (let page=1; page<=PAGES; page++) {
+    const batch = await esGET({ module:'account', action:'tokentx', contractaddress: ca, page, offset: OFFSET, sort:'asc' });
+    if (!Array.isArray(batch) || !batch.length) break;
+    out.push(...batch);
+    if (batch.length < OFFSET) break;
+  }
+
+  const totalsBySource = new Map();   // from -> bigint amount
+  const recipientsBySource = new Map(); // from -> Set(to)
+  let totalFunded = 0n;
+
+  for (const ev of out) {
+    const from = String(ev?.from || '').toLowerCase();
+    const to   = String(ev?.to   || '').toLowerCase();
+    if (!to || DEAD.has(to)) continue;
+
+    const isCreator = creator && from === creator;
+    const isZero    = from === ZERO;
+    const isToken   = allowTokenAsSender && from === ca;
+    if (!(isCreator || isZero || isToken)) continue;
+
+    const val = toBig(ev.value || '0');
+    if (val <= 0n) continue;
+
+    totalFunded += val;
+
+    const k = from;
+    totalsBySource.set(k, (totalsBySource.get(k) || 0n) + val);
+    if (!recipientsBySource.has(k)) recipientsBySource.set(k, new Set());
+    recipientsBySource.get(k).add(to);
+  }
+
+  const sources = [...totalsBySource.entries()]
+    .map(([source, amt]) => ({
+      source,
+      amountRaw: amt.toString(),
+      uniqueRecipients: recipientsBySource.get(source)?.size || 0
+    }))
+    .sort((a,b) => (toBig(b.amountRaw) > toBig(a.amountRaw) ? 1 : -1));
+
+  const result = {
+    updatedAt: Date.now(),
+    sources,
+    uniqueRecipients: [...recipientsBySource.values()].reduce((acc, s) => acc + (s?.size || 0), 0),
+    totalFundedRaw: totalFunded.toString(),
+    hints: { creator, allowTokenAsSender, meta }
+  };
+
+  await setJSON(cacheKey, result, 600);
+  return result;
+}
+
+// default export with both builders
+export default { buildBundlesSnapshot, buildFundingMap };
