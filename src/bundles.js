@@ -1,131 +1,162 @@
 // src/bundles.js
-// Bundle detector for "first buyers" on Abstract.
-// Heuristic: wallets are in a bundle if their first buy was funded by the same funder
-// in a short window before the buy.
+import axios from 'axios';
+import { getJSON, setJSON } from './cache.js';
 
-// Types expected from refreshWorker:
-// firstBuys: [{ address, ts, blockNumber, firstBuyAmtRaw (bigint), decimals, percentOfSupply }]
-// fundingMap: Map<buyerAddr, { funder: string, fundTxHash: string, ts: number, blockNumber: number, amountWei: bigint }>
+const ES_BASE  = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
+const ES_KEY   = process.env.ETHERSCAN_API_KEY;
+const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741';
 
-const toPct = (x) => (Math.round(Number(x) * 10000) / 100).toFixed(2); // 0.00..100.00
-const shortAddr = (a) => (a ? (a.slice(0,6) + '…' + a.slice(-4)) : 'unknown');
+const httpES = axios.create({ baseURL: ES_BASE, timeout: 30_000 });
 
-export function detectBundles(firstBuys, fundingMap, {
-  // must be funded no later than this many blocks *before* the first buy
-  maxBlocksBeforeBuy = 200,
-  // group label: funder address
-} = {}) {
-  if (!Array.isArray(firstBuys) || firstBuys.length === 0) {
-    return { groups: [], totals: { buyers: 0, bundledWallets: 0, uniqueFunders: 0, supplyPct: 0 } };
-  }
-
-  // Build groups by funder
-  const byFunder = new Map(); // funder -> { funder, members: [], supplyPct: number }
-  let bundledCount = 0;
-  let totalSupplyPct = 0;
-
-  for (const b of firstBuys) {
-    const buyer = String(b.address || '').toLowerCase();
-    const f = fundingMap.get(buyer);
-    if (!f || !f.funder) continue;
-
-    // only accept if funding happened not too far before buy
-    const blockGap = (b.blockNumber ?? 0) - (f.blockNumber ?? 0);
-    if (!Number.isFinite(blockGap) || blockGap < 0 || blockGap > maxBlocksBeforeBuy) {
-      continue;
-    }
-
-    const key = String(f.funder).toLowerCase();
-    if (!byFunder.has(key)) byFunder.set(key, { funder: key, members: [], supplyPct: 0 });
-    const g = byFunder.get(key);
-
-    g.members.push({
-      buyer,
-      fundTxHash: f.fundTxHash || '',
-      fundTs: f.ts || 0,
-      fundBlock: f.blockNumber || 0,
-      amountWei: f.amountWei || 0n,
-      firstBuyAmtRaw: b.firstBuyAmtRaw || 0n,
-      decimals: b.decimals || 18,
-      percentOfSupply: Number(b.percentOfSupply || 0),
-    });
-    g.supplyPct += Number(b.percentOfSupply || 0);
-    totalSupplyPct += Number(b.percentOfSupply || 0);
-    bundledCount++;
-  }
-
-  // Flatten/sort
-  const groups = [...byFunder.values()]
-    .map(g => ({
-      funder: g.funder,
-      buyers: g.members.length,
-      supplyPct: Number(g.supplyPct.toFixed(4)),
-      members: g.members.sort((a,b) => a.fundTs - b.fundTs),
-    }))
-    .filter(g => g.buyers >= 2) // only meaningful bundles
-    .sort((a, b) => {
-      if (b.buyers !== a.buyers) return b.buyers - a.buyers;
-      return b.supplyPct - a.supplyPct;
-    });
-
-  return {
-    groups,
-    totals: {
-      buyers: firstBuys.length,
-      bundledWallets: bundledCount,
-      uniqueFunders: groups.length,
-      supplyPct: Number(totalSupplyPct.toFixed(4)),
-    }
-  };
+// very gentle throttle: 5 rps (keep same as rest of app)
+const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
+const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS);
+let _last = 0, _chain = Promise.resolve();
+async function throttle() {
+  await (_chain = _chain.then(async () => {
+    const wait = Math.max(0, _last + ES_MIN_INTERVAL - Date.now());
+    if (wait) await new Promise(r => setTimeout(r, wait));
+    _last = Date.now();
+  }));
+}
+async function esGET(params) {
+  await throttle();
+  const { data } = await httpES.get('', { params: { chainid: ES_CHAIN, apikey: ES_KEY, ...params } });
+  if (data?.status === '1') return data.result;
+  throw new Error(data?.result || data?.message || 'Etherscan v2 error');
 }
 
+const DEAD = new Set([
+  '0x0000000000000000000000000000000000000000',
+  '0x000000000000000000000000000000000000dEaD',
+  '0x000000000000000000000000000000000000dead',
+].map(s => s.toLowerCase()));
+
+const toBig = (x) => BigInt(String(x));
+const topicToAddr = (t) => ('0x' + String(t).slice(-40)).toLowerCase();
+
 /**
- * Build a simple funding map from external/internal ETH txs:
- *  - funding if "to=buyer" and value>0
- *  - keep the *closest* funding tx BEFORE the buyer's first buy block
+ * Bundle definition used here:
+ *  - Find the creator address.
+ *  - Take earliest token transfers (ascending) until we have the first 100 *recipient* buys.
+ *  - Group recipients who bought in the same blockNumber (or same blockNumber+logIndex window).
+ *  - A "bundle" = group size >= 2
+ *  - For each bundle: count wallets, sum amounts, compute share of supply (%).
+ *
+ * Result is cached in Redis under token:<ca>:bundles for 10 min.
  */
-export function buildFundingMap(buyers, externalsAsc, internalsAsc) {
-  const map = new Map(); // buyer -> { funder, fundTxHash, blockNumber, ts, amountWei }
-  if (!Array.isArray(buyers) || buyers.length === 0) return map;
+export async function buildBundlesSnapshot(ca) {
+  const key = `token:${ca}:bundles`;
+  const cached = await getJSON(key);
+  if (cached) return cached; // fast path
 
-  // Index both lists by recipient (to) for quick scan
-  const add = (tx, isInternal = false) => {
-    const to = String(tx.to || '').toLowerCase();
-    const from = String(tx.from || '').toLowerCase();
-    if (!to || !from) return;
-    const ts = Number(tx.timeStamp || tx.timestamp || 0);
-    const bn = Number(tx.blockNumber || 0);
-    const val = BigInt(String(tx.value || '0'));
-    if (val <= 0n) return;
+  // 1) get creator (best-effort via Dexscreener token info)
+  let creator = null;
+  try {
+    const { data } = await axios.get(`https://api.dexscreener.com/tokens/v1/abstract/${ca}`, { timeout: 12_000 });
+    creator = String((Array.isArray(data) ? data[0]?.creator : data?.creator) || '').toLowerCase() || null;
+  } catch {}
 
-    let list = idx.get(to);
-    if (!list) idx.set(to, list = []);
-    list.push({ from, hash: tx.hash, ts, bn, val, type: isInternal ? 'internal' : 'external' });
-  };
-
-  const idx = new Map();
-  (externalsAsc || []).forEach(t => add(t, false));
-  (internalsAsc || []).forEach(t => add(t, true));
-
-  for (const b of buyers) {
-    const buyer = String(b.address || '').toLowerCase();
-    const firstBuyBlock = Number(b.blockNumber || 0);
-    const arr = idx.get(buyer) || [];
-    // choose the latest funding strictly before the first buy block
-    let best = null;
-    for (const t of arr) {
-      if (t.bn >= firstBuyBlock) continue;
-      if (!best || t.bn > best.bn) best = t;
-    }
-    if (best) {
-      map.set(buyer, {
-        funder: best.from,
-        fundTxHash: best.hash,
-        blockNumber: best.bn,
-        ts: best.ts,
-        amountWei: best.val,
-      });
-    }
+  // fallback: etherscan contract creation
+  if (!creator) {
+    try {
+      const r = await esGET({ module:'contract', action:'getcontractcreation', contractaddresses: ca });
+      const first = Array.isArray(r) ? r[0] : r;
+      creator = String(first?.contractCreator || first?.creatorAddress || '').toLowerCase() || null;
+    } catch {}
   }
-  return map;
+  if (!creator) {
+    const res = { updatedAt: Date.now(), totalBundles: 0, groups: [] };
+    await setJSON(key, res, 600);
+    return res;
+  }
+
+  // 2) earliest token transfers ascending (just enough to capture ~first 100 buys)
+  const out = [];
+  const PAGES = 12; // 12*200 = 2400 events max
+  const OFFSET = 200;
+  for (let page=1; page<=PAGES; page++) {
+    const batch = await esGET({ module:'account', action:'tokentx', contractaddress: ca, page, offset: OFFSET, sort:'asc' });
+    if (!Array.isArray(batch) || !batch.length) break;
+    out.push(...batch);
+    if (batch.length < OFFSET) break;
+  }
+
+  // 3) walk until first "creator receives" then collect first 100 distinct recipient buys (not dead)
+  let startIdx = -1;
+  for (let i=0;i<out.length;i++) {
+    if (String(out[i]?.to||'').toLowerCase() === creator) { startIdx = i; break; }
+  }
+  if (startIdx < 0) {
+    const res = { updatedAt: Date.now(), totalBundles: 0, groups: [] };
+    await setJSON(key, res, 600);
+    return res;
+  }
+
+  const recipients = []; // [{addr, value, blockNumber, logIndex}]
+  const seen = new Set();
+  for (let i=startIdx;i<out.length && recipients.length < 100;i++) {
+    const ev = out[i];
+    const to = String(ev?.to||'').toLowerCase();
+    if (!to || DEAD.has(to)) continue;
+    if (seen.has(to)) continue;
+    // must be a positive incoming transfer to the buyer
+    if (String(ev?.from||'').toLowerCase() !== creator) continue;
+    const val = toBig(ev.value||'0');
+    if (val <= 0n) continue;
+    recipients.push({
+      addr: to,
+      value: val,
+      blockNumber: Number(ev.blockNumber||0),
+      logIndex: Number(ev.logIndex||0)
+    });
+    seen.add(to);
+  }
+
+  // 4) group by blockNumber (and very close logIndex)
+  const byBlock = new Map();
+  for (const r of recipients) {
+    const keyB = r.blockNumber;
+    if (!byBlock.has(keyB)) byBlock.set(keyB, []);
+    byBlock.get(keyB).push(r);
+  }
+
+  const groups = [];
+  for (const [bn, arr] of byBlock.entries()) {
+    if (arr.length < 2) continue; // bundle = at least 2 buyers same block
+    // sub-group if needed by small logIndex windows (optional)
+    arr.sort((a,b)=> a.logIndex - b.logIndex);
+    let cur = [arr[0]];
+    for (let i=1;i<arr.length;i++) {
+      const prev = cur[cur.length-1];
+      if (Math.abs(arr[i].logIndex - prev.logIndex) <= 3) {
+        cur.push(arr[i]);
+      } else {
+        if (cur.length >= 2) groups.push(cur);
+        cur = [arr[i]];
+      }
+    }
+    if (cur.length >= 2) groups.push(cur);
+  }
+
+  // 5) compute stats per group
+  const totalBought = recipients.reduce((acc, r)=> acc + r.value, 0n) || 1n;
+  const groupStats = groups.map(g => {
+    const members = g.map(x => x.addr);
+    const sum = g.reduce((a,b)=> a + b.value, 0n);
+    const share = Number((sum * 10000n) / totalBought) / 100; // % of the first-100-buys pot
+    return {
+      size: g.length,
+      buyers: members.slice(0, 10), // sample (avoid long lines)
+      sharePct: +share.toFixed(2)
+    };
+  }).sort((a,b)=> b.size - a.size || b.sharePct - a.sharePct);
+
+  const result = {
+    updatedAt: Date.now(),
+    totalBundles: groupStats.length,
+    groups: groupStats
+  };
+  await setJSON(key, result, 600); // 10 minutes
+  return result;
 }
