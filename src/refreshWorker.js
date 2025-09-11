@@ -12,6 +12,8 @@ import { Worker, Queue } from 'bullmq';
 
 import { setJSON, withLock } from './cache.js';
 import { getDexscreenerTokenStats } from './services/dexscreener.js';
+import { detectBundles, buildFundingMap } from './bundles.js';
+
 
 // ---------- Dexscreener helpers ----------
 async function getDexCreator(ca) {
