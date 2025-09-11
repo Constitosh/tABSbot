@@ -484,6 +484,7 @@ export async function refreshPnl(wallet, window='30d') {
   .sort((a,b)=> b.usdNow - a.usdNow);
 
   // 8) Airdrops
+  // 8) Airdrops
   const tokenAirdrops = {};
   for (const [hash, rec] of txmap.entries()) {
     if (sinceTs && rec.ts && rec.ts < sinceTs) continue;
