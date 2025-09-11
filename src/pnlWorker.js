@@ -66,7 +66,7 @@ function bnToNum(raw, decimals) {
   } catch { return 0; }
 }
 function round4(x){ return (Math.round(Number(x)*1e4)/1e4).toFixed(4); }
-function money(x, n=2){ return '$'+(Math.round(Number(x)*10**n)/10**n).toFixed(n); }
+function round2(x){ return (Math.round(Number(x)*100)/100).toFixed(2); }
 function parseWindow(win) {
   const now = Math.floor(Date.now() / 1000);
   if (win === '24h') return now - 24 * 3600;
@@ -160,6 +160,7 @@ async function getTokenPairsBulk(tokenCAs) {
             symbol: p?.baseToken?.symbol || '',
             name: p?.baseToken?.name || '',
             priceUsd: Number(p?.priceUsd || 0),
+            priceNative: Number(p?.priceNative || 0), // <— needed for unrealized ETH
           };
         }
       }
@@ -215,10 +216,8 @@ function weiToEthStr(wei) {
 
 const DUST_THRESHOLD = 5n;
 
-// Pick the traded token inside a hash (handles bonding buys vs swaps)
-// We accept the **dominant** delta by absolute value, but if there is a clear ETH leg,
-// prefer token whose sign matches the ETH leg direction (buy: +token & ETH out; sell: -token & ETH in).
-function chooseTradeToken(rec, wallet) {
+// Select traded token in a multi-delta tx
+function chooseTradeToken(rec) {
   const keys = Object.keys(rec.tokenDeltas);
   if (!keys.length) return null;
 
@@ -238,7 +237,6 @@ function chooseTradeToken(rec, wallet) {
   });
 
   if (isBuy) {
-    // if dominant is positive, keep it; otherwise try a positive one
     if (dominant.deltaRaw < 0n) {
       const pos = items.filter(x => x.deltaRaw > 0n);
       if (pos.length) dominant = pos.reduce((a,b)=> a.deltaRaw > b.deltaRaw ? a : b);
@@ -259,7 +257,7 @@ export async function refreshPnl(wallet, window='30d') {
 
   const sinceTs = parseWindow(window);
 
-  // 1) Fetch
+  // 1) Fetch txs
   const [normals, internals, tokentx] = await Promise.all([
     getTxList(acct),
     getInternalByAddress(acct),
@@ -306,7 +304,6 @@ export async function refreshPnl(wallet, window='30d') {
     let rec = txmap.get(h); if (!rec) txmap.set(h, rec = { ts, ethInWei:0n, ethOutWei:0n, tokenDeltas:{} });
 
     if (detectWETH(ca, sym)) {
-      // convert WETH to ETH-equivalent
       const wei = raw * (ONE_E18 / (10n ** BigInt(dec)));
       if (to === acct)   rec.ethInWei  += wei;
       if (from === acct) rec.ethOutWei += wei;
@@ -324,13 +321,10 @@ export async function refreshPnl(wallet, window='30d') {
   const trades = [];
   for (const [hash, rec] of txmap.entries()) {
     if (sinceTs && rec.ts && rec.ts < sinceTs) continue;
-
-    const chosen = chooseTradeToken(rec, acct);
+    const chosen = chooseTradeToken(rec);
     if (!chosen) continue;
-
     const hasEthLeg = (rec.ethInWei > 0n || rec.ethOutWei > 0n);
-    if (!hasEthLeg) continue; // avoid misclassifying pure token transfers
-
+    if (!hasEthLeg) continue; // avoid pure transfers
     trades.push({
       hash,
       ts: rec.ts || 0,
@@ -374,7 +368,7 @@ export async function refreshPnl(wallet, window='30d') {
     }
   }
 
-  // realized PnL (always compute; list realized even if still holding)
+  // realized PnL (list realized even if still holding)
   for (const p of positions.values()) {
     const bought = p.qtyBoughtRaw;
     const sold   = p.qtySoldRaw;
@@ -412,10 +406,12 @@ export async function refreshPnl(wallet, window='30d') {
         token: p.token,
         symbol: p.symbol,
         decimals: p.decimals,
-        buyEth: +round4(buyEthPortion),
-        sellEth: +round4(sellEth),
-        realizedEth: +round4(realizedEth),
-        realizedPct: +round4(realizedPct),
+        buyEth: Number(+round4(buyEthPortion)),
+        sellEth: Number(+round4(sellEth)),
+        realizedEth: Number(+round4(realizedEth)),
+        realizedPct: Number(+round4(realizedPct)),
+        avgBuyEth: Number(+round4(avgBuyEth)),
+        heldNum: bnToNum(heldBig, p.decimals),
       });
     }
 
@@ -425,12 +421,12 @@ export async function refreshPnl(wallet, window='30d') {
         symbol: p.symbol,
         decimals: p.decimals,
         heldNum: bnToNum(heldBig, p.decimals),
-        avgBuyEth: avgBuyEth,
+        avgBuyEth: Number(+round4(avgBuyEth)),
       });
     }
   }
 
-  // 6) Optional: enrich open positions via Alchemy balances (captures holdings with no recent trades)
+  // 6) Optional: enrich open via Alchemy balances (holdings with no recent trades)
   if (ALCHEMY_RPC) {
     try {
       const bals = await getAlchemyBalances(acct);
@@ -444,9 +440,7 @@ export async function refreshPnl(wallet, window='30d') {
         add.push({ token: ca, symbol: '', decimals: 18, heldNum: 0, _raw: raw });
       }
       const metaByToken = {};
-      for (const tr of trades) {
-        metaByToken[tr.token.toLowerCase()] = { decimals: tr.decimals, symbol: tr.symbol };
-      }
+      for (const tr of trades) metaByToken[tr.token.toLowerCase()] = { decimals: tr.decimals, symbol: tr.symbol };
       for (const it of add) {
         const meta = metaByToken[it.token] || { decimals: 18, symbol: '' };
         it.decimals = meta.decimals;
@@ -458,20 +452,36 @@ export async function refreshPnl(wallet, window='30d') {
     } catch {}
   }
 
-  // 7) Price open positions (USD)
+  // 7) Price open positions (USD + ETH native). Also compute unrealized in ETH.
   const priceMap = await getTokenPairsBulk(openItems.map(x => x.token));
   let holdingsUsd = 0;
+  let unrealizedEthSum = 0;
+
   const openEnriched = openItems.map(o => {
     const info = priceMap[o.token?.toLowerCase()] || {};
-    const usd = Number(info.priceUsd || 0) * (o.heldNum || 0);
+    const priceUsd    = Number(info.priceUsd || 0);
+    const priceNative = Number(info.priceNative || 0); // ETH per token
+    const usd = priceUsd * (o.heldNum || 0);
     holdingsUsd += usd;
+
+    // unrealized in ETH: current value in ETH minus cost basis for remaining tokens
+    const currEth = priceNative * (o.heldNum || 0);
+    const cbEth   = (o.avgBuyEth || 0) * (o.heldNum || 0);
+    const uPnL    = currEth - cbEth;
+    unrealizedEthSum += uPnL;
+
     return {
       ...o,
       name: info.name || '',
       symbol: info.symbol || o.symbol || '',
-      usdNow: Math.round(usd * 100) / 100
+      usdNow: Number(+round2(usd)),
+      priceNative: Number(+round4(priceNative)),
+      unrealizedEth: Number(+round4(uPnL)),
     };
-  }).sort((a,b)=> b.usdNow - a.usdNow);
+  })
+  // filter tiny positions (>$0.10 only)
+  .filter(x => x.usdNow >= 0.10)
+  .sort((a,b)=> b.usdNow - a.usdNow);
 
   // 8) Airdrops
   const tokenAirdrops = {};
@@ -507,7 +517,7 @@ export async function refreshPnl(wallet, window='30d') {
     const qty = bnToNum(d.qtyRaw, d.decimals);
     airdropsUsd += Number(info.priceUsd || 0) * qty;
   }
-  airdropsUsd = Math.round(airdropsUsd * 100) / 100;
+  airdropsUsd = Number(+round2(airdropsUsd));
 
   // 9) Totals
   let ETH_IN = 0;
@@ -527,14 +537,14 @@ export async function refreshPnl(wallet, window='30d') {
   const topLosses  = fullLosses.slice(0,3);
 
   const totals = {
-    ethIn: +round4(ETH_IN),
-    ethOut:+round4(ETH_OUT),
-    realizedEth: +round4(realizedTotalEth),
-    unrealizedEth: 0,
-    holdingsUsd: Math.round(holdingsUsd * 100)/100,
+    ethIn: Number(+round4(ETH_IN)),
+    ethOut:Number(+round4(ETH_OUT)),
+    realizedEth: Number(+round4(realizedTotalEth)),
+    unrealizedEth: Number(+round4(unrealizedEthSum)),
+    holdingsUsd: Number(+round2(holdingsUsd)),
     airdropsUsd,
-    totalEth: +round4(realizedTotalEth),
-    totalPct: +(ETH_OUT > 0 ? round4((realizedTotalEth / ETH_OUT) * 100) : '0.0000'),
+    totalEth: Number(+round4(realizedTotalEth + unrealizedEthSum)),
+    totalPct: Number(ETH_OUT > 0 ? +round4(((realizedTotalEth + unrealizedEthSum) / ETH_OUT) * 100) : 0),
   };
 
   // 10) Wallet ETH + WETH fold-in (for display on top of /pnl)
@@ -546,7 +556,6 @@ export async function refreshPnl(wallet, window='30d') {
     walletEth = weiToEthStr(wei);
   } catch {}
   try {
-    // If a WETH holding exists in open positions, reuse it
     const wethRow = openEnriched.find(r => String(r.symbol || '').toUpperCase() === 'WETH');
     if (wethRow) walletWeth = String(wethRow.heldNum || '0');
   } catch {}
