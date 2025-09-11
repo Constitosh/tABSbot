@@ -573,6 +573,65 @@ export async function refreshToken(tokenAddress) {
         );
       }
 
+// ---- BUNDLES: build first-100 buyers and detect funding clusters ----
+      let first100Buys = [];
+      try {
+        // Reuse earliest token tx (ascending) to assemble first 100 unique buyers & their first buy size
+        const buyersSeen = new Set();
+        for (const tx of earlyTokentx) {
+          const to = String(tx.to || '').toLowerCase();
+          if (buyersSeen.has(to)) continue;
+          const raw = BigInt(String(tx.value || '0'));
+          buyersSeen.add(to);
+          first100Buys.push({
+            address: to,
+            ts: Number(tx.timeStamp || 0),
+            blockNumber: Number(tx.blockNumber || 0),
+            firstBuyAmtRaw: raw,
+            decimals: Number(tx.tokenDecimal || 18),
+            // % of supply for that first buy (optional; helps sizing bundles)
+            percentOfSupply: (toBig(totalSupplyRaw || '0') > 0n)
+              ? Number(((raw * 1000000n) / toBig(totalSupplyRaw || '0'))) / 10000
+              : 0
+          });
+          if (first100Buys.length >= 100) break;
+        }
+
+        // Fetch ETH funding flows to detect funders
+        // NOTE: we only need external + internal ETH txs once per refresh; keep it light
+        const [extAsc, intAsc] = await Promise.all([
+          esGET({ module:'account', action:'txlist', address: ca, page:1, offset:1, sort:'asc' }) // dummy to warm ESV2
+            .then(() => esGET({ module:'account', action:'txlist', address:'', page:1, offset:1, sort:'asc' })) // no-op
+            .catch(()=>[]), // keep shape
+          esGET({ module:'account', action:'txlistinternal', address:'', page:1, offset:1, sort:'asc' }).catch(()=>[])
+        ]);
+        // Instead of wasting calls in worker, we’ll reuse holder math inputs you already have:
+        // Puller helpers for this token’s buyers:
+        const buyersAddrs = first100Buys.map(b => b.address);
+
+        // We need ETH flows *to buyers*; reuse your Etherscan client to pull per address in a tiny loop
+        const externals = [];
+        const internals = [];
+        for (const a of buyersAddrs) {
+          const ext = await esGET({ module:'account', action:'txlist', address:a, page:1, offset:50, sort:'asc' }).catch(()=>[]);
+          const intx = await esGET({ module:'account', action:'txlistinternal', address:a, page:1, offset:50, sort:'asc' }).catch(()=>[]);
+          externals.push(...(Array.isArray(ext) ? ext : []));
+          internals.push(...(Array.isArray(intx) ? intx : []));
+          if (externals.length + internals.length > 10_000) break; // hard safety
+        }
+
+        // Build per-buyer funding
+        const fundingMap = buildFundingMap(first100Buys, externals, internals);
+
+        // Detect bundles
+        var bundles = detectBundles(first100Buys, fundingMap, { maxBlocksBeforeBuy: 400 });
+      } catch (e) {
+        console.warn('[WORKER] bundles failed:', e?.message || e);
+        var bundles = { groups: [], totals: { buyers: 0, bundledWallets: 0, uniqueFunders: 0, supplyPct: 0 } };
+      }
+
+
+      
       console.log(
         '[WORKER] compute sizes',
         'balances=', balances.size,
@@ -601,6 +660,9 @@ export async function refreshToken(tokenAddress) {
       first20Buyers,
 
       creator: { address: creatorAddr, percent: creatorPercent },
+
+      bundles,
+      
     };
 
     // 5) Cache
