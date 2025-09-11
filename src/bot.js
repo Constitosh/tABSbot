@@ -13,7 +13,7 @@ import { renderBundles } from './renderers_bundles.js';
 
 
 // --- Bot with longer handler timeout + global error catcher ---
-const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 15_000 });
+const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 60_000 });
 
 bot.use(async (ctx, next) => {
   try {
@@ -56,17 +56,16 @@ async function ensureData(ca) {
     const cache = await getJSON(key);
     if (cache) return cache;
 
-    // cold start: try a synchronous refresh once
-    const fresh = await refreshToken(ca);
-    return fresh || null;
-  } catch (e) {
-    // enqueue and ask user to retry
+    // 🔁 No cold computation here — just queue a refresh and return null
     try {
       await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
-    } catch (_) {}
+    } catch {}
+    return null;
+  } catch {
     return null;
   }
 }
+
 
 // Always return { ok:boolean, age?:number, error?:string }
 async function requestRefresh(ca) {
