@@ -1,198 +1,225 @@
 // src/indexWorker.js
 import './configEnv.js';
-import { getJSON, setJSON } from './cache.js';
-import { getDexscreenerTokenStats } from './services/dexscreener.js';
+import axios from 'axios';
+import { getJSON, setJSON, withLock } from './cache.js';
 
-// Your existing snapshot function that builds holders arrays/buckets/gini/etc.
-// If your current file already has a builder, keep it and import it here.
-import { buildHoldersSnapshot } from './holdersIndex.js';
+/**
+ * Keys:
+ *   token:${ca}:index:data      -> the computed index snapshot (6h TTL)
+ *   token:${ca}:index:queued    -> simple flag to avoid duplicate queues (short TTL)
+ */
 
-// Burn list (expand if you have more in your project)
-const DEAD = new Set([
-  '0x0000000000000000000000000000000000000000',
-  '0x000000000000000000000000000000000000dEaD',
-  '0x000000000000000000000000000000000000dead',
-].map(s => s.toLowerCase()));
+const ES_BASE  = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
+const ES_KEY   = process.env.ETHERSCAN_API_KEY;
+const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741';
+if (!ES_KEY) console.warn('[INDEX] ETHERSCAN_API_KEY missing');
 
-// Return lowercased string or null
-const lo = (s) => (s ? String(s).toLowerCase() : null);
+const httpES = axios.create({ baseURL: ES_BASE, timeout: 45_000 });
 
-// Pull likely LP / pool addresses from Dexscreener
-async function getExcludedAddresses(ca) {
+// ---- throttle (same as elsewhere) ----
+const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
+const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS);
+let esLastTs = 0;
+let esChain = Promise.resolve();
+async function throttleES() {
+  await (esChain = esChain.then(async () => {
+    const wait = Math.max(0, esLastTs + ES_MIN_INTERVAL - Date.now());
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    esLastTs = Date.now();
+  }));
+}
+function esParams(params) {
+  return { params: { chainid: ES_CHAIN, apikey: ES_KEY, ...params } };
+}
+async function esGET(params, { tag='' } = {}) {
+  await throttleES();
+  const tries = 3;
+  for (let i = 1; i <= tries; i++) {
+    try {
+      const { data } = await httpES.get('', esParams(params));
+      if (data?.status === '1') return data.result;
+      const msg = data?.result || data?.message || 'Etherscan v2 error';
+      if (i === tries) throw new Error(msg);
+    } catch (e) {
+      if (i === tries) throw e;
+    }
+    await new Promise(r => setTimeout(r, 250*i));
+  }
+}
+
+// ---- helpers ----
+const TOPIC_TRANSFER =
+  '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const ZERO = '0x0000000000000000000000000000000000000000';
+const DEAD = new Set([ZERO, '0x000000000000000000000000000000000000dEaD', '0x000000000000000000000000000000000000dead'].map(s=>s.toLowerCase()));
+const toBig = (x) => BigInt(String(x));
+const topicToAddr = (t) => ('0x' + String(t).slice(-40)).toLowerCase();
+
+async function getCreationBlock(token) {
   try {
-    const { summary } = await getDexscreenerTokenStats(ca);
-    const amm = lo(summary?.pairAddress);
-    const launchPadPair = lo(summary?.launchPadPair);
-    const isMoonshot = !!launchPadPair || String(summary?.dexId || '').toLowerCase() === 'moonshot' || !!summary?.moonshot;
-
-    // If moonshot bonding, the token contract itself often acts as a pool in early phase
-    const excludeTokenAsPool = isMoonshot ? lo(ca) : null;
-
-    const out = new Set([...DEAD]);
-    if (amm) out.add(amm);
-    if (launchPadPair) out.add(launchPadPair);
-    if (excludeTokenAsPool) out.add(excludeTokenAsPool);
-
-    return { excludeSet: out, context: { amm, launchPadPair, isMoonshot, excludeTokenAsPool } };
-  } catch {
-    const out = new Set([...DEAD]);
-    return { excludeSet: out, context: { amm: null, launchPadPair: null, isMoonshot: false, excludeTokenAsPool: null } };
-  }
+    const r = await esGET({ module:'contract', action:'getcontractcreation', contractaddresses: token }, { tag:'creatorBlock' });
+    const first = Array.isArray(r) ? r[0] : r;
+    const n = Number(first?.blockNumber || first?.blocknumber || first);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch {}
+  try {
+    const r = await esGET({ module:'account', action:'tokentx', contractaddress: token, page:1, offset:1, sort:'asc' }, { tag:'firstTx' });
+    const n = Number((Array.isArray(r) && r[0]?.blockNumber) || r?.blockNumber);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch {}
+  return 0;
 }
-
-function pickPercent(h) {
-  // tolerate different field names; ALWAYS return a number in [0..100]
-  const cand = h?.percent ?? h?.pct ?? h?.share ?? 0;
-  const v = Number(cand);
-  return Number.isFinite(v) && v >= 0 ? v : 0;
+async function getLatestBlock() {
+  try {
+    const ts = Math.floor(Date.now()/1000);
+    const r = await esGET({ module:'block', action:'getblocknobytime', timestamp:ts, closest:'before' }, { tag:'latestBlock' });
+    const n = Number(r?.blockNumber || r?.BlockNumber || r);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch {}
+  return 9_223_372_036;
 }
-function pickUSD(h) {
-  // tolerate your value field variants
-  const cand = h?.usd ?? h?.usdNow ?? h?.valueUsd ?? h?.usd_value ?? 0;
-  const v = Number(cand);
-  return Number.isFinite(v) && v >= 0 ? v : 0;
-}
-
-function postFilterSnapshot(raw, excludeSet) {
-  // Prefer a full holders list with addresses. Fall back if your builder used a different key.
-  // Accepted shapes:
-  //  - raw.holdersPerc: [{address, percent/pct, usd?/usdNow?/valueUsd?}, ...]
-  //  - raw.holders:     [{address, percent/pct, ...}, ...]
-  const holdersArray =
-    Array.isArray(raw.holdersPerc) ? raw.holdersPerc
-    : (Array.isArray(raw.holders) ? raw.holders
-    : []);
-
-  // Filter out excluded addresses (LP, launchpad pool/moonshot CA, burn)
-  const filtered = holdersArray.filter(h => !excludeSet.has(String(h?.address || '').toLowerCase()));
-
-  if (!filtered.length) {
-    // Nothing to work with: keep previous summary fields if any
-    return {
-      ...raw,
-      holdersCount: raw.holdersCount ?? 0,
-      top10CombinedPct: raw.top10CombinedPct ?? 0,
-      gini: raw.gini ?? 0,
-      pctBuckets: [],
-      valueBuckets: [],
-      _note: 'postFilter: empty holders after filter or no holders list present',
-    };
-  }
-
-  // ---------- Top 10 combined (filtered) ----------
-  const byPctDesc = [...filtered].sort((a, b) => pickPercent(b) - pickPercent(a));
-  const top10CombinedPct = byPctDesc.slice(0, 10).reduce((sum, h) => sum + pickPercent(h), 0);
-  const holdersCount = filtered.length;
-
-  // ---------- Gini over filtered holders ----------
-  // Convert percent-of-supply to fractions and renormalize to sum=1 for the filtered set
-  const fractions = filtered.map(h => Math.max(0, pickPercent(h)) / 100);
-  const denom = fractions.reduce((a, b) => a + b, 0) || 1;
-  const w = fractions.map(x => x / denom); // sum(w)=1
-
-  // Discrete Lorenz area; G = 1 - 2*Area
-  const s = [...w].sort((a, b) => a - b);
-  let cum = 0, area = 0;
-  for (let i = 0; i < s.length; i++) {
-    const prev = cum;
-    cum += s[i];
-    area += (prev + cum) / 2; // trapezoid
-  }
-  const gini = Math.max(0, Math.min(1, 1 - 2 * (area / s.length)));
-
-  // ---------- % of supply buckets ----------
-  const pctBounds = raw.pctBounds || [
-    { label: '<0.01%', max: 0.01 },
-    { label: '<0.05%', max: 0.05 },
-    { label: '<0.10%', max: 0.10 },
-    { label: '<0.50%', max: 0.50 },
-    { label: '<1.00%', max: 1.00 },
-    { label: '≥1.00%',  max: null },
-  ];
-  const pctBuckets = pctBounds.map(b => ({ label: b.label, count: 0, pct: 0 }));
-  for (const h of filtered) {
-    const p = pickPercent(h);
-    let idx = pctBuckets.length - 1; // default last (≥)
-    for (let i = 0; i < pctBounds.length; i++) {
-      const mx = pctBounds[i].max;
-      if (mx != null && p < mx) { idx = i; break; }
-    }
-    pctBuckets[idx].count++;
-  }
-  for (const b of pctBuckets) {
-    b.pct = Math.round((b.count / holdersCount) * 10000) / 100; // percent of filtered holders
-  }
-
-  // ---------- Value buckets ----------
-  const haveValue = filtered.some(h => pickUSD(h) > 0);
-  let valueBuckets = [];
-  if (haveValue) {
-    const bands = raw.valueBands || [
-      { label: '$0–$10',      min: 0,      max: 10    },
-      { label: '$10–$50',     min: 10,     max: 50    },
-      { label: '$50–$100',    min: 50,     max: 100   },
-      { label: '$100–$250',   min: 100,    max: 250   },
-      { label: '$250–$1,000', min: 250,    max: 1000  },
-      { label: '$1,000+',     min: 1000,   max: null  },
-    ];
-    valueBuckets = bands.map(b => ({ label: b.label, count: 0, pct: 0 }));
-    for (const h of filtered) {
-      const v = pickUSD(h);
-      let idx = valueBuckets.length - 1;
-      for (let i = 0; i < bands.length; i++) {
-        const { min, max } = bands[i];
-        if (v >= min && (max == null || v < max)) { idx = i; break; }
+async function getAllTransferLogs(token, { fromBlock, toBlock, window=200_000, offset=1000 } = {}) {
+  const all = [];
+  let start = fromBlock;
+  while (start <= toBlock) {
+    const end = Math.min(start + window, toBlock);
+    for (let page = 1; ; page++) {
+      const params = {
+        module:'logs', action:'getLogs', address:token,
+        topic0: TOPIC_TRANSFER, fromBlock:start, toBlock:end, page, offset
+      };
+      let batch;
+      try {
+        batch = await esGET(params, { tag:`logs ${start}-${end}` });
+      } catch (e) {
+        break;
       }
-      valueBuckets[idx].count++;
+      if (!Array.isArray(batch) || batch.length === 0) break;
+      all.push(...batch);
+      if (batch.length < offset) break;
     }
-    for (const b of valueBuckets) {
-      b.pct = Math.round((b.count / holdersCount) * 10000) / 100;
-    }
-  } else {
-    // If you built buckets earlier, keep them (but they may not reflect filtering)
-    valueBuckets = Array.isArray(raw.valueBuckets) ? raw.valueBuckets : [];
+    start = end + 1;
   }
-
-  return {
-    ...raw,
-    holdersCount,
-    top10CombinedPct: +top10CombinedPct.toFixed(2),
-    gini: +gini.toFixed(4),
-    pctBuckets,
-    valueBuckets,
-    _note: 'postFilter: filtered metrics computed (LP/CA/Burn excluded)',
-  };
+  all.sort((a,b)=>{
+    const ba = Number(a.blockNumber||0), bb = Number(b.blockNumber||0);
+    if (ba !== bb) return ba - bb;
+    const ia = Number(a.logIndex||0), ib = Number(b.logIndex||0);
+    return ia - ib;
+  });
+  return all;
+}
+async function getTokenTotalSupply(token) {
+  const r = await esGET({ module:'stats', action:'tokensupply', contractaddress: token }, { tag:'supply' });
+  return String(r || '0');
 }
 
-// ------------- Public API -------------
-// Build (or reuse cached) snapshot, then apply post-filtering.
-// Cache the POST-FILTERED result for 6 hours (21600s).
-export async function ensureIndexSnapshot(tokenAddress) {
-  const ca = lo(tokenAddress);
-  if (!/^0x[a-f0-9]{40}$/.test(ca || '')) throw new Error('Bad contract address');
-
-  const cacheKey = `index:${ca}:filtered:v1`;
-  const cached = await getJSON(cacheKey);
-  if (cached && cached.updatedAt && (Date.now() - cached.updatedAt < 6 * 3600 * 1000)) {
-    return cached;
+// Build full balances map from logs
+function balancesFromLogs(logs) {
+  const m = new Map();
+  for (const lg of logs) {
+    const from = topicToAddr(lg.topics[1]);
+    const to   = topicToAddr(lg.topics[2]);
+    const val  = toBig(lg.data);
+    if (!DEAD.has(from)) m.set(from, (m.get(from) || 0n) - val);
+    if (!DEAD.has(to))   m.set(to,   (m.get(to)   || 0n) + val);
   }
+  for (const [a,v] of m) if (v <= 0n) m.delete(a);
+  return m;
+}
 
-  // Build raw snapshot with your existing code (no changes here)
-  const rawKey = `index:${ca}:raw:v1`;
-  let raw = await getJSON(rawKey);
-  if (!raw) {
-    raw = await buildHoldersSnapshot(ca); // <- your existing function
-    // be generous: keep raw for 6h too
-    try { await setJSON(rawKey, raw, 21600); } catch {}
-  }
+// ---------- PUBLIC: queue + compute ----------
+export async function ensureIndexSnapshot(ca) {
+  const token = String(ca||'').toLowerCase();
+  const dataKey   = `token:${token}:index:data`;
+  const queuedKey = `token:${token}:index:queued`;
 
-  const { excludeSet } = await getExcludedAddresses(ca);
-  const filtered = postFilterSnapshot(raw, excludeSet);
+  const cached = await getJSON(dataKey);
+  if (cached) return { ready:true, data: cached };
 
-  // carry over the tokenAddress and updatedAt
-  filtered.tokenAddress = ca;
-  filtered.updatedAt = Date.now();
+  // if already queued recently, don't re-queue
+  const already = await getJSON(queuedKey);
+  if (already) return { ready:false };
 
-  try { await setJSON(cacheKey, filtered, 21600); } catch {}
-  return filtered;
+  await setJSON(queuedKey, { ts: Date.now() }, 300); // 5 min "queued" flag
+  // fire and forget compute (don’t block bot)
+  computeIndexSnapshot(token).catch(e => console.warn('[INDEX] compute failed', token, e?.message || e));
+  return { ready:false };
+}
+
+export async function computeIndexSnapshot(token) {
+  const ca = String(token||'').toLowerCase();
+  const dataKey   = `token:${ca}:index:data`;
+  const lockKey   = `lock:index:${ca}`;
+
+  return withLock(lockKey, 120, async () => {
+    // guard: maybe another worker filled it
+    const cached = await getJSON(dataKey);
+    if (cached) return cached;
+
+    const t0 = Date.now();
+    console.log('[INDEX] compute start', ca);
+
+    // bounds
+    const [fromBlock, toBlock] = await Promise.all([getCreationBlock(ca), getLatestBlock()]);
+    if (!Number.isFinite(fromBlock) || !Number.isFinite(toBlock) || fromBlock<=0 || toBlock<=0 || toBlock<fromBlock) {
+      throw new Error('bad block range');
+    }
+
+    // logs + supply
+    const [logs, supplyRaw] = await Promise.all([
+      getAllTransferLogs(ca, { fromBlock, toBlock, window:200_000, offset:1000 }),
+      getTokenTotalSupply(ca),
+    ]);
+
+    const supply = toBig(supplyRaw || '0');
+    const balances = balancesFromLogs(logs);
+    const rows = [...balances.entries()]
+      .map(([addr, bal]) => [addr, bal > 0n ? bal : 0n])
+      .filter(([,bal]) => bal > 0n)
+      .sort((A,B)=> (B[1] > A[1] ? 1 : (B[1] < A[1] ? -1 : 0)));
+
+    const holdersCount = rows.length;
+
+    // percent per holder
+    const holdersAllPerc = supply > 0n
+      ? rows.map(([,bal]) => Number((bal * 1000000n) / supply) / 10000) // 4 dp
+      : [];
+
+    // top20 + top10 combined
+    const top20 = rows.slice(0,20).map(([address,bal]) => {
+      const pct = supply > 0n ? Number((bal * 1000000n)/supply)/10000 : 0;
+      return { address, balance: bal.toString(), percent: +pct.toFixed(4) };
+    });
+    const top10CombinedPct = +top20.slice(0,10).reduce((a,h)=>a+(h.percent||0),0).toFixed(4);
+
+    // simple Gini
+    const sorted = holdersAllPerc.slice().sort((a,b)=>a-b);
+    const n = sorted.length;
+    let gini = 0;
+    if (n > 1) {
+      let cum = 0;
+      for (let i=0;i<n;i++) cum += (i+1) * sorted[i];
+      const mean = sorted.reduce((a,b)=>a+b,0)/n;
+      if (mean > 0) gini = (2*cum)/(n*sorted.reduce((a,b)=>a+b,0)) - (n+1)/n;
+      gini = Math.max(0, Math.min(1, gini));
+    }
+
+    const payload = {
+      tokenAddress: ca,
+      computedAt: Date.now(),
+      holdersCount,
+      holdersTop20: top20,
+      top10CombinedPct,
+      holdersAllPerc,     // array of percents (0..100)
+      totalSupply: supplyRaw,
+      gini: +gini.toFixed(4),
+      fromBlock,
+      toBlock,
+      ttlSeconds: 6*3600
+    };
+
+    await setJSON(dataKey, payload, 6*3600); // cache 6h
+    console.log('[INDEX] compute done', ca, 'holders=', holdersCount, 'elapsed=', (Date.now()-t0)+'ms');
+    return payload;
+  });
 }
