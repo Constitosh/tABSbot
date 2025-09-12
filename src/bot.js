@@ -170,11 +170,12 @@ bot.action('noop', (ctx) => ctx.answerCbQuery(''));
 bot.action(/^(stats|buyers|holders|refresh|index):/, async (ctx) => {
   const dataStr = ctx.callbackQuery?.data || '';
   try {
-    // ack asap
+    // ACK asap so Telegram doesn't show "loading…" forever
     try { await ctx.answerCbQuery('Working…'); } catch {}
 
     const [kind, ca, maybePage] = dataStr.split(':');
 
+    // ---------- Refresh ----------
     if (kind === 'refresh') {
       const res = await requestRefresh(ca);
       const msg = res.ok
@@ -186,18 +187,21 @@ bot.action(/^(stats|buyers|holders|refresh|index):/, async (ctx) => {
       return;
     }
 
+    // We need summary data for all tabs
     const data = await ensureData(ca);
     if (!data) {
       try { await ctx.answerCbQuery('Initializing… try again shortly.', { show_alert: true }); } catch {}
       return;
     }
 
+    // ---------- Overview ----------
     if (kind === 'stats') {
       const { text, extra } = renderOverview(data);
       await editHTML(ctx, text, extra);
       return;
     }
 
+    // ---------- Buyers (paginated) ----------
     if (kind === 'buyers') {
       const page = Number(maybePage || 1);
       const { text, extra } = renderBuyers(data, page);
@@ -205,6 +209,7 @@ bot.action(/^(stats|buyers|holders|refresh|index):/, async (ctx) => {
       return;
     }
 
+    // ---------- Holders (paginated) ----------
     if (kind === 'holders') {
       const page = Number(maybePage || 1);
       const { text, extra } = renderHolders(data, page);
@@ -212,26 +217,30 @@ bot.action(/^(stats|buyers|holders|refresh|index):/, async (ctx) => {
       return;
     }
 
-    // ---------- NEW: Index ----------
+    // ---------- Index (holder distribution snapshot) ----------
     if (kind === 'index') {
-      // show a safe loading message first (NO stray backticks/unclosed tags)
+      // 1) Show a safe “working” view immediately (no raw `$` or unclosed tags).
       await editHTML(
         ctx,
-        '📈 <b>Index</b>\n\n<i>Crunching holder distribution…</i>',
+        '📈 <b>Index</b>\n\n<i>Crunching holder distribution…</i>\n\nThis runs once and is cached for 6 hours.',
         {
           reply_markup: {
             inline_keyboard: [[
-              { text:'🏠 Overview', callback_data:`stats:${ca}` },
-              { text:'🧑‍🤝‍🧑 Buyers', callback_data:`buyers:${ca}:1` },
-              { text:'📊 Holders', callback_data:`holders:${ca}:1` }
+              { text:'🏠 Overview',        callback_data:`stats:${ca}` },
+              { text:'🧑‍🤝‍🧑 Buyers',     callback_data:`buyers:${ca}:1` },
+              ...(Array.isArray(data?.holdersTop20) && data.holdersTop20.length
+                ? [{ text:'📊 Holders',    callback_data:`holders:${ca}:1` }]
+                : [])
             ]]
           }
         }
       );
 
-      // compute + render
-      const idxData = await refreshIndex(ca);           // <- make sure you have this exported
-      const { text, extra } = renderIndex(idxData);     // <- and this renderer
+      // 2) Kick off (or retrieve) the snapshot without blocking the UI.
+      const first = await ensureIndexSnapshot(ca);   // { ready: boolean, data?: snapshot }
+
+      // 3) Render either the “preparing…” placeholder or the finished snapshot.
+      const { text, extra } = renderIndexView(data, first);
       await editHTML(ctx, text, extra);
       return;
     }
