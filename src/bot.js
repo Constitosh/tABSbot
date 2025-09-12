@@ -15,7 +15,7 @@ import { renderIndexView } from './renderers_index.js';
 
 
 // --- Bot with longer handler timeout + global error catcher ---
-const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 15_000 });
+const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 30_000 });
 
 bot.use(async (ctx, next) => {
   try {
