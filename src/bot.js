@@ -70,6 +70,15 @@ async function ensureData(ca) {
   }
 }
 
+async function ensureIndex(ca) {
+  const key = `index:${ca}`;
+  const cached = await getJSON(key);
+  if (cached) return cached;
+  const snap = await buildIndexSnapshot(ca);
+  await setJSON(key, snap, 6 * 60 * 60);
+  return snap;
+}
+
 // Always return { ok:boolean, age?:number, error?:string }
 async function requestRefresh(ca) {
   try {
