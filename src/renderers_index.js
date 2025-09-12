@@ -22,17 +22,22 @@ export function renderIndexView(snap) {
   const counts = snap?.counts || [];
   const values = snap?.values || [];
   for (let i = 0; i <= bins.length; i++) {
-    const label =
-      (i < bins.length)
-        ? `<$${bins[i]}`
-        : `≥$${bins[bins.length-1]}`;
-    const c = counts[i] || 0;
-    const v = values[i] || 0;
-    lines.push(
-      `${label.padEnd(7,' ')} ${bar(c, totalH)}  <b>${num(c)}</b>  ·  ${esc(money(v,2))}`
-    );
-  }
+  const rawLabel =
+    (i < bins.length)
+      ? `&lt;$${bins[i]}`             // <-- escape <
+      : `≥$${bins[bins.length-1]}`;
+  const c = counts[i] || 0;
+  const v = values[i] || 0;
 
+  // pad without breaking &lt; (treat label as plain text length ~ use fixed width 7 as before)
+  const padded = (i < bins.length)
+    ? `&lt;$${String(bins[i]).padEnd(5,' ')}`
+    : `≥$${String(bins[bins.length-1]).padEnd(6,' ')}`;
+
+  lines.push(
+    `${padded} ${bar(c, totalH)}  <b>${num(c)}</b>  ·  ${esc(money(v,2))}`
+  );
+}
   // % supply bands
   const bands = (snap?.pctSupplyBands || []).map(b => `${esc(b.label)}: <b>${num(b.cnt)}</b>`).join(' • ');
 
