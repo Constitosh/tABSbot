@@ -415,9 +415,6 @@ export async function ensureIndexSnapshot(tokenAddress, { force = false } = {}) 
   return await refreshIndex(tokenAddress, { force });
 }
 
-// Keep whatever else you export:
-export { refreshIndex }; // if not already exported somewhere above
-
 
 
 
