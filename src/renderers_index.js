@@ -1,79 +1,89 @@
-// src/renderers_index.js
-import { esc, money } from './ui_html.js';
+// --- DROP-IN: safe Index renderer ---
+// Requires: esc, money helpers already imported in this file
 
-function bar(n, total) {
-  if (!total) return '';
-  const width = 12; // 12 chars bar
-  const frac = Math.max(0, Math.min(1, n / total));
-  const filled = Math.max(0, Math.min(width, Math.round(frac * width)));
-  return '▉'.repeat(filled) + '░'.repeat(width - filled);
-}
-function num(x){ return Number(x||0).toLocaleString(); }
+export function renderIndexView(s) {
+  // s is the snapshot from ensureIndex()
+  const name = esc(s.market?.name || 'Token');
+  const sym  = esc(s.market?.symbol || '');
+  const ca   = s.tokenAddress;
 
-export function renderIndexView(snap) {
-  const name = esc(snap?.market?.name || 'Token');
-  const sym  = esc(snap?.market?.symbol || '');
-  const cap  = Number(snap?.market?.capUsd || 0);
+  const mcUsd   = Number(s.market?.marketCap || s.market?.fdv || 0);
+  const holders = Number(s.holdersCount || 0);
 
-  // Histogram rows
-  const totalH = (snap?.counts || []).reduce((a,b)=>a+b,0);
-  const lines = [];
-  const bins = snap?.bins || [];
-  const counts = snap?.counts || [];
-  const values = snap?.values || [];
+  // Build human labels (IMPORTANT: escape "<")
+  const bins = s.valueBins || [];         // e.g. [10, 25, 50, 100, 250, 500]
+  const counts = s.valueCounts || [];     // length = bins.length + 1
+  const vals   = s.valueUsd || [];        // total USD per bucket
+
+  const totalH = counts.reduce((a,b)=>a+b,0) || 1;
+
+  const bar = (n, tot) => {
+    // 12-slot bar
+    const filled = Math.max(0, Math.min(12, Math.round((n / tot) * 12)));
+    return '█'.repeat(filled) + '░'.repeat(12 - filled);
+  };
+
+  const num = (x) => (Number(x)||0).toLocaleString();
+
+  const histLines = [];
   for (let i = 0; i <= bins.length; i++) {
-  const rawLabel =
-    (i < bins.length)
-      ? `&lt;$${bins[i]}`             // <-- escape <
-      : `≥$${bins[bins.length-1]}`;
-  const c = counts[i] || 0;
-  const v = values[i] || 0;
+    const label = (i < bins.length)
+      ? `&lt;$${bins[i]}`                  // <-- ESCAPED "<"
+      : `≥$${bins[bins.length - 1]}`;
+    const c = counts[i] || 0;
+    const v = vals[i] || 0;
+    histLines.push(`${label.padEnd(8,' ')} ${bar(c, totalH)}  <b>${num(c)}</b> · ${esc(money(v,2))}`);
+  }
 
-  // pad without breaking &lt; (treat label as plain text length ~ use fixed width 7 as before)
-  const padded = (i < bins.length)
-    ? `&lt;$${String(bins[i]).padEnd(5,' ')}`
-    : `≥$${String(bins[bins.length-1]).padEnd(6,' ')}`;
+  // $10+ vs <$10 split
+  const gt10 = Number(s.holdersValueGTE10 || 0);
+  const lt10 = Math.max(0, totalH - gt10);
 
-  lines.push(
-    `${padded} ${bar(c, totalH)}  <b>${num(c)}</b>  ·  ${esc(money(v,2))}`
-  );
-}
-  // % supply bands
-  const bands = (snap?.pctSupplyBands || []).map(b => `${esc(b.label)}: <b>${num(b.cnt)}</b>`).join(' • ');
+  // Supply bands (escape if any "<")
+  const bands = (s.supplyBands || []).map(b => {
+    const label = String(b.label || '').replace('<','&lt;');
+    return `${label.padEnd(8,' ')} ${bar(b.count || 0, totalH)}  <b>${num(b.count || 0)}</b>`;
+  });
 
-  // Minimal Gini explainer
-  const giniLine = `Gini: <b>${(Number(snap?.gini||0)*100).toFixed(1)}%</b> — 0% = even, 100% = concentrated`;
+  const gini = (typeof s.gini === 'number') ? s.gini.toFixed(3) : 'n/a';
 
-  const text = [
+  const lines = [
     `📈 <b>Index — ${name}${sym ? ` (${sym})` : ''}</b>`,
+    `<code>${ca}</code>`,
     ``,
-    `Cap: <b>${esc(money(cap,0))}</b>   ·   Holders: <b>${num(snap?.holdersCount || 0)}</b>`,
-    `Real holders (≥$10): <b>${num(snap?.realHolders||0)}</b>  ·  <$10: <b>${num(snap?.microHolders||0)}</b>`,
-    giniLine,
+    `Market Cap/FDV: <b>${esc(money(mcUsd,0))}</b>`,
+    `Holders: <b>${num(holders)}</b>`,
     ``,
-    `<b>Value Histogram</b> (holders per USD bucket; bar = share of holders)`,
-    ...lines,
+    `<b>Value Histogram</b>`,
+    ...histLines,
     ``,
-    `<b>Supply Distribution</b>`,
-    bands,
+    `<b>Holder Types</b>`,
+    `≥ $10: <b>${num(gt10)}</b>   ·   &lt; $10: <b>${num(lt10)}</b>`,  // <-- ESCAPED "<"
     ``,
-    `<i>Updated: ${new Date(snap?.updatedAt||Date.now()).toLocaleString()}</i>`,
-  ].join('\n');
+    `<b>Compact Distribution (by % supply)</b>`,
+    ...bands,
+    ``,
+    `Gini (holdings): <b>${gini}</b> — 0 = equal, 1 = concentrated.`,
+    ``,
+    `<i>Updated: ${new Date(s.updatedAt || Date.now()).toLocaleString()}</i>`,
+  ];
 
-  const kb = {
+  const extra = {
     reply_markup: {
       inline_keyboard: [
         [
-          { text:'🏠 Overview', callback_data:`stats:${snap.tokenAddress}` },
-          { text:'🧑‍🤝‍🧑 Buyers', callback_data:`buyers:${snap.tokenAddress}:1` },
-          { text:'📊 Holders', callback_data:`holders:${snap.tokenAddress}:1` },
+          { text:'🏠 Overview', callback_data:`stats:${ca}` },
+          { text:'🧑‍🤝‍🧑 Buyers', callback_data:`buyers:${ca}:1` },
+          { text:'📊 Holders', callback_data:`holders:${ca}:1` },
         ],
         [
-          { text:'↻ Refresh Index', callback_data:`index_refresh:${snap.tokenAddress}` }
+          { text:'↻ Refresh', callback_data:`refresh:${ca}` }
         ]
       ]
-    }
+    },
+    disable_web_page_preview: true,
+    parse_mode: 'HTML',
   };
 
-  return { text, extra: kb };
+  return { text: lines.join('\n'), extra };
 }
