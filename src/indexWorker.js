@@ -40,79 +40,78 @@ async function getExcludedAddresses(ca) {
   }
 }
 
-// Recompute top10, gini and buckets **after** excluding LP/CA/Burn
-function postFilterSnapshot(raw, excludeSet) {
-  // We expect either:
-  //  - raw.holdersPerc: array of { address, percent, usd?, balance? }
-  //  - or raw.holders:   array of { address, percent, ... }
-  //  - plus prebuilt buckets (pctBuckets/valueBuckets) which we’ll rebuild if possible
+function pickPercent(h) {
+  // tolerate different field names; ALWAYS return a number in [0..100]
+  const cand = h?.percent ?? h?.pct ?? h?.share ?? 0;
+  const v = Number(cand);
+  return Number.isFinite(v) && v >= 0 ? v : 0;
+}
+function pickUSD(h) {
+  // tolerate your value field variants
+  const cand = h?.usd ?? h?.usdNow ?? h?.valueUsd ?? h?.usd_value ?? 0;
+  const v = Number(cand);
+  return Number.isFinite(v) && v >= 0 ? v : 0;
+}
 
+function postFilterSnapshot(raw, excludeSet) {
+  // Prefer a full holders list with addresses. Fall back if your builder used a different key.
+  // Accepted shapes:
+  //  - raw.holdersPerc: [{address, percent/pct, usd?/usdNow?/valueUsd?}, ...]
+  //  - raw.holders:     [{address, percent/pct, ...}, ...]
   const holdersArray =
     Array.isArray(raw.holdersPerc) ? raw.holdersPerc
     : (Array.isArray(raw.holders) ? raw.holders
     : []);
 
-  // Filter out excluded addresses
-  const filtered = holdersArray.filter(h => !excludeSet.has(lo(h.address)));
+  // Filter out excluded addresses (LP, launchpad pool/moonshot CA, burn)
+  const filtered = holdersArray.filter(h => !excludeSet.has(String(h?.address || '').toLowerCase()));
 
-  // If nothing to work with, return a shallow safe copy
   if (!filtered.length) {
+    // Nothing to work with: keep previous summary fields if any
     return {
       ...raw,
       holdersCount: raw.holdersCount ?? 0,
       top10CombinedPct: raw.top10CombinedPct ?? 0,
       gini: raw.gini ?? 0,
-      pctBuckets: raw.pctBuckets ?? [],
-      valueBuckets: raw.valueBuckets ?? [],
-      _note: 'postFilter: no holders after filter',
+      pctBuckets: [],
+      valueBuckets: [],
+      _note: 'postFilter: empty holders after filter or no holders list present',
     };
   }
 
-  // --- Top 10 combined (filtered) ---
-  const byPctDesc = [...filtered].sort((a, b) => Number(b.percent || 0) - Number(a.percent || 0));
-  const top10 = byPctDesc.slice(0, 10).reduce((acc, h) => acc + Number(h.percent || 0), 0);
+  // ---------- Top 10 combined (filtered) ----------
+  const byPctDesc = [...filtered].sort((a, b) => pickPercent(b) - pickPercent(a));
+  const top10CombinedPct = byPctDesc.slice(0, 10).reduce((sum, h) => sum + pickPercent(h), 0);
   const holdersCount = filtered.length;
 
-  // --- Gini (filtered, percent as share of total supply in [0..100]) ---
-  // Convert percent to fraction of supply (0..1) and renormalize to sum of “non-excluded supply” for distribution-based gini.
-  // If you prefer supply-based gini (not renormalized), comment the renorm section.
-  const supplyFractions = filtered.map(h => Math.max(0, Number(h.percent || 0)) / 100);
-  const totalShare = supplyFractions.reduce((a, b) => a + b, 0) || 1;
-  // Renormalize to 1 over the filtered set (so bars map nicely to 100% of “considered” holders)
-  const w = supplyFractions.map(x => x / totalShare);
+  // ---------- Gini over filtered holders ----------
+  // Convert percent-of-supply to fractions and renormalize to sum=1 for the filtered set
+  const fractions = filtered.map(h => Math.max(0, pickPercent(h)) / 100);
+  const denom = fractions.reduce((a, b) => a + b, 0) || 1;
+  const w = fractions.map(x => x / denom); // sum(w)=1
 
-  // Gini over weights w where sum(w)=1:
-  // G = 1 - 2 * sum_{i} (cum_i) / n   if equal-weighted holders
-  // We’ll use the discrete sorted formulation for probabilities:
-  const sortedW = [...w].sort((a, b) => a - b);
-  let cum = 0;
-  let lorentzArea = 0;
-  for (let i = 0; i < sortedW.length; i++) {
-    cum += sortedW[i];
-    // trapezoid area increment; since sum(w)=1, the x step is 1/n
-    const prevCum = cum - sortedW[i];
-    lorentzArea += (prevCum + cum) / 2;
+  // Discrete Lorenz area; G = 1 - 2*Area
+  const s = [...w].sort((a, b) => a - b);
+  let cum = 0, area = 0;
+  for (let i = 0; i < s.length; i++) {
+    const prev = cum;
+    cum += s[i];
+    area += (prev + cum) / 2; // trapezoid
   }
-  const n = sortedW.length;
-  // normalize area by n (since the x-axis step sum equals n)
-  const normalizedArea = lorentzArea / n;
-  // Gini = 1 - 2*Area under Lorenz curve
-  const gini = Math.max(0, Math.min(1, 1 - 2 * normalizedArea));
+  const gini = Math.max(0, Math.min(1, 1 - 2 * (area / s.length)));
 
-  // --- Buckets by % of supply (filtered, normalized to 100% of filtered holders) ---
-  // Use your existing boundaries if present; else use fixed set
+  // ---------- % of supply buckets ----------
   const pctBounds = raw.pctBounds || [
     { label: '<0.01%', max: 0.01 },
     { label: '<0.05%', max: 0.05 },
     { label: '<0.10%', max: 0.10 },
     { label: '<0.50%', max: 0.50 },
     { label: '<1.00%', max: 1.00 },
-    { label: '≥1.00%', max: null },
+    { label: '≥1.00%',  max: null },
   ];
-
-  const pctBuckets = pctBounds.map(b => ({ label: b.label, count: 0 }));
+  const pctBuckets = pctBounds.map(b => ({ label: b.label, count: 0, pct: 0 }));
   for (const h of filtered) {
-    const p = Number(h.percent || 0);
+    const p = pickPercent(h);
     let idx = pctBuckets.length - 1; // default last (≥)
     for (let i = 0; i < pctBounds.length; i++) {
       const mx = pctBounds[i].max;
@@ -124,28 +123,25 @@ function postFilterSnapshot(raw, excludeSet) {
     b.pct = Math.round((b.count / holdersCount) * 10000) / 100; // percent of filtered holders
   }
 
-  // --- Buckets by estimated value ---
-  // If you previously calculated per-holder USD value (e.g., h.usd), we’ll use it.
-  // If not present, we fall back to prebuilt raw.valueBuckets (no change).
-  let valueBuckets = Array.isArray(raw.valueBuckets) ? raw.valueBuckets : [];
-  const haveUsd = filtered.some(h => Number.isFinite(Number(h.usd)));
-  if (haveUsd) {
-    // dynamic bands possible; else keep yours
+  // ---------- Value buckets ----------
+  const haveValue = filtered.some(h => pickUSD(h) > 0);
+  let valueBuckets = [];
+  if (haveValue) {
     const bands = raw.valueBands || [
-      { label: '$0–$10',    min: 0,      max: 10 },
-      { label: '$10–$50',   min: 10,     max: 50 },
-      { label: '$50–$100',  min: 50,     max: 100 },
-      { label: '$100–$250', min: 100,    max: 250 },
-      { label: '$250–$1,000', min: 250,  max: 1000 },
-      { label: '$1,000+',   min: 1000,   max: null },
+      { label: '$0–$10',      min: 0,      max: 10    },
+      { label: '$10–$50',     min: 10,     max: 50    },
+      { label: '$50–$100',    min: 50,     max: 100   },
+      { label: '$100–$250',   min: 100,    max: 250   },
+      { label: '$250–$1,000', min: 250,    max: 1000  },
+      { label: '$1,000+',     min: 1000,   max: null  },
     ];
-    valueBuckets = bands.map(b => ({ label: b.label, count: 0 }));
+    valueBuckets = bands.map(b => ({ label: b.label, count: 0, pct: 0 }));
     for (const h of filtered) {
-      const v = Number(h.usd || 0);
+      const v = pickUSD(h);
       let idx = valueBuckets.length - 1;
       for (let i = 0; i < bands.length; i++) {
         const { min, max } = bands[i];
-        if ((v >= min) && (max == null || v < max)) { idx = i; break; }
+        if (v >= min && (max == null || v < max)) { idx = i; break; }
       }
       valueBuckets[idx].count++;
     }
@@ -153,24 +149,18 @@ function postFilterSnapshot(raw, excludeSet) {
       b.pct = Math.round((b.count / holdersCount) * 10000) / 100;
     }
   } else {
-    // Keep existing buckets if you had them, but renormalize pct if counts exist
-    const totalCounts = valueBuckets.reduce((a, b) => a + Number(b.count || 0), 0);
-    if (totalCounts > 0) {
-      for (const b of valueBuckets) {
-        b.pct = Math.round((Number(b.count || 0) / totalCounts) * 10000) / 100;
-      }
-    }
+    // If you built buckets earlier, keep them (but they may not reflect filtering)
+    valueBuckets = Array.isArray(raw.valueBuckets) ? raw.valueBuckets : [];
   }
 
-  // Return merged snapshot with filtered metrics
   return {
     ...raw,
-    holdersCount,             // filtered holders count
-    top10CombinedPct: +top10.toFixed(2),
+    holdersCount,
+    top10CombinedPct: +top10CombinedPct.toFixed(2),
     gini: +gini.toFixed(4),
     pctBuckets,
     valueBuckets,
-    _note: 'postFilter: excluded LP/CA/Burn from stats',
+    _note: 'postFilter: filtered metrics computed (LP/CA/Burn excluded)',
   };
 }
 
