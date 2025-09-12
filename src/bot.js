@@ -265,10 +265,27 @@ bot.on('callback_query', async (ctx) => {
       try { await ctx.answerCbQuery('Refreshed'); } catch {}
       return;
     }
+    
+    
 
     // ignore other callback routes here (handled above)
   } catch (e) {
     console.error('[PNL cb] error:', e?.response?.description || e);
+    try { await ctx.answerCbQuery('Error'); } catch {}
+  }
+});
+
+bot.action(/^index_refresh:/, async (ctx) => {
+  try {
+    const ca = ctx.callbackQuery?.data?.split(':')[1];
+    if (!/^0x[a-f0-9]{40}$/.test(ca)) return ctx.answerCbQuery('Bad address');
+    await ctx.answerCbQuery('Refreshing…');
+    const snap = await buildIndexSnapshot(ca); // force rebuild + cache
+    const { text, extra } = renderIndexView(snap);
+    await editHTML(ctx, text, extra);
+    try { await ctx.answerCbQuery('Refreshed'); } catch {}
+  } catch (e) {
+    console.error('[INDEX refresh] error:', e?.message || e);
     try { await ctx.answerCbQuery('Error'); } catch {}
   }
 });
