@@ -167,7 +167,7 @@ bot.command('pnl', async (ctx) => {
 bot.action('noop', (ctx) => ctx.answerCbQuery(''));
 
 // Main action router for stats/buyers/holders/refresh
-bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
+bot.action(/^(stats|buyers|holders|refresh|index):/, async (ctx) => {
   const dataStr = ctx.callbackQuery?.data || '';
   try {
     // ack asap
