@@ -11,8 +11,8 @@ import { refreshPnl } from './pnlWorker.js'; // ⬅ only refreshPnl to avoid exp
 import { renderPNL } from './renderers_pnl.js';
 
 import { getIndexSnapshot, buildIndexSnapshot } from './indexer.js';
-import { renderIndexView } from './renderers_index.js';
-import { ensureIndex } from './indexWorker.js';
+import { renderIndex } from './renderers_index.js';
+import { refreshIndex } from './indexWorker.js';
 
 // --- Bot with longer handler timeout + global error catcher ---
 const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 30_000 });
