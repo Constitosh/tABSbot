@@ -213,19 +213,28 @@ bot.action(/^(stats|buyers|holders|refresh|index):/, async (ctx) => {
     }
     
         if (kind === 'index') {
-      // compute on demand, cache 6h
-      const snap = await ensureIndex(ca);
-      const { text, extra } = renderIndexView(snap);
-      await editHTML(ctx, text, extra);
-      return;
+  // 1) quickly show a placeholder to avoid Telegram timeouts
+  await editHTML(ctx,
+    `📈 <b>Index</b>\n\n<i>Crunching holder distribution…</i>`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text:'🏠 Overview', callback_data:`stats:${ca}` },
+            { text:'🧑‍🤝‍🧑 Buyers', callback_data:`buyers:${ca}:1` },
+            { text:'📊 Holders', callback_data:`holders:${ca}:1` },
+          ]
+        ]
+      }
     }
-    
-  } catch (e) {
-    console.error('[stats/buyers/holders cb] error:', e?.response?.description || e);
-    try { await ctx.answerCbQuery('Error — try again', { show_alert: true }); } catch {}
-  }
-});
+  );
 
+  // 2) build or get cached snapshot, then re-render
+  const snap = await ensureIndex(ca);
+  const { text, extra } = renderIndexView(snap);
+  await editHTML(ctx, text, extra);
+  return;
+}
 // ----- PNL callbacks (windows / views / refresh) -----
 // Supports:
 //   pnlv:<wallet>:<window>:<view>    (view ∈ overview|profits|losses|open|airdrops)
