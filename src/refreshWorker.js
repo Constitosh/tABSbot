@@ -651,3 +651,27 @@ if (process.argv.includes('--cron') && process.env.DEFAULT_TOKENS) {
     }, 120_000);
   }
 }
+
+import { getJSON } from './cache.js';
+import { buildIndexSnapshot } from './indexer.js';
+
+if (!process.env.DISABLE_INDEX_CRON) {
+  setInterval(async () => {
+    try {
+      const reg = (await getJSON('index:requested')) || {};
+      const list = Object.keys(reg);
+      if (!list.length) return;
+      console.log('[INDEX CRON] refreshing', list.length, 'tokens');
+      for (const ca of list) {
+        try {
+          await buildIndexSnapshot(ca);
+        } catch (e) {
+          console.warn('[INDEX CRON] failed for', ca, e?.message || e);
+        }
+      }
+    } catch (e) {
+      console.warn('[INDEX CRON] loop error:', e?.message || e);
+    }
+  }, 6 * 60 * 60 * 1000); // every 6 hours
+}
+
