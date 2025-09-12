@@ -1,215 +1,225 @@
 // src/indexWorker.js
 import './configEnv.js';
+import axios from 'axios';
 import { getJSON, setJSON, withLock } from './cache.js';
-import { getDexscreenerTokenStats } from './services/dexscreener.js';
-import { buildHoldersSnapshot } from './holdersIndex.js';
 
-/** ---------- helpers ---------- */
-const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
-const sum = (arr) => arr.reduce((a,b)=>a+b, 0);
+/**
+ * Keys:
+ *   token:${ca}:index:data      -> the computed index snapshot (6h TTL)
+ *   token:${ca}:index:queued    -> simple flag to avoid duplicate queues (short TTL)
+ */
 
-/** Choose 6 value buckets (USD) scaled to market cap / FDV */
-function pickDollarBuckets(mcUsd, holdersCount) {
-  const mc = Number(mcUsd || 0);
-  const h  = Number(holdersCount || 0);
+const ES_BASE  = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
+const ES_KEY   = process.env.ETHERSCAN_API_KEY;
+const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741';
+if (!ES_KEY) console.warn('[INDEX] ETHERSCAN_API_KEY missing');
 
-  // base presets (USD)
-  let buckets = [10, 50, 100, 250, 500, 1000];
+const httpES = axios.create({ baseURL: ES_BASE, timeout: 45_000 });
 
-  if (mc > 150_000 && mc <= 600_000) buckets = [25, 100, 250, 500, 1000, 2500];
-  else if (mc > 600_000 && mc <= 2_000_000) buckets = [50, 250, 500, 1000, 2500, 5000];
-  else if (mc > 2_000_000 && mc <= 10_000_000) buckets = [100, 500, 1000, 2500, 5000, 10000];
-  else if (mc > 10_000_000) buckets = [250, 1000, 2500, 5000, 10000, 25000];
-
-  // if there are very few holders, bias lower
-  if (h && h < 200) buckets = buckets.map(v => Math.max(10, Math.round(v * 0.6)));
-
-  return buckets;
+// ---- throttle (same as elsewhere) ----
+const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
+const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS);
+let esLastTs = 0;
+let esChain = Promise.resolve();
+async function throttleES() {
+  await (esChain = esChain.then(async () => {
+    const wait = Math.max(0, esLastTs + ES_MIN_INTERVAL - Date.now());
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    esLastTs = Date.now();
+  }));
+}
+function esParams(params) {
+  return { params: { chainid: ES_CHAIN, apikey: ES_KEY, ...params } };
+}
+async function esGET(params, { tag='' } = {}) {
+  await throttleES();
+  const tries = 3;
+  for (let i = 1; i <= tries; i++) {
+    try {
+      const { data } = await httpES.get('', esParams(params));
+      if (data?.status === '1') return data.result;
+      const msg = data?.result || data?.message || 'Etherscan v2 error';
+      if (i === tries) throw new Error(msg);
+    } catch (e) {
+      if (i === tries) throw e;
+    }
+    await new Promise(r => setTimeout(r, 250*i));
+  }
 }
 
-/** Gini coefficient on non-negative array */
-function gini(values) {
-  const arr = values.filter(v => v > 0).slice().sort((a,b)=>a-b);
-  const n = arr.length;
-  if (n === 0) return 0;
-  const s = arr.reduce((a,b)=>a+b, 0);
-  if (s === 0) return 0;
-  let cum = 0;
-  let num = 0;
-  for (let i = 0; i < n; i++) {
-    cum += arr[i];
-    num += cum;
-  }
-  // Gini = 1 + (1/n) - 2 * (sum_{i} (cum_i) / (n * sum))
-  return clamp(1 + 1/n - (2 * num) / (n * s), 0, 1);
+// ---- helpers ----
+const TOPIC_TRANSFER =
+  '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const ZERO = '0x0000000000000000000000000000000000000000';
+const DEAD = new Set([ZERO, '0x000000000000000000000000000000000000dEaD', '0x000000000000000000000000000000000000dead'].map(s=>s.toLowerCase()));
+const toBig = (x) => BigInt(String(x));
+const topicToAddr = (t) => ('0x' + String(t).slice(-40)).toLowerCase();
+
+async function getCreationBlock(token) {
+  try {
+    const r = await esGET({ module:'contract', action:'getcontractcreation', contractaddresses: token }, { tag:'creatorBlock' });
+    const first = Array.isArray(r) ? r[0] : r;
+    const n = Number(first?.blockNumber || first?.blocknumber || first);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch {}
+  try {
+    const r = await esGET({ module:'account', action:'tokentx', contractaddress: token, page:1, offset:1, sort:'asc' }, { tag:'firstTx' });
+    const n = Number((Array.isArray(r) && r[0]?.blockNumber) || r?.blockNumber);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch {}
+  return 0;
 }
-
-/** Convert holders % → USD values */
-function percentsToUsd(holdersAllPerc, totalSupply, priceUsd) {
-  const supply = Number(totalSupply || 0);
-  const px = Number(priceUsd || 0);
-  if (!holdersAllPerc || !holdersAllPerc.length || !supply || !px) return [];
-  return holdersAllPerc.map(p => (Number(p || 0) / 100) * supply * px);
+async function getLatestBlock() {
+  try {
+    const ts = Math.floor(Date.now()/1000);
+    const r = await esGET({ module:'block', action:'getblocknobytime', timestamp:ts, closest:'before' }, { tag:'latestBlock' });
+    const n = Number(r?.blockNumber || r?.BlockNumber || r);
+    if (Number.isFinite(n) && n > 0) return n;
+  } catch {}
+  return 9_223_372_036;
 }
-
-/** Build distribution buckets & bands */
-function buildDistributions(usdVals, bucketsUsd, percBands, holdersAllPerc) {
-  const counts = bucketsUsd.map(() => 0);
-  for (const v of usdVals) {
-    let idx = 0;
-    while (idx < bucketsUsd.length && v >= bucketsUsd[idx]) idx++;
-    // idx == number of thresholds passed; we count it in that bucket (<= threshold)
-    // For a simple <= bucket, clamp to last index.
-    const place = clamp(idx - 1, 0, bucketsUsd.length - 1);
-    if (v < bucketsUsd[0]) {
-      counts[0] += 1;
-    } else {
-      counts[place] += 1;
-    }
-  }
-
-  // >= $10 vs < $10
-  let above10 = 0, below10 = 0;
-  for (const v of usdVals) (v >= 10 ? above10++ : below10++);
-
-  // percentage-of-supply bands
-  const bandCounts = {
-    lt001: 0, lt005: 0, lt01: 0, lt05: 0, gte1: 0
-  };
-  if (Array.isArray(holdersAllPerc)) {
-    for (const p of holdersAllPerc) {
-      const x = Number(p || 0);
-      if (x >= 1) bandCounts.gte1++;
-      else if (x >= 0.5) bandCounts.lt05++;
-      else if (x >= 0.1) bandCounts.lt01++;
-      else if (x >= 0.05) bandCounts.lt005++;
-      else bandCounts.lt001++;
-    }
-  }
-
-  return { counts, above10, below10, bandCounts };
-}
-
-/** ---------- MAIN: refreshIndex ---------- */
-export async function refreshIndex(tokenAddress) {
-  const ca = String(tokenAddress || '').trim().toLowerCase();
-  if (!/^0x[a-f0-9]{40}$/.test(ca)) throw new Error(`Invalid contract address: ${tokenAddress}`);
-
-  // cache key for index view (6h)
-  const idxKey = `token:${ca}:index`;
-
-  // if cached — return immediately
-  const cached = await getJSON(idxKey);
-  if (cached && typeof cached.updatedAt === 'number' && (Date.now() - cached.updatedAt) < 6 * 3600 * 1000) {
-    return cached;
-  }
-
-  return withLock(`lock:index:${ca}`, 60, async () => {
-    // try again after lock (maybe someone else filled it)
-    const again = await getJSON(idxKey);
-    if (again && typeof again.updatedAt === 'number' && (Date.now() - again.updatedAt) < 6 * 3600 * 1000) {
-      return again;
-    }
-
-    // 1) Pull summary (from your refreshWorker cache)
-    let summary = await getJSON(`token:${ca}:summary`);
-
-    // 2) Ensure we have market + holders snapshot
-    let market = summary?.market || null;
-    if (!market) {
-      try {
-        const { summary: ds } = await getDexscreenerTokenStats(ca);
-        market = ds || null;
-      } catch {}
-    }
-
-    // if snapshot fields are missing, build them now
-    let holdersAllPerc = summary?.holdersAllPerc || null;
-    let totalSupplyRaw = summary?.totalSupply || null;
-    let decimals = Number(summary?.decimals || 18);
-    let holdersCount = summary?.holdersCount || null;
-    let holdersTop20 = summary?.holdersTop20 || null;
-    let top10CombinedPct = summary?.top10CombinedPct || null;
-    let burnedPct = summary?.burnedPct || null;
-
-    if (!holdersAllPerc || !totalSupplyRaw || !holdersCount) {
-      try {
-        const snap = await buildHoldersSnapshot(ca, {
-          balancesHint: null,
-          totalSupplyHint: totalSupplyRaw || null,
-        });
-        if (Array.isArray(snap?.holdersAllPerc)) holdersAllPerc = snap.holdersAllPerc;
-        if (snap?.totalSupply) totalSupplyRaw = String(snap.totalSupply);
-        if (Number.isFinite(snap?.decimals)) decimals = Number(snap.decimals);
-        if (Number.isFinite(snap?.holdersCount)) holdersCount = Number(snap.holdersCount);
-        if (!holdersTop20 && Array.isArray(snap?.holdersTop20)) holdersTop20 = snap.holdersTop20;
-        if (!top10CombinedPct && Number.isFinite(snap?.top10CombinedPct)) top10CombinedPct = snap.top10CombinedPct;
-        if (!burnedPct && Number.isFinite(snap?.burnedPct)) burnedPct = snap.burnedPct;
-      } catch (e) {
-        console.warn('[INDEX] buildHoldersSnapshot failed:', e?.message || e);
-      }
-    }
-
-    // 3) Price/token info
-    const priceUsd = Number(market?.priceUsd || 0);
-    const fdv = Number(market?.marketCap || market?.fdv || 0);
-    const name = market?.name || 'Token';
-    const symbol = market?.symbol || '';
-
-    // 4) If no holders/price — abort with minimal payload so renderer can show a helpful message
-    if (!holdersAllPerc || !holdersAllPerc.length || !priceUsd) {
-      const minimal = {
-        tokenAddress: ca,
-        updatedAt: Date.now(),
-        ok: false,
-        reason: !priceUsd ? 'no_price' : 'no_holders',
-        market: { name, symbol, priceUsd, marketCap: fdv },
+async function getAllTransferLogs(token, { fromBlock, toBlock, window=200_000, offset=1000 } = {}) {
+  const all = [];
+  let start = fromBlock;
+  while (start <= toBlock) {
+    const end = Math.min(start + window, toBlock);
+    for (let page = 1; ; page++) {
+      const params = {
+        module:'logs', action:'getLogs', address:token,
+        topic0: TOPIC_TRANSFER, fromBlock:start, toBlock:end, page, offset
       };
-      await setJSON(idxKey, minimal, 6 * 3600);
-      return minimal;
+      let batch;
+      try {
+        batch = await esGET(params, { tag:`logs ${start}-${end}` });
+      } catch (e) {
+        break;
+      }
+      if (!Array.isArray(batch) || batch.length === 0) break;
+      all.push(...batch);
+      if (batch.length < offset) break;
+    }
+    start = end + 1;
+  }
+  all.sort((a,b)=>{
+    const ba = Number(a.blockNumber||0), bb = Number(b.blockNumber||0);
+    if (ba !== bb) return ba - bb;
+    const ia = Number(a.logIndex||0), ib = Number(b.logIndex||0);
+    return ia - ib;
+  });
+  return all;
+}
+async function getTokenTotalSupply(token) {
+  const r = await esGET({ module:'stats', action:'tokensupply', contractaddress: token }, { tag:'supply' });
+  return String(r || '0');
+}
+
+// Build full balances map from logs
+function balancesFromLogs(logs) {
+  const m = new Map();
+  for (const lg of logs) {
+    const from = topicToAddr(lg.topics[1]);
+    const to   = topicToAddr(lg.topics[2]);
+    const val  = toBig(lg.data);
+    if (!DEAD.has(from)) m.set(from, (m.get(from) || 0n) - val);
+    if (!DEAD.has(to))   m.set(to,   (m.get(to)   || 0n) + val);
+  }
+  for (const [a,v] of m) if (v <= 0n) m.delete(a);
+  return m;
+}
+
+// ---------- PUBLIC: queue + compute ----------
+export async function ensureIndexSnapshot(ca) {
+  const token = String(ca||'').toLowerCase();
+  const dataKey   = `token:${token}:index:data`;
+  const queuedKey = `token:${token}:index:queued`;
+
+  const cached = await getJSON(dataKey);
+  if (cached) return { ready:true, data: cached };
+
+  // if already queued recently, don't re-queue
+  const already = await getJSON(queuedKey);
+  if (already) return { ready:false };
+
+  await setJSON(queuedKey, { ts: Date.now() }, 300); // 5 min "queued" flag
+  // fire and forget compute (don’t block bot)
+  computeIndexSnapshot(token).catch(e => console.warn('[INDEX] compute failed', token, e?.message || e));
+  return { ready:false };
+}
+
+export async function computeIndexSnapshot(token) {
+  const ca = String(token||'').toLowerCase();
+  const dataKey   = `token:${ca}:index:data`;
+  const lockKey   = `lock:index:${ca}`;
+
+  return withLock(lockKey, 120, async () => {
+    // guard: maybe another worker filled it
+    const cached = await getJSON(dataKey);
+    if (cached) return cached;
+
+    const t0 = Date.now();
+    console.log('[INDEX] compute start', ca);
+
+    // bounds
+    const [fromBlock, toBlock] = await Promise.all([getCreationBlock(ca), getLatestBlock()]);
+    if (!Number.isFinite(fromBlock) || !Number.isFinite(toBlock) || fromBlock<=0 || toBlock<=0 || toBlock<fromBlock) {
+      throw new Error('bad block range');
     }
 
-    // 5) Compute USD holdings per holder
-    const totalSupply = Number(totalSupplyRaw || 0); // already raw units; percent is of raw supply
-    const usdValues = percentsToUsd(holdersAllPerc, totalSupply, priceUsd);
+    // logs + supply
+    const [logs, supplyRaw] = await Promise.all([
+      getAllTransferLogs(ca, { fromBlock, toBlock, window:200_000, offset:1000 }),
+      getTokenTotalSupply(ca),
+    ]);
 
-    // 6) Pick buckets & build distributions
-    const bucketsUsd = pickDollarBuckets(fdv, holdersCount);
-    const dist = buildDistributions(usdValues, bucketsUsd, [0.01, 0.05, 0.1, 0.5, 1], holdersAllPerc);
+    const supply = toBig(supplyRaw || '0');
+    const balances = balancesFromLogs(logs);
+    const rows = [...balances.entries()]
+      .map(([addr, bal]) => [addr, bal > 0n ? bal : 0n])
+      .filter(([,bal]) => bal > 0n)
+      .sort((A,B)=> (B[1] > A[1] ? 1 : (B[1] < A[1] ? -1 : 0)));
 
-    // 7) Gini (USD-based)
-    const giniUsd = gini(usdValues);
+    const holdersCount = rows.length;
 
-    // 8) final payload
-    const out = {
-      ok: true,
+    // percent per holder
+    const holdersAllPerc = supply > 0n
+      ? rows.map(([,bal]) => Number((bal * 1000000n) / supply) / 10000) // 4 dp
+      : [];
+
+    // top20 + top10 combined
+    const top20 = rows.slice(0,20).map(([address,bal]) => {
+      const pct = supply > 0n ? Number((bal * 1000000n)/supply)/10000 : 0;
+      return { address, balance: bal.toString(), percent: +pct.toFixed(4) };
+    });
+    const top10CombinedPct = +top20.slice(0,10).reduce((a,h)=>a+(h.percent||0),0).toFixed(4);
+
+    // simple Gini
+    const sorted = holdersAllPerc.slice().sort((a,b)=>a-b);
+    const n = sorted.length;
+    let gini = 0;
+    if (n > 1) {
+      let cum = 0;
+      for (let i=0;i<n;i++) cum += (i+1) * sorted[i];
+      const mean = sorted.reduce((a,b)=>a+b,0)/n;
+      if (mean > 0) gini = (2*cum)/(n*sorted.reduce((a,b)=>a+b,0)) - (n+1)/n;
+      gini = Math.max(0, Math.min(1, gini));
+    }
+
+    const payload = {
       tokenAddress: ca,
-      updatedAt: Date.now(),
-      market: {
-        name, symbol,
-        priceUsd,
-        marketCap: fdv
-      },
-      holders: {
-        count: Number(holdersCount || 0),
-        top10CombinedPct: Number(top10CombinedPct || 0),
-        burnedPct: Number(burnedPct || 0),
-        percBands: dist.bandCounts,          // { lt001, lt005, lt01, lt05, gte1 }
-        holdersAllPerc: holdersAllPerc,      // raw array (optional to render sparklines)
-      },
-      valueBuckets: {
-        thresholds: bucketsUsd,              // 6 numbers (USD)
-        counts: dist.counts,                 // same length as thresholds
-        above10: dist.above10,
-        below10: dist.below10
-      },
-      gini: {
-        usd: Number(giniUsd.toFixed(4))
-      }
+      computedAt: Date.now(),
+      holdersCount,
+      holdersTop20: top20,
+      top10CombinedPct,
+      holdersAllPerc,     // array of percents (0..100)
+      totalSupply: supplyRaw,
+      gini: +gini.toFixed(4),
+      fromBlock,
+      toBlock,
+      ttlSeconds: 6*3600
     };
 
-    // 9) cache 6h
-    await setJSON(idxKey, out, 6 * 3600);
-    return out;
+    await setJSON(dataKey, payload, 6*3600); // cache 6h
+    console.log('[INDEX] compute done', ca, 'holders=', holdersCount, 'elapsed=', (Date.now()-t0)+'ms');
+    return payload;
   });
 }
