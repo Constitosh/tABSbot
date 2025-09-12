@@ -407,3 +407,17 @@ export async function refreshIndex(tokenAddress) {
     return payload;
   });
 }
+
+// --- adapter so bot.js can import ensureIndexSnapshot ---
+export async function ensureIndexSnapshot(tokenAddress, { force = false } = {}) {
+  // If you already have caching inside refreshIndex, this simply forwards the call.
+  // The `force` flag is here in case you later want to bypass cache.
+  return await refreshIndex(tokenAddress, { force });
+}
+
+// Keep whatever else you export:
+export { refreshIndex }; // if not already exported somewhere above
+
+
+
+
