@@ -109,13 +109,16 @@ export function renderOverview(data) {
   const text = lines.join('\n');
 
   // ----- keyboard -----
+    // Keyboard (add Index button)
   const navRow = hasHolders(data)
     ? [
         { text:'🧑‍🤝‍🧑 Buyers',  callback_data:`buyers:${data.tokenAddress}:1` },
-        { text:'📊 Holders',     callback_data:`holders:${data.tokenAddress}:1` }
+        { text:'📊 Holders',     callback_data:`holders:${data.tokenAddress}:1` },
+        { text:'📈 Index',       callback_data:`index:${data.tokenAddress}` }, // <-- NEW
       ]
     : [
-        { text:'🧑‍🤝‍🧑 Buyers',  callback_data:`buyers:${data.tokenAddress}:1` }
+        { text:'🧑‍🤝‍🧑 Buyers',  callback_data:`buyers:${data.tokenAddress}:1` },
+        { text:'📈 Index',       callback_data:`index:${data.tokenAddress}` }, // <-- NEW
       ];
 
   const kb = {
