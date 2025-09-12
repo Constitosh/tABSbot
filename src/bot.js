@@ -211,6 +211,15 @@ bot.action(/^(stats|buyers|holders|refresh|index):/, async (ctx) => {
       await editHTML(ctx, text, extra);
       return;
     }
+    
+        if (kind === 'index') {
+      // compute on demand, cache 6h
+      const snap = await ensureIndex(ca);
+      const { text, extra } = renderIndexView(snap);
+      await editHTML(ctx, text, extra);
+      return;
+    }
+    
   } catch (e) {
     console.error('[stats/buyers/holders cb] error:', e?.response?.description || e);
     try { await ctx.answerCbQuery('Error — try again', { show_alert: true }); } catch {}
