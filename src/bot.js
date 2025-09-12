@@ -10,6 +10,10 @@ import { isAddress } from './util.js';
 import { refreshPnl } from './pnlWorker.js'; // ⬅ only refreshPnl to avoid export mismatch
 import { renderPNL } from './renderers_pnl.js';
 
+import { getIndexSnapshot, buildIndexSnapshot } from './indexer.js';
+import { renderIndexView } from './renderers_index.js';
+
+
 // --- Bot with longer handler timeout + global error catcher ---
 const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 15_000 });
 
