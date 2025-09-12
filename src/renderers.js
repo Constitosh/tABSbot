@@ -112,12 +112,10 @@ export function renderOverview(data) {
   const navRow = hasHolders(data)
     ? [
         { text:'🧑‍🤝‍🧑 Buyers',  callback_data:`buyers:${data.tokenAddress}:1` },
-        { text:'📊 Holders',     callback_data:`holders:${data.tokenAddress}:1` },
-        { text:'📦 Bundles',     callback_data:`bundles:${data.tokenAddress}:1` },
+        { text:'📊 Holders',     callback_data:`holders:${data.tokenAddress}:1` }
       ]
     : [
-        { text:'🧑‍🤝‍🧑 Buyers',  callback_data:`buyers:${data.tokenAddress}:1` },
-        { text:'📦 Bundles',     callback_data:`bundles:${data.tokenAddress}:1` },
+        { text:'🧑‍🤝‍🧑 Buyers',  callback_data:`buyers:${data.tokenAddress}:1` }
       ];
 
   const kb = {
