@@ -10,13 +10,8 @@ import { isAddress } from './util.js';
 import { refreshPnl } from './pnlWorker.js'; // ⬅ only refreshPnl to avoid export mismatch
 import { renderPNL } from './renderers_pnl.js';
 
-import { buildBundlesSnapshot } from './bundles.js';
-import { renderBundlesView } from './renderers_bundles.js';
-
-
-
 // --- Bot with longer handler timeout + global error catcher ---
-const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 60_000 });
+const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 15_000 });
 
 bot.use(async (ctx, next) => {
   try {
@@ -59,16 +54,17 @@ async function ensureData(ca) {
     const cache = await getJSON(key);
     if (cache) return cache;
 
-    // 🔁 No cold computation here — just queue a refresh and return null
+    // cold start: try a synchronous refresh once
+    const fresh = await refreshToken(ca);
+    return fresh || null;
+  } catch (e) {
+    // enqueue and ask user to retry
     try {
       await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
-    } catch {}
-    return null;
-  } catch {
+    } catch (_) {}
     return null;
   }
 }
-
 
 // Always return { ok:boolean, age?:number, error?:string }
 async function requestRefresh(ca) {
@@ -176,23 +172,6 @@ bot.action(/^(stats|buyers|holders|refresh):/, async (ctx) => {
       try { await ctx.answerCbQuery(msg, { show_alert: false }); } catch {}
       return;
     }
-    
-bot.action(/^bundles:/, async (ctx) => {
-  try {
-    const dataStr = ctx.callbackQuery?.data || '';
-    const [, ca] = dataStr.split(':');
-    try { await ctx.answerCbQuery('Scanning early buys…'); } catch {}
-    // get the light summary we already cache (for name + CA):
-    const summary = await ensureData(ca);
-    // build (or fetch cached) bundles snapshot (fast path if cached)
-    const b = await buildBundlesSnapshot(ca);
-    const { text, extra } = renderBundlesView(summary, b);
-    await ctx.editMessageText(text, extra);
-  } catch (e) {
-    console.error('[bundles cb] error', e?.message || e);
-    try { await ctx.answerCbQuery('Bundles failed — try again'); } catch {}
-  }
-});
 
     const data = await ensureData(ca);
     if (!data) {
@@ -219,15 +198,6 @@ bot.action(/^bundles:/, async (ctx) => {
       await editHTML(ctx, text, extra);
       return;
     }
-
-    if (kind === 'bundles') {
-      const page = Number(maybePage || 1);
-      const { text, extra } = renderBundles(data, page);
-      await editHTML(ctx, text, extra);
-      return;
-    }
-
-    
   } catch (e) {
     console.error('[stats/buyers/holders cb] error:', e?.response?.description || e);
     try { await ctx.answerCbQuery('Error — try again', { show_alert: true }); } catch {}
