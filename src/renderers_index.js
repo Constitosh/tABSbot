@@ -100,3 +100,10 @@ export function renderIndex(idxPayload) {
 
   return { text: lines.join('\n'), extra: navKB(ca) };
 }
+
+// Adapter so bot.js can import the name it expects.
+export function renderIndexView(snapshot) {
+  // If your primary renderer is named differently, call it here:
+  return renderIndex(idxPayload);
+}
+
