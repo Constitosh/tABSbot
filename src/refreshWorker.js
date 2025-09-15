@@ -17,22 +17,18 @@ if (!process.env.REDIS_URL) {
   process.exit(1);
 }
 
-// Explicit Redis config
-const redisOptions = {
-  host: '127.0.0.1',
-  port: 6379,
-  password: process.env.REDIS_URL.match(/:([^@]+)@/)?.[1] || undefined,
-  db: 0
-};
-
-const redis = new Redis(redisOptions);
-redis.on('connect', () => console.log('Worker: Redis connected'));
-redis.on('error', (err) => console.error('Worker: Redis error:', err.message));
+// Use cache's redis instance to avoid duplicate connections
+const redis = cache.redis;
+console.log('Worker: Using shared Redis instance');
 
 const queue = new Queue('refresh', { connection: redis });
 const worker = new Worker('refresh', async (job) => {
   const { tokenAddress, chain } = job.data;
-  await refreshToken(tokenAddress, chain);
+  try {
+    await refreshToken(tokenAddress, chain);
+  } catch (err) {
+    console.error('Worker: Refresh error for', { tokenAddress, chain }, err.message);
+  }
 }, { connection: redis });
 
 async function refreshToken(tokenAddress, chain = 'ethereum') {
@@ -75,7 +71,11 @@ if (process.env.CRON === 'true') {
 
   setInterval(async () => {
     for (let d of defaults) {
-      await queue.add('refresh', d, { removeOnComplete: 1 });
+      try {
+        await queue.add('refresh', d, { removeOnComplete: 1 });
+      } catch (err) {
+        console.error('Worker: Queue add error:', err.message);
+      }
     }
   }, 120000);
 }
