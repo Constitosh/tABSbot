@@ -20,6 +20,8 @@ const bullRedis = new Redis(process.env.REDIS_URL, {
 
 export const refreshQueueName = 'tabs_refresh';
 export const refreshQueue = new Queue(refreshQueueName, { connection: bullRedis });
+// 👇 Make a compat export that queueCore.js expects:
+export const queue = refreshQueue;
 
 /* -------------------- Etherscan v2 client -------------------- */
 const ESV2_BASE = process.env.ETHERSCAN_V2_BASE || process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
@@ -32,9 +34,9 @@ const httpES = axios.create({ baseURL: ESV2_BASE, timeout: 45_000 });
 const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
 const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS);
 let esLastTs = 0;
-let esChain = Promise.resolve();
+let esChainGate = Promise.resolve();
 async function throttleES() {
-  await (esChain = esChain.then(async () => {
+  await (esChainGate = esChainGate.then(async () => {
     const wait = Math.max(0, esLastTs + ES_MIN_INTERVAL - Date.now());
     if (wait > 0) await new Promise(r => setTimeout(r, wait));
     esLastTs = Date.now();
