@@ -1,158 +1,105 @@
-// src/bot.js
-import './configEnv.js';
-import { Telegraf } from 'telegraf';
-import { getJSON, setJSON } from './cache.js';
-import { queue } from './queueCore.js';
-import { renderOverview, renderBuyers, renderHolders, renderAbout } from './renderers.js';
-import { isAddress } from './util.js';
+const { Telegraf, Markup } = require('telegraf');
+const cache = require('./cache');
+const { refreshToken, queue } = require('./refreshWorker');
+const { isAddress, shortAddr, num, escapeMarkdownV2 } = require('./util');
+const chains = require('../../chains');
+const { renderTop20Holders, renderFirst20Buyers } = require('./services/compute');
 
-import { refreshPnl } from './pnlWorker.js';
-import { renderPNL } from './renderers_pnl.js';
+const bot = new Telegraf(process.env.BOT_TOKEN);
 
-import { getChainByCmd, chainKey } from './chains.js';
+bot.start((ctx) => ctx.reply('Hi! Use /stats <tokenAddress> [chain] for token stats. See /help.'));
 
-const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 30_000 });
+bot.help((ctx) => {
+  const chainList = Object.keys(chains).map(c => `${c} (${chains[c].name})`).join(', ');
+  ctx.reply(`Available chains: ${chainList}\n\n/stats <CA> [chain] - Get full stats\n/refresh <CA> [chain] - Force refresh (30s cooldown)\nExample: /stats 0x123 base`);
+});
 
-bot.use(async (ctx, next) => {
-  try { await next(); } catch (err) {
-    console.error('[TG] middleware error:', err?.response?.description || err);
+bot.command('stats', async (ctx) => {
+  const args = ctx.message.text.split(/\s+/).slice(1);
+  const tokenAddress = args[0]?.trim();
+  const chain = args[1]?.trim() || 'abstract';
+
+  if (!tokenAddress || !isAddress(tokenAddress)) {
+    return ctx.reply('Invalid token address. Usage: /stats <address> [chain]');
   }
-});
-bot.catch((err, ctx) => {
-  console.error('[TG] Global bot.catch error on update', ctx.updateType, err?.response?.description || err);
-});
+  if (!chains[chain]) {
+    return ctx.reply(`Unknown chain "${chain}". Available: ${Object.keys(chains).join(', ')}`);
+  }
 
-const sendHTML = (ctx, text, extra = {}) =>
-  ctx.replyWithHTML(text, { disable_web_page_preview: true, ...extra });
+  const key = `token:${chain}:${tokenAddress}:summary`;
+  let data = await cache.getJSON(key);
 
-const editHTML = async (ctx, text, extra = {}) => {
-  try {
-    return await ctx.editMessageText(text, {
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      ...extra,
-    });
-  } catch (err) {
-    const desc = err?.response?.description || '';
-    if (desc.includes('message is not modified')) {
-      try { await ctx.answerCbQuery('Already up to date'); } catch {}
+  if (!data) {
+    ctx.reply('Cache miss. Initializing (first fetch may take ~10s)...');
+    try {
+      // Sync refresh for cold start (timeout implied by fetch)
+      data = await refreshToken(tokenAddress, chain);
+    } catch (err) {
+      ctx.reply('Sync fetch failed (e.g., API lag). Queued async refresh—try /stats again in 30s.');
+      queue.add('refresh', { tokenAddress, chain });
       return;
     }
-    throw err;
   }
-};
 
-// ---- data helpers (per-chain) ----
-async function ensureDataChain(ca, dsChain, esChain) {
-  const ck = chainKey(dsChain);
-  const key = `token:${ck}:${ca}:summary`;
-  const cache = await getJSON(key);
-  if (cache) return cache;
+  const { market, top10CombinedPct, burnedPct, creator, first20Buyers, holdersTop20, updatedAt } = data;
+  let text = `*${market.name || 'Unknown'} (${market.symbol || '?'})*\n`;
+  text += `\`${tokenAddress}\`\n\n`;
+  text += `💰 Price: \\$${market.priceUsd.toFixed(6)}\n`;
+  text += `📊 24h Vol: \\$${num(market.volume24h)}\n`;
+  text += `📈 1h: ${market.priceChange.h1.toFixed(2)}\\% | 6h: ${market.priceChange.h6.toFixed(2)}\\% | 24h: ${market.priceChange.h24.toFixed(2)}\\%\n`;
+  text += `💎 FDV: \\$${num(market.marketCap)}\n\n`;
+  text += `*Creator:* \`${shortAddr(creator.address)}\` (${creator.percent.toFixed(2)}\\%)\n`;
+  text += `*Top 10:* ${top10CombinedPct.toFixed(2)}\\%\n`;
+  text += `*Burned:* ${burnedPct.toFixed(2)}\\%\n\n`;
+  text += `*First 20 Buyers:*\n${renderFirst20Buyers(first20Buyers)}\n\n`;
+  text += `*Top 20 Holders:*\n${renderTop20Holders(holdersTop20)}\n\n`;
+  text += `🕐 Updated: ${new Date(updatedAt).toLocaleString()}`;
 
-  try {
-    await setJSON(`token:${ck}:${ca}:last_refresh`, { ts: Date.now() }, 600);
-    await queue.add('refresh',
-      { tokenAddress: ca, dsChain, esChain },
-      { removeOnComplete: true, removeOnFail: true }
-    );
-  } catch (_) {}
-  return null;
-}
+  text = escapeMarkdownV2(text);
 
-async function requestRefreshChain(ca, dsChain, esChain) {
-  const ck = chainKey(dsChain);
-  try {
-    const last = await getJSON(`token:${ck}:${ca}:last_refresh`);
-    const age = last ? (Date.now() - last.ts) / 1000 : Infinity;
-    if (Number.isFinite(age) && age < 30) return { ok:false, age };
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback('🔄 Refresh', `refresh:${chain}:${tokenAddress}`)]
+  ]);
 
-    await setJSON(`token:${ck}:${ca}:last_refresh`, { ts: Date.now() }, 600);
-    await queue.add('refresh',
-      { tokenAddress: ca, dsChain, esChain },
-      { removeOnComplete: true, removeOnFail: true }
-    );
-    return { ok:true };
-  } catch (e) {
-    return { ok:false, error: e?.message || String(e) };
-  }
-}
-
-// ----- Commands -----
-bot.start((ctx) =>
-  ctx.reply(
-    [
-      'tABS Tools ready.',
-      'Use /tabs <contract> (Abstract)  •  /tbase <contract> (Base)  •  /thyper <contract> (HyperEVM)',
-      'Also: /pnl <wallet>',
-      'Example: /tabs  0x1234...abcd',
-    ].join('\n')
-  )
-);
-
-// legacy Abstract
-bot.command('stats', async (ctx) => {
-  const [, caRaw] = (ctx.message?.text || '').trim().split(/\s+/);
-  if (!isAddress(caRaw)) return ctx.reply('Send: /stats <contractAddress>');
-  const ca = caRaw.toLowerCase();
-  const chain = getChainByCmd('tabs'); // Abstract
-  const data = await ensureDataChain(ca, chain.ds, chain.es);
-  if (!data) return ctx.reply('Initializing… try again in a few seconds.');
-  const { text, extra } = renderOverview(data);
-  return sendHTML(ctx, text, extra);
-});
-
-bot.command(['tabs','tbase','thyper'], async (ctx) => {
-  const cmd = (ctx.message?.text || '').split(/\s+/)[0].slice(1); // tabs|tbase|thyper
-  const [, caRaw] = (ctx.message?.text || '').trim().split(/\s+/);
-  if (!isAddress(caRaw)) return ctx.reply(`Send: /${cmd} <contractAddress>`);
-  const ca = caRaw.toLowerCase();
-  const chain = getChainByCmd(cmd);
-
-  const data = await ensureDataChain(ca, chain.ds, chain.es);
-  if (!data) return ctx.reply('Initializing… try again in a few seconds.');
-
-  const { text, extra } = renderOverview(data);
-  return sendHTML(ctx, text, extra);
+  return ctx.replyWithMarkdown(text, keyboard);
 });
 
 bot.command('refresh', async (ctx) => {
-  // defaults to Abstract for backward-compat
-  const [, caRaw] = (ctx.message?.text || '').trim().split(/\s+/);
-  if (!isAddress(caRaw)) return ctx.reply('Send: /refresh <contractAddress>');
-  const ca = caRaw.toLowerCase();
-  const chain = getChainByCmd('tabs');
-  const res = await requestRefreshChain(ca, chain.ds, chain.es);
-  if (!res.ok) {
-    if (typeof res.age === 'number') return ctx.reply(`Recently refreshed (${res.age.toFixed(0)}s ago). Try again shortly.`);
-    return ctx.reply(`Couldn't queue refresh. ${res.error ? 'Error: ' + res.error : ''}`);
+  const args = ctx.message.text.split(/\s+/).slice(1);
+  const tokenAddress = args[0]?.trim();
+  const chain = args[1]?.trim() || 'abstract';
+
+  if (!tokenAddress || !isAddress(tokenAddress) || !chains[chain]) {
+    return ctx.reply('Invalid args. Usage: /refresh <address> [chain]');
   }
-  return ctx.reply(`Refreshing ${ca}…`);
+
+  const key = `token:${chain}:${tokenAddress}:summary`;
+  const lastRefreshKey = `${key}:last_refresh`;
+  const lastRefresh = await cache.getJSON(lastRefreshKey) || 0;
+  if (Date.now() - lastRefresh < 30000) {
+    return ctx.reply('⏰ 30s cooldown active. Try again soon.');
+  }
+
+  await cache.setJSON(lastRefreshKey, Date.now());
+  queue.add('refresh', { tokenAddress, chain });
+  ctx.reply('🔄 Refresh queued! Data updates in ~10s. Use /stats to check.');
 });
 
-// PNL unchanged
-bot.command('pnl', async (ctx) => {
-  try {
-    const parts = (ctx.message?.text || '').trim().split(/\s+/);
-    const wallet = (parts[1] || '').toLowerCase();
-    if (!/^0x[a-f0-9]{40}$/.test(wallet)) return ctx.reply('Usage: /pnl <walletAddress>');
-    const data = await refreshPnl(wallet, '30d');
-    const { text, extra } = renderPNL(data, '30d', 'overview');
-    return ctx.replyWithHTML(text, extra);
-  } catch (e) {
-    console.error('[PNL /pnl] error:', e?.message || e);
-    return ctx.reply('PNL: something went wrong.');
+bot.on('callback_query', async (ctx) => {
+  const [action, chain, tokenAddress] = ctx.callbackQuery.data.split(':');
+  if (action === 'refresh') {
+    const key = `token:${chain}:${tokenAddress}:summary`;
+    const lastRefreshKey = `${key}:last_refresh`;
+    const lastRefresh = await cache.getJSON(lastRefreshKey) || 0;
+    if (Date.now() - lastRefresh < 30000) {
+      return ctx.answerCbQuery('⏰ Cooldown: wait 30s');
+    }
+    await cache.setJSON(lastRefreshKey, Date.now());
+    queue.add('refresh', { tokenAddress, chain });
+    ctx.answerCbQuery('🔄 Refreshing... Check /stats soon.');
   }
+  ctx.answerCbQuery();
 });
 
-/* ====== Callback handlers ====== */
-
-// noop
-bot.action('noop', (ctx) => ctx.answerCbQuery(''));
-
-// Your existing stats/buyers/holders callbacks can remain as-is (Abstract).
-// If/when you want chain-specific callbacks, include ds/es in callback_data like: `stats:<ds>:<es>:<ca>`
-// then thread those into ensureDataChain & requestRefreshChain.
-
-bot.launch().then(() => console.log('tABS Tools bot up.'));
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+bot.launch();
+module.exports = bot;
