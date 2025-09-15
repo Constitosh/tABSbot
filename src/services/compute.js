@@ -1,4 +1,4 @@
-const { shortAddr } = require('../util');
+import { shortAddr } from '../util.js';
 
 function summarizeHolders(holders) {
   const top20 = holders.slice(0, 20);
@@ -24,11 +24,9 @@ function buildCurrentBalanceMap(holders) {
 }
 
 function first20BuyersStatus(transfers, currentBalancesMap, contractAddress) {
-  // Basic known contracts/routers to exclude (add more as needed)
   const knownContracts = [
-    '0x7a250d5630b4cf539739df2c5dacb4c659f2488d', // Uniswap V2 Router ETH
-    '0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45', // Uniswap V3 Router ETH
-    // Add chain-specific routers
+    '0x7a250d5630b4cf539739df2c5dacb4c659f2488d',
+    '0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45'
   ];
   const buyTransfers = transfers.filter(t => 
     t.to !== t.from && 
@@ -42,7 +40,7 @@ function first20BuyersStatus(transfers, currentBalancesMap, contractAddress) {
     const addr = t.to;
     if (!seen.has(addr)) {
       seen.add(addr);
-      const firstReceived = t.value; // Simplistic: use first incoming value
+      const firstReceived = t.value;
       const current = currentBalancesMap.get(addr) || 0n;
       let status;
       if (current === 0n) status = 'SOLD ALL';
@@ -64,7 +62,7 @@ function renderFirst20Buyers(buyers) {
   return buyers.map((b, i) => `${i + 1}. ${shortAddr(b.address)} - ${b.status}`).join('\n');
 }
 
-module.exports = { 
+export { 
   summarizeHolders, 
   buildCurrentBalanceMap, 
   first20BuyersStatus, 
