@@ -1,4 +1,4 @@
-const chains = require('../../chains');
+import chains from '../../chains.js';
 
 async function getDexscreenerTokenStats(tokenAddress, chain) {
   const config = chains[chain];
@@ -34,8 +34,8 @@ async function getDexscreenerTokenStats(tokenAddress, chain) {
       h6: parseFloat(bestPair.priceChange?.h6) || 0,
       h24: parseFloat(bestPair.priceChange?.h24) || 0
     },
-    marketCap: parseFloat(bestPair.fdv) || 0  // FDV for new tokens
+    marketCap: parseFloat(bestPair.fdv) || 0
   };
 }
 
-module.exports = { getDexscreenerTokenStats };
+export { getDexscreenerTokenStats };
