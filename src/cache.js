@@ -1,25 +1,15 @@
 import 'dotenv/config';
 import Redis from 'ioredis';
 
-// Parse REDIS_URL (redis://:password@host:port/db or redis://host:port/db)
-const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379/0';
-const urlMatch = redisUrl.match(/redis:\/\/(?::([^@]+)@)?([^:]+):(\d+)(?:\/(\d+))?/);
-if (!urlMatch) {
-  console.error('Invalid REDIS_URL format:', redisUrl);
+if (!process.env.REDIS_URL) {
+  console.error('Cache: Missing REDIS_URL in .env');
   process.exit(1);
 }
 
-const [, password, host = '127.0.0.1', port = '6379', db = '0'] = urlMatch;
-console.log('Cache: Parsed REDIS_URL:', { host, port, db, hasPassword: !!password });
-
-const redisOptions = {
-  host,
-  port: parseInt(port),
-  password: password || undefined, // Undefined if no password
-  db: parseInt(db)
-};
-
-const redis = new Redis(redisOptions);
+const redis = new Redis(process.env.REDIS_URL, {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false
+});
 redis.on('connect', () => console.log('Cache: Redis connected'));
 redis.on('error', (err) => console.error('Cache: Redis error:', err.message));
 
