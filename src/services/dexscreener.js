@@ -1,15 +1,11 @@
 // src/services/dexscreener.js
-// Dexscreener helpers (multi-chain)
-// Returns a "summary" object used by the UI + worker
+// Dexscreener helpers (multi-chain) -> returns a normalized "summary" for UI/worker.
 
 import axios from 'axios';
 
 const DS_BASE = process.env.DS_ENDPOINT || 'https://api.dexscreener.com';
 
-function safeNum(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
-}
+function safeNum(x) { const n = Number(x); return Number.isFinite(n) ? n : null; }
 
 function extractSocials(info) {
   const out = {};
@@ -27,7 +23,7 @@ function extractSocials(info) {
   return out;
 }
 
-/** Choose best AMM pair by 24h volume, then by liquidity. Also identify Moonshot pseudo-pair (":moon"). */
+/** choose best AMM by 24h volume then liquidity; also identify moonshot pseudo-pair (":moon") */
 function choosePairs(pairs, dsChain) {
   const sameChain = (p) => String(p?.chainId || '').toLowerCase() === String(dsChain).toLowerCase();
   const chainPairs = (Array.isArray(pairs) ? pairs : []).filter(sameChain);
@@ -61,11 +57,11 @@ export async function getDexscreenerTokenStats(ca, dsChain = 'abstract') {
   const base = chosen?.baseToken || {};
   const info = chosen?.info || {};
 
-  const priceUsd   = safeNum(chosen?.priceUsd ?? moon?.priceUsd);
-  const fdv        = safeNum(chosen?.fdv);
-  const marketCap  = safeNum(chosen?.marketCap);
-  const volume     = chosen?.volume || null;
-  const priceChange= chosen?.priceChange || null;
+  const priceUsd    = safeNum(chosen?.priceUsd ?? moon?.priceUsd);
+  const fdv         = safeNum(chosen?.fdv);
+  const marketCap   = safeNum(chosen?.marketCap);
+  const volume      = chosen?.volume || null;
+  const priceChange = chosen?.priceChange || null;
 
   const socials = extractSocials(info);
 
@@ -79,9 +75,8 @@ export async function getDexscreenerTokenStats(ca, dsChain = 'abstract') {
       marketCap: marketCap ?? fdv ?? null,
       marketCapSource: marketCap != null ? 'market' : (fdv != null ? 'fdv' : null),
 
-      // Pairs
       pairAddress: bestAMM?.pairAddress ? String(bestAMM.pairAddress).toLowerCase() : null,
-      launchPadPair: moon?.pairAddress || null, // e.g. ":moon"
+      launchPadPair: moon?.pairAddress || null,
       dexId: chosen?.dexId || null,
       chainId: dsChain,
 
