@@ -1,7 +1,7 @@
 // src/refreshWorker.js
 // Queue-backed refresher for token summaries (holders, creator, market)
-// Chain-aware: pass dsChain (dexscreener slug) + esChain (etherscan chain id)
-// Caches partial payloads so /tabs doesn't get stuck on "Initializing…"
+// Chain-aware: pass dsChain (dexscreener slug) + esChain (etherscan/scan chain id)
+// Always caches a payload so the bot never gets stuck on "Initializing…"
 
 import './configEnv.js';
 import axios from 'axios';
@@ -12,7 +12,7 @@ import { setJSON, withLock } from './cache.js';
 import { getDexscreenerTokenStats } from './services/dexscreener.js';
 import { chainKey } from './chains.js';
 
-/* -------------------- BullMQ connection -------------------- */
+/* -------------------- BullMQ -------------------- */
 const bullRedis = new Redis(process.env.REDIS_URL, {
   maxRetriesPerRequest: null,
   enableReadyCheck: false,
@@ -20,7 +20,7 @@ const bullRedis = new Redis(process.env.REDIS_URL, {
 
 export const refreshQueueName = 'tabs_refresh';
 export const refreshQueue = new Queue(refreshQueueName, { connection: bullRedis });
-// 👇 Make a compat export that queueCore.js expects:
+// compat export used by queueCore.js
 export const queue = refreshQueue;
 
 /* -------------------- Etherscan v2 client -------------------- */
@@ -34,9 +34,9 @@ const httpES = axios.create({ baseURL: ESV2_BASE, timeout: 45_000 });
 const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
 const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS);
 let esLastTs = 0;
-let esChainGate = Promise.resolve();
+let esThrottle = Promise.resolve();
 async function throttleES() {
-  await (esChainGate = esChainGate.then(async () => {
+  await (esThrottle = esThrottle.then(async () => {
     const wait = Math.max(0, esLastTs + ES_MIN_INTERVAL - Date.now());
     if (wait > 0) await new Promise(r => setTimeout(r, wait));
     esLastTs = Date.now();
@@ -52,6 +52,7 @@ function esURL(params, esChainId) {
   return u.toString();
 }
 
+/** Robust GET: never throws; returns [] or null on hard failure */
 async function esGET(params, esChainId, { logOnce = false, tag = '' } = {}) {
   await throttleES();
   const maxAttempts = 3;
@@ -61,24 +62,22 @@ async function esGET(params, esChainId, { logOnce = false, tag = '' } = {}) {
       const { data } = await httpES.get('', esParams(params, esChainId));
       if (data?.status === '1') return data.result;
 
-      const msg = (data?.result || data?.message || '').toString().toLowerCase();
-      // Treat “no records found” as empty, not an error
+      const msg = String(data?.result || data?.message || '').toLowerCase();
       if (msg.includes('no records') || msg.includes('not found')) {
-        return [];
+        return Array.isArray(data?.result) ? data.result : [];
       }
-      if (attempt === maxAttempts) throw new Error(data?.result || data?.message || 'Etherscan v2 error');
+      // fallthrough => retry
     } catch (e) {
-      if (attempt === maxAttempts) throw e;
-      await new Promise(r => setTimeout(r, 400 * attempt));
+      // retry
     }
+    await new Promise(r => setTimeout(r, 400 * attempt));
   }
+  console.warn(`[ESV2] request failed after retries: ${tag}`);
   return [];
 }
 
 /* -------------------- Dexscreener helpers -------------------- */
-
 async function getDexCreator(ca, dsChain) {
-  // Best-effort: /tokens/v1/<chain>/<CA> sometimes returns creator
   try {
     const url = `https://api.dexscreener.com/tokens/v1/${dsChain}/${ca}`;
     const { data } = await axios.get(url, { timeout: 12_000 });
@@ -89,7 +88,6 @@ async function getDexCreator(ca, dsChain) {
 }
 
 async function getDexPairAddresses(ca, dsChain) {
-  // Pick best AMM pair by (liquidity + h24 volume); detect Moonshot (pairAddress contains ':moon')
   try {
     const url = `https://api.dexscreener.com/latest/dex/tokens/${ca}`;
     const { data } = await axios.get(url, { timeout: 15_000 });
@@ -119,48 +117,38 @@ async function getDexPairAddresses(ca, dsChain) {
 }
 
 /* -------------------- Etherscan helpers -------------------- */
-
 const TOPIC_TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const ZERO = '0x0000000000000000000000000000000000000000';
 const DEAD = new Set([ZERO, '0x000000000000000000000000000000000000dEaD', '0x000000000000000000000000000000000000dead'].map(s => s.toLowerCase()));
-const BANNED = new Set([
-  // add addresses to ignore in holder distribution here if needed
-].map(s => s.toLowerCase()));
+const BANNED = new Set([].map(s => s.toLowerCase()));
 
 const toBig = (x) => BigInt(String(x));
 const topicToAddr = (t) => ('0x' + String(t).slice(-40)).toLowerCase();
 
 async function getCreationBlock(token, esChainId) {
-  try {
-    const res = await esGET(
-      { module: 'contract', action: 'getcontractcreation', contractaddresses: token },
-      esChainId, { logOnce: true, tag: '[creatorBlock]' }
-    );
-    const first = Array.isArray(res) ? res[0] : res;
-    const n = Number(first?.blockNumber || first?.blocknumber || first);
-    if (Number.isFinite(n) && n > 0) return n;
-  } catch {}
-  try {
-    const r = await esGET(
-      { module: 'account', action: 'tokentx', contractaddress: token, page: 1, offset: 1, sort: 'asc' },
-      esChainId, { logOnce: true, tag: '[firstTx]' }
-    );
-    const n = Number((Array.isArray(r) && r[0]?.blockNumber) || r?.blockNumber);
-    if (Number.isFinite(n) && n > 0) return n;
-  } catch {}
-  return 0;
+  const res = await esGET(
+    { module: 'contract', action: 'getcontractcreation', contractaddresses: token },
+    esChainId, { logOnce: true, tag: '[creatorBlock]' }
+  );
+  const first = Array.isArray(res) ? res[0] : res;
+  const n = Number(first?.blockNumber || first?.blocknumber || first);
+  if (Number.isFinite(n) && n > 0) return n;
+
+  const r = await esGET(
+    { module: 'account', action: 'tokentx', contractaddress: token, page: 1, offset: 1, sort: 'asc' },
+    esChainId, { logOnce: true, tag: '[firstTx]' }
+  );
+  const n2 = Number((Array.isArray(r) && r[0]?.blockNumber) || r?.blockNumber);
+  return Number.isFinite(n2) && n2 > 0 ? n2 : 0;
 }
 async function getLatestBlock(esChainId) {
-  try {
-    const ts = Math.floor(Date.now() / 1000);
-    const r = await esGET(
-      { module: 'block', action: 'getblocknobytime', timestamp: ts, closest: 'before' },
-      esChainId, { logOnce: true, tag: '[latestBlock]' }
-    );
-    const n = Number(r?.blockNumber || r?.BlockNumber || r);
-    if (Number.isFinite(n) && n > 0) return n;
-  } catch {}
-  return 9_223_372_036; // fallback big number
+  const ts = Math.floor(Date.now() / 1000);
+  const r = await esGET(
+    { module: 'block', action: 'getblocknobytime', timestamp: ts, closest: 'before' },
+    esChainId, { logOnce: true, tag: '[latestBlock]' }
+  );
+  const n = Number(r?.blockNumber || r?.BlockNumber || r);
+  return Number.isFinite(n) && n > 0 ? n : 9_223_372_036;
 }
 
 async function getAllTransferLogs(token, esChainId, {
@@ -190,21 +178,7 @@ async function getAllTransferLogs(token, esChainId, {
         offset,
       };
 
-      let batch = null;
-      let ok = false;
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        try {
-          batch = await esGET(params, esChainId, { logOnce: page === 1 && attempt === 1, tag: `[logs ${start}-${end}]` });
-          ok = true; break;
-        } catch (e) {
-          if (attempt === 2) {
-            console.warn(`[ESV2] window ${start}-${end} page ${page} failed: ${e.message || e}`);
-          } else {
-            await new Promise(r => setTimeout(r, 500 * attempt));
-          }
-        }
-      }
-      if (!ok) break;
+      const batch = await esGET(params, esChainId, { logOnce: page === 1, tag: `[logs ${start}-${end}]` });
       if (!Array.isArray(batch) || batch.length === 0) break;
 
       all.push(...batch);
@@ -222,15 +196,11 @@ async function getAllTransferLogs(token, esChainId, {
 }
 
 async function getTokenTotalSupply(token, esChainId) {
-  try {
-    const r = await esGET(
-      { module: 'stats', action: 'tokensupply', contractaddress: token },
-      esChainId, { logOnce: true, tag: '[supply]' }
-    );
-    return String(r || '0');
-  } catch {
-    return '0';
-  }
+  const r = await esGET(
+    { module: 'stats', action: 'tokensupply', contractaddress: token },
+    esChainId, { logOnce: true, tag: '[supply]' }
+  );
+  return String(r || '0');
 }
 
 function buildBalancesFromLogs(logs) {
@@ -255,7 +225,6 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
     if (BANNED.has(a)) continue;
     rows.push([a, bal]);
   }
-  // sort desc by balance
   rows.sort((A, B) => (B[1] > A[1] ? 1 : (B[1] < A[1] ? -1 : 0)));
 
   const top20 = rows.slice(0, 20).map(([address, bal]) => {
@@ -273,7 +242,6 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
 }
 
 /* -------------------- Main refresh -------------------- */
-
 export async function refreshToken(tokenAddress, dsChain = 'abstract', esChainId = '2741') {
   const ca = String(tokenAddress || '').trim().toLowerCase();
   if (!/^0x[a-f0-9]{40}$/.test(ca)) throw new Error(`Invalid contract address: ${tokenAddress}`);
@@ -284,7 +252,7 @@ export async function refreshToken(tokenAddress, dsChain = 'abstract', esChainId
     const t0 = Date.now();
     console.log('[WORKER] refreshToken start', dsChain, esChainId, ca);
 
-    // 1) Dexscreener (market + pairs + creator if available)
+    // 1) Dexscreener (market + pairs + creator hint)
     let market = null;
     let ammPair = null;
     let launchPadPair = null;
@@ -316,7 +284,7 @@ export async function refreshToken(tokenAddress, dsChain = 'abstract', esChainId
       console.log('[WORKER] Dexscreener failed:', e?.message || e);
     }
 
-    // 2) Etherscan pulls (best-effort)
+    // 2) Etherscan pulls (best-effort, never throws)
     let logs = [];
     let totalSupplyRaw = '0';
     let holdersTop20 = [];
@@ -325,20 +293,15 @@ export async function refreshToken(tokenAddress, dsChain = 'abstract', esChainId
     let burnedPct = 0;
 
     try {
-      const [creationBlock, latestBlock] = await Promise.all([
-        getCreationBlock(ca, esChainId),
-        getLatestBlock(esChainId),
-      ]);
-
+      const creationBlock = await getCreationBlock(ca, esChainId);
+      const latestBlock   = await getLatestBlock(esChainId);
       const fromB = Math.max(0, creationBlock - 1);
       const toB   = latestBlock;
 
       console.log('[WORKER] range', ca, fromB, '→', toB);
 
-      [logs, totalSupplyRaw] = await Promise.all([
-        getAllTransferLogs(ca, esChainId, { fromBlock: fromB, toBlock: toB, window: 75_000, offset: 1000 }),
-        getTokenTotalSupply(ca, esChainId),
-      ]);
+      logs = await getAllTransferLogs(ca, esChainId, { fromBlock: fromB, toBlock: toB, window: 75_000, offset: 1000 });
+      totalSupplyRaw = await getTokenTotalSupply(ca, esChainId);
 
       // sort chronological
       logs.sort((a, b) => {
@@ -348,35 +311,38 @@ export async function refreshToken(tokenAddress, dsChain = 'abstract', esChainId
         return ia - ib;
       });
 
-      const balances = buildBalancesFromLogs(logs);
-      const supply = toBig(totalSupplyRaw || '0');
+      if (logs.length > 0) {
+        const balances = buildBalancesFromLogs(logs);
+        const supply = toBig(totalSupplyRaw || '0');
 
-      // burned %
-      let burned = 0n;
-      for (const lg of logs) {
-        const to = topicToAddr(lg.topics[2]);
-        if (DEAD.has(to)) burned += toBig(lg.data);
+        // burned %
+        let burned = 0n;
+        for (const lg of logs) {
+          const to = topicToAddr(lg.topics[2]);
+          if (DEAD.has(to)) burned += toBig(lg.data);
+        }
+        burnedPct = supply > 0n ? Number((burned * 1000000n) / supply) / 10000 : 0;
+
+        // exclude AMM pool + (moonshot) token CA as pool
+        const excludeList = [];
+        if (ammPair) excludeList.push(String(ammPair).toLowerCase());
+        const moonProg = Number(market?.moonshot?.progress || 0);
+        const excludeTokenAsPool = isMoonshot && moonProg > 0 && moonProg < 100;
+        if (excludeTokenAsPool) excludeList.push(ca);
+
+        const holders = computeTopHolders(balances, supply, { exclude: excludeList });
+        holdersTop20 = holders.holdersTop20;
+        top10CombinedPct = holders.top10CombinedPct;
+        holdersCount = holders.holdersCount;
+      } else {
+        console.warn('[WORKER] No logs fetched; skipping holder math.');
       }
-      burnedPct = supply > 0n ? Number((burned * 1000000n) / supply) / 10000 : 0;
-
-      // Exclusions for holders: AMM pool and (during moonshot) token CA as pool
-      const excludeList = [];
-      if (ammPair) excludeList.push(String(ammPair).toLowerCase());
-      const moonProg = Number(market?.moonshot?.progress || 0);
-      const excludeTokenAsPool = isMoonshot && moonProg > 0 && moonProg < 100;
-      if (excludeTokenAsPool) excludeList.push(ca);
-
-      const holders = computeTopHolders(balances, supply, { exclude: excludeList });
-      holdersTop20 = holders.holdersTop20;
-      top10CombinedPct = holders.top10CombinedPct;
-      holdersCount = holders.holdersCount;
-
     } catch (e) {
       console.warn('[WORKER] Etherscan section degraded:', e?.message || e);
-      // Leave defaults; we still cache a partial payload
+      // Leave defaults; still cache a partial payload below.
     }
 
-    // 3) Final payload (always cache something so bot isn't stuck)
+    // 3) Final payload — ALWAYS cached
     const payload = {
       tokenAddress: ca,
       updatedAt: Date.now(),
@@ -391,14 +357,14 @@ export async function refreshToken(tokenAddress, dsChain = 'abstract', esChainId
     const sumKey  = `token:${ck}:${ca}:summary`;
     const gateKey = `token:${ck}:${ca}:last_refresh`;
     try {
-      await setJSON(sumKey, payload, 180); // 3 minutes summary cache
-      await setJSON(gateKey, { ts: Date.now() }, 600); // 10 minutes refresh gate
+      await setJSON(sumKey, payload, 180);        // 3 min summary cache
+      await setJSON(gateKey, { ts: Date.now() }, 600); // 10 min refresh gate
       console.log('[WORKER] cached', sumKey, 'ttl=180s', 'elapsed', (Date.now() - t0) + 'ms');
     } catch (e) {
       console.log('[WORKER] cache write failed:', e?.message || e);
     }
 
-    console.log('[WORKER] refreshToken done', dsChain, ca);
+    console.log('[WORKER] refreshToken done', dsChain, esChainId, ca);
     return payload;
   });
 }
@@ -424,7 +390,6 @@ new Worker(
 );
 
 /* -------------------- Optional cron refresher -------------------- */
-// If you want a periodic warm-cache for specific tokens per chain, set DEFAULT_TOKENS like:
 // DEFAULT_TOKENS="abstract:0xabc,base:0xdef,hyper:0x123"
 if (process.argv.includes('--cron') && process.env.DEFAULT_TOKENS) {
   const items = process.env.DEFAULT_TOKENS
@@ -445,7 +410,11 @@ if (process.argv.includes('--cron') && process.env.DEFAULT_TOKENS) {
                  : (it.dsChain === 'hyperevm' || it.dsChain === 'hyper') ? '999'
                  : '2741';
         try {
-          await refreshQueue.add('refresh', { tokenAddress: it.ca, dsChain: it.dsChain, esChain: es }, { removeOnComplete: true, removeOnFail: true });
+          await refreshQueue.add(
+            'refresh',
+            { tokenAddress: it.ca, dsChain: it.dsChain, esChain: es },
+            { removeOnComplete: true, removeOnFail: true }
+          );
         } catch (e) {
           console.error('[CRON] Enqueue failed for', it.dsChain, it.ca, e?.message || e);
         }
