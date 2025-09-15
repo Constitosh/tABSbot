@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { Telegraf, Markup } from 'telegraf';
 import * as cache from './cache.js';
 import { refreshToken, queue } from './refreshWorker.js';
@@ -5,16 +6,32 @@ import { isAddress, shortAddr, num, escapeMarkdownV2 } from './util.js';
 import chains from '../chains.js';
 import { renderTop20Holders, renderFirst20Buyers } from './services/compute.js';
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+// Validate env
+if (!process.env.BOT_TOKEN) {
+  console.error('Missing BOT_TOKEN in .env');
+  process.exit(1);
+}
+if (!process.env.ETHERSCAN_API_KEY) {
+  console.error('Missing ETHERSCAN_API_KEY in .env');
+  process.exit(1);
+}
 
-bot.start((ctx) => ctx.reply('Hi! Use /stats <tokenAddress> [chain] for token stats. See /help.'));
+const bot = new Telegraf(process.env.BOT_TOKEN);
+console.log('Bot initialized with token');
+
+bot.start((ctx) => {
+  console.log('Received /start command');
+  ctx.reply('Hi! Use /stats <tokenAddress> [chain] for token stats. See /help.');
+});
 
 bot.help((ctx) => {
+  console.log('Received /help command');
   const chainList = Object.keys(chains).map(c => `${c} (${chains[c].name})`).join(', ');
   ctx.reply(`Available V2 chains: ${chainList}\n\n/stats <CA> [chain] - Get full stats\n/refresh <CA> [chain] - Force refresh (30s cooldown)\nExample: /stats 0x123 base\nDefault chain: ethereum`);
 });
 
 bot.command('stats', async (ctx) => {
+  console.log('Received /stats command:', ctx.message.text);
   const args = ctx.message.text.split(/\s+/).slice(1);
   const tokenAddress = args[0]?.trim();
   const chain = args[1]?.trim() || 'ethereum';
@@ -27,13 +44,20 @@ bot.command('stats', async (ctx) => {
   }
 
   const key = `token:${chain}:${tokenAddress}:summary`;
-  let data = await cache.getJSON(key);
+  let data;
+  try {
+    data = await cache.getJSON(key);
+  } catch (err) {
+    console.error('Cache get error:', err.message);
+    data = null;
+  }
 
   if (!data) {
     ctx.reply('Cache miss. Initializing (first fetch may take ~10s)...');
     try {
       data = await refreshToken(tokenAddress, chain);
     } catch (err) {
+      console.error('Refresh error:', err.message);
       ctx.reply(`Fetch failed: ${err.message}. Queued async—try /stats again in 30s.`);
       queue.add('refresh', { tokenAddress, chain });
       return;
@@ -64,6 +88,7 @@ bot.command('stats', async (ctx) => {
 });
 
 bot.command('refresh', async (ctx) => {
+  console.log('Received /refresh command:', ctx.message.text);
   const args = ctx.message.text.split(/\s+/).slice(1);
   const tokenAddress = args[0]?.trim();
   const chain = args[1]?.trim() || 'ethereum';
@@ -74,33 +99,59 @@ bot.command('refresh', async (ctx) => {
 
   const key = `token:${chain}:${tokenAddress}:summary`;
   const lastRefreshKey = `${key}:last_refresh`;
-  const lastRefresh = await cache.getJSON(lastRefreshKey) || 0;
+  let lastRefresh;
+  try {
+    lastRefresh = await cache.getJSON(lastRefreshKey) || 0;
+  } catch (err) {
+    console.error('Cache get error for cooldown:', err.message);
+    lastRefresh = 0;
+  }
   if (Date.now() - lastRefresh < 30000) {
     return ctx.reply('⏰ 30s cooldown active. Try again soon.');
   }
 
-  await cache.setJSON(lastRefreshKey, Date.now());
+  try {
+    await cache.setJSON(lastRefreshKey, Date.now());
+  } catch (err) {
+    console.error('Cache set error for cooldown:', err.message);
+  }
   queue.add('refresh', { tokenAddress, chain });
   ctx.reply('🔄 Refresh queued! Data updates in ~10s. Use /stats to check.');
 });
 
 bot.on('callback_query', async (ctx) => {
+  console.log('Received callback_query:', ctx.callbackQuery.data);
   const [action, ch, tokenAddress] = ctx.callbackQuery.data.split(':');
   const chain = ch;
   if (action === 'refresh' && chains[chain]) {
     const key = `token:${chain}:${tokenAddress}:summary`;
     const lastRefreshKey = `${key}:last_refresh`;
-    const lastRefresh = await cache.getJSON(lastRefreshKey) || 0;
+    let lastRefresh;
+    try {
+      lastRefresh = await cache.getJSON(lastRefreshKey) || 0;
+    } catch (err) {
+      console.error('Cache get error for callback:', err.message);
+      lastRefresh = 0;
+    }
     if (Date.now() - lastRefresh < 30000) {
       return ctx.answerCbQuery('⏰ Cooldown: wait 30s');
     }
-    await cache.setJSON(lastRefreshKey, Date.now());
+    try {
+      await cache.setJSON(lastRefreshKey, Date.now());
+    } catch (err) {
+      console.error('Cache set error for callback:', err.message);
+    }
     queue.add('refresh', { tokenAddress, chain });
     ctx.answerCbQuery('🔄 Refreshing... Check /stats soon.');
   }
   ctx.answerCbQuery();
 });
 
-bot.launch();
+bot.launch().then(() => {
+  console.log('Bot polling started');
+}).catch((err) => {
+  console.error('Bot launch error:', err.message);
+  process.exit(1);
+});
 
-console.log('Bot started');
+console.log('Bot startup complete');
