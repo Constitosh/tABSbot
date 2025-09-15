@@ -9,7 +9,7 @@ import Redis from 'ioredis';
 import { Worker, Queue } from 'bullmq';
 
 import { setJSON, withLock } from './cache.js';
-import { getDexscreenerTokenStats } from './dexscreener.js';
+import { getDexscreenerTokenStats } from './services/dexscreener.js';
 import { chainKey } from './chains.js';
 
 /* -------------------- BullMQ connection -------------------- */
