@@ -20,18 +20,18 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 console.log('Bot initialized with token');
 
 bot.start((ctx) => {
-  console.log('Received /start command');
+  console.log('Received /start command from', ctx.from.id);
   ctx.reply('Hi! Use /stats <tokenAddress> [chain] for token stats. See /help.');
 });
 
 bot.help((ctx) => {
-  console.log('Received /help command');
+  console.log('Received /help command from', ctx.from.id);
   const chainList = Object.keys(chains).map(c => `${c} (${chains[c].name})`).join(', ');
   ctx.reply(`Available V2 chains: ${chainList}\n\n/stats <CA> [chain] - Get full stats\n/refresh <CA> [chain] - Force refresh (30s cooldown)\nExample: /stats 0x123 base\nDefault chain: ethereum`);
 });
 
 bot.command('stats', async (ctx) => {
-  console.log('Received /stats command:', ctx.message.text);
+  console.log('Received /stats command:', ctx.message.text, 'from', ctx.from.id);
   const args = ctx.message.text.split(/\s+/).slice(1);
   const tokenAddress = args[0]?.trim();
   const chain = args[1]?.trim() || 'ethereum';
@@ -59,7 +59,11 @@ bot.command('stats', async (ctx) => {
     } catch (err) {
       console.error('Refresh error:', err.message);
       ctx.reply(`Fetch failed: ${err.message}. Queued async—try /stats again in 30s.`);
-      queue.add('refresh', { tokenAddress, chain });
+      try {
+        await queue.add('refresh', { tokenAddress, chain });
+      } catch (queueErr) {
+        console.error('Queue add error:', queueErr.message);
+      }
       return;
     }
   }
@@ -88,7 +92,7 @@ bot.command('stats', async (ctx) => {
 });
 
 bot.command('refresh', async (ctx) => {
-  console.log('Received /refresh command:', ctx.message.text);
+  console.log('Received /refresh command:', ctx.message.text, 'from', ctx.from.id);
   const args = ctx.message.text.split(/\s+/).slice(1);
   const tokenAddress = args[0]?.trim();
   const chain = args[1]?.trim() || 'ethereum';
@@ -115,12 +119,17 @@ bot.command('refresh', async (ctx) => {
   } catch (err) {
     console.error('Cache set error for cooldown:', err.message);
   }
-  queue.add('refresh', { tokenAddress, chain });
-  ctx.reply('🔄 Refresh queued! Data updates in ~10s. Use /stats to check.');
+  try {
+    await queue.add('refresh', { tokenAddress, chain });
+    ctx.reply('🔄 Refresh queued! Data updates in ~10s. Use /stats to check.');
+  } catch (err) {
+    console.error('Queue add error:', err.message);
+    ctx.reply('Failed to queue refresh due to cache issue. Try again later.');
+  }
 });
 
 bot.on('callback_query', async (ctx) => {
-  console.log('Received callback_query:', ctx.callbackQuery.data);
+  console.log('Received callback_query:', ctx.callbackQuery.data, 'from', ctx.from.id);
   const [action, ch, tokenAddress] = ctx.callbackQuery.data.split(':');
   const chain = ch;
   if (action === 'refresh' && chains[chain]) {
@@ -141,10 +150,16 @@ bot.on('callback_query', async (ctx) => {
     } catch (err) {
       console.error('Cache set error for callback:', err.message);
     }
-    queue.add('refresh', { tokenAddress, chain });
-    ctx.answerCbQuery('🔄 Refreshing... Check /stats soon.');
+    try {
+      await queue.add('refresh', { tokenAddress, chain });
+      ctx.answerCbQuery('🔄 Refreshing... Check /stats soon.');
+    } catch (err) {
+      console.error('Queue add error for callback:', err.message);
+      ctx.answerCbQuery('Failed to queue refresh due to cache issue.');
+    }
+  } else {
+    ctx.answerCbQuery();
   }
-  ctx.answerCbQuery();
 });
 
 bot.launch().then(() => {
