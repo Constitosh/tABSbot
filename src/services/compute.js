@@ -32,7 +32,7 @@ function first20BuyersStatus(transfers, currentBalancesMap, contractAddress) {
     t.to !== t.from && 
     t.value > 0n && 
     t.to !== contractAddress.toLowerCase() &&
-    !knownContracts.some(kc => kc === t.to)
+    !knownContracts.some(kc => kc.toLowerCase() === t.to)
   );
   const seen = new Set();
   const buyers = [];
