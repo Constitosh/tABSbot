@@ -11,7 +11,9 @@ import Redis from 'ioredis';
 import { Worker, Queue } from 'bullmq';
 
 import { setJSON, withLock } from './cache.js';
-import { getDexscreenerTokenStats } from './services/dexscreener.js';
+import { getChainByKey } from './chains.js';
+import { getDexscreenerTokenStats, getDexPairAddresses, getDexCreator } from './services/dexscreener.js';
+
 
 // ---------- Dexscreener helpers ----------
 async function getDexCreator(ca) {
