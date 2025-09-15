@@ -8,7 +8,7 @@ import {
   buildCurrentBalanceMap, 
   first20BuyersStatus 
 } from './services/compute.js';
-import chains from '../../chains.js';
+import chains from '../chains.js';
 
 const redis = new Redis(process.env.REDIS_URL);
 const queue = new Queue('refresh', { connection: redis });
@@ -17,7 +17,10 @@ const worker = new Worker('refresh', async (job) => {
   await refreshToken(tokenAddress, chain);
 }, { connection: redis });
 
-async function refreshToken(tokenAddress, chain = 'abstract') {
+async function refreshToken(tokenAddress, chain = 'ethereum') {
+  const config = chains[chain];
+  if (!config) throw new Error(`Unsupported chain for Etherscan V2: ${chain}`);
+
   const market = await getDexscreenerTokenStats(tokenAddress, chain);
   if (!market) throw new Error('No market data on this chain');
 
@@ -49,7 +52,7 @@ async function refreshToken(tokenAddress, chain = 'abstract') {
 if (process.env.CRON === 'true') {
   const defaults = (process.env.DEFAULT_TOKENS || '').split(',').map(s => {
     const parts = s.trim().split(':');
-    return { chain: parts[0] || 'abstract', tokenAddress: parts[1] };
+    return { chain: parts[0] || 'ethereum', tokenAddress: parts[1] };
   }).filter(d => d.tokenAddress && chains[d.chain]);
 
   setInterval(async () => {
