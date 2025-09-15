@@ -14,20 +14,16 @@ function num(n) {
   return n.toLocaleString(undefined, { maximumFractionDigits: 0 });
 }
 
-function escapeMarkdownV2(text) {
-  return text.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+function pct(p) {
+  return (p * 100).toFixed(2) + '%';
 }
 
-function isKnownContract(addr) {
-  const known = [
-    '0x7a250d5630b4cf539739df2c5dacb4c659f2488d',
-    '0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45'
-  ];
-  return known.some(k => k.toLowerCase() === addr.toLowerCase());
+function escapeMarkdownV2(text) {
+  return text.replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
 }
 
 function now() {
   return Date.now();
 }
 
-export { sleep, isAddress, shortAddr, num, escapeMarkdownV2, isKnownContract, now };
+export { sleep, isAddress, shortAddr, num, pct, escapeMarkdownV2, now };
