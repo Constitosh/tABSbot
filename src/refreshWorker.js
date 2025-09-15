@@ -1,18 +1,16 @@
-const Queue = require('bullmq').Queue; // Assume imported
-const { Worker } = require('bullmq');
-const cache = require('./cache');
-const { getDexscreenerTokenStats } = require('./services/dexscreener');
-const { getContractCreator, getTokenHolders, getTokenTransfers } = require('./services/explorer');
-const { 
+import { Queue, Worker } from 'bullmq';
+import Redis from 'ioredis';
+import * as cache from './cache.js';
+import { getDexscreenerTokenStats } from './services/dexscreener.js';
+import { getContractCreator, getTokenHolders, getTokenTransfers } from './services/explorer.js';
+import { 
   summarizeHolders, 
   buildCurrentBalanceMap, 
-  first20BuyersStatus, 
-  renderTop20Holders, 
-  renderFirst20Buyers 
-} = require('./services/compute');
-const chains = require('../../chains');
+  first20BuyersStatus 
+} from './services/compute.js';
+import chains from '../../chains.js';
 
-// Assume Redis connection: const redis = ...;
+const redis = new Redis(process.env.REDIS_URL);
 const queue = new Queue('refresh', { connection: redis });
 const worker = new Worker('refresh', async (job) => {
   const { tokenAddress, chain } = job.data;
@@ -24,7 +22,7 @@ async function refreshToken(tokenAddress, chain = 'abstract') {
   if (!market) throw new Error('No market data on this chain');
 
   const creatorInfo = await getContractCreator(tokenAddress, chain);
-  const holders = await getTokenHolders(tokenAddress, chain, 1, 100); // Top 100 for creator
+  const holders = await getTokenHolders(tokenAddress, chain, 1, 100);
   const { top20, top10CombinedPct, burnedPct } = summarizeHolders(holders);
   const creatorHolder = holders.find(h => h.address === creatorInfo.address.toLowerCase()) || { percent: 0 };
   const transfers = await getTokenTransfers(tokenAddress, chain);
@@ -44,11 +42,10 @@ async function refreshToken(tokenAddress, chain = 'abstract') {
   };
 
   const key = `token:${chain}:${tokenAddress}:summary`;
-  await cache.setJSON(key, payload, 180); // 180s TTL
+  await cache.setJSON(key, payload, 180);
   return payload;
 }
 
-// Scheduler (run every 120s for defaults)
 if (process.env.CRON === 'true') {
   const defaults = (process.env.DEFAULT_TOKENS || '').split(',').map(s => {
     const parts = s.trim().split(':');
@@ -62,4 +59,4 @@ if (process.env.CRON === 'true') {
   }, 120000);
 }
 
-module.exports = { refreshToken, queue };
+export { refreshToken, queue };
