@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { Queue, Worker } from 'bullmq';
 import Redis from 'ioredis';
 import * as cache from './cache.js';
@@ -10,7 +11,24 @@ import {
 } from './services/compute.js';
 import chains from '../chains.js';
 
-const redis = new Redis(process.env.REDIS_URL);
+// Validate env
+if (!process.env.REDIS_URL) {
+  console.error('Missing REDIS_URL in .env');
+  process.exit(1);
+}
+
+// Explicit Redis config
+const redisOptions = {
+  host: '127.0.0.1',
+  port: 6379,
+  password: process.env.REDIS_URL.match(/:([^@]+)@/)?.[1] || undefined,
+  db: 0
+};
+
+const redis = new Redis(redisOptions);
+redis.on('connect', () => console.log('Worker: Redis connected'));
+redis.on('error', (err) => console.error('Worker: Redis error:', err.message));
+
 const queue = new Queue('refresh', { connection: redis });
 const worker = new Worker('refresh', async (job) => {
   const { tokenAddress, chain } = job.data;
@@ -62,4 +80,4 @@ if (process.env.CRON === 'true') {
   }, 120000);
 }
 
-export { refreshToken, queue };
+console.log('Worker started');
