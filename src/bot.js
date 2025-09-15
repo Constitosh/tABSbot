@@ -1,9 +1,9 @@
-const { Telegraf, Markup } = require('telegraf');
-const cache = require('./cache');
-const { refreshToken, queue } = require('./refreshWorker');
-const { isAddress, shortAddr, num, escapeMarkdownV2 } = require('./util');
-const chains = require('../../chains');
-const { renderTop20Holders, renderFirst20Buyers } = require('./services/compute');
+import { Telegraf, Markup } from 'telegraf';
+import * as cache from './cache.js';
+import { refreshToken, queue } from './refreshWorker.js';
+import { isAddress, shortAddr, num, escapeMarkdownV2 } from './util.js';
+import chains from '../../chains.js';
+import { renderTop20Holders, renderFirst20Buyers } from './services/compute.js';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
@@ -32,7 +32,6 @@ bot.command('stats', async (ctx) => {
   if (!data) {
     ctx.reply('Cache miss. Initializing (first fetch may take ~10s)...');
     try {
-      // Sync refresh for cold start (timeout implied by fetch)
       data = await refreshToken(tokenAddress, chain);
     } catch (err) {
       ctx.reply('Sync fetch failed (e.g., API lag). Queued async refresh—try /stats again in 30s.');
@@ -102,4 +101,4 @@ bot.on('callback_query', async (ctx) => {
 });
 
 bot.launch();
-module.exports = bot;
+export default bot;
