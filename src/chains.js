@@ -41,7 +41,6 @@ const chains = {
     explorerBase: 'https://api.polygonscan.com/api',
     apiKeyVar: 'ETHERSCAN_API_KEY'
   }
-  // Add more: e.g., 'zksync': { chainId: 324, explorerBase: 'https://api.zksync.io/api', ... }
 };
 
-module.exports = chains;
+export default chains;
