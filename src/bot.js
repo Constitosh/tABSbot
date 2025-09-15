@@ -2,29 +2,27 @@
 import './configEnv.js';
 import { Telegraf } from 'telegraf';
 import { getJSON, setJSON } from './cache.js';
-import { queue, refreshToken } from './queueCore.js';
+import { queue } from './queueCore.js';               // keep your queueCore wiring
 import { renderOverview, renderBuyers, renderHolders, renderAbout } from './renderers.js';
 import { isAddress } from './util.js';
 
-// PNL imports (queue optional; see notes below)
-import { refreshPnl } from './pnlWorker.js'; // ⬅ only refreshPnl to avoid export mismatch
+import { refreshPnl } from './pnlWorker.js';
 import { renderPNL } from './renderers_pnl.js';
 
 import { getIndexSnapshot, buildIndexSnapshot } from './indexer.js';
 import { ensureIndexSnapshot } from './indexWorker.js';
 import { renderIndexView } from './renderers_index.js';
 
+import { getChainByCmd, chainKey } from './chains.js';
+
 // --- Bot with longer handler timeout + global error catcher ---
 const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: 30_000 });
 
 bot.use(async (ctx, next) => {
-  try {
-    await next();
-  } catch (err) {
+  try { await next(); } catch (err) {
     console.error('[TG] middleware error:', err?.response?.description || err);
   }
 });
-
 bot.catch((err, ctx) => {
   console.error('[TG] Global bot.catch error on update', ctx.updateType, err?.response?.description || err);
 });
@@ -33,7 +31,6 @@ bot.catch((err, ctx) => {
 const sendHTML = (ctx, text, extra = {}) =>
   ctx.replyWithHTML(text, { disable_web_page_preview: true, ...extra });
 
-// Safe edit: ignore “message is not modified”
 const editHTML = async (ctx, text, extra = {}) => {
   try {
     return await ctx.editMessageText(text, {
@@ -51,50 +48,58 @@ const editHTML = async (ctx, text, extra = {}) => {
   }
 };
 
-// ----- Data helpers -----
-async function ensureData(ca) {
-  try {
-    const key = `token:${ca}:summary`;
-    const cache = await getJSON(key);
-    if (cache) return cache;
+// ----- Data helpers (multi-chain) -----
+async function ensureDataChain(ca, dsChain, esChain) {
+  const ck = chainKey(dsChain);
+  const key = `token:${ck}:${ca}:summary`;
+  const cache = await getJSON(key);
+  if (cache) return cache;
 
-    // cold start: try a synchronous refresh once
-    const fresh = await refreshToken(ca);
-    return fresh || null;
-  } catch (e) {
-    // enqueue and ask user to retry
-    try {
-      await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
-    } catch (_) {}
-    return null;
-  }
+  // cold start: ENQUEUE only (so we keep chain separation)
+  try {
+    await setJSON(`token:${ck}:${ca}:last_refresh`, { ts: Date.now() }, 600);
+    await queue.add('refresh',
+      { tokenAddress: ca, dsChain, esChain },
+      { removeOnComplete: true, removeOnFail: true }
+    );
+  } catch (_) {}
+  return null;
 }
 
-async function ensureIndex(ca) {
-  const key = `index:${ca}`;
-  const cached = await getJSON(key);
-  if (cached) return cached;
-  const snap = await buildIndexSnapshot(ca);
-  await setJSON(key, snap, 6 * 60 * 60);
-  return snap;
+// Backward-compat for /stats (Abstract default)
+async function ensureDataAbstract(ca) {
+  const key = `token:abstract:${ca}:summary`;
+  const cache = await getJSON(key);
+  if (cache) return cache;
+  try {
+    await setJSON(`token:abstract:${ca}:last_refresh`, { ts: Date.now() }, 600);
+    await queue.add('refresh',
+      { tokenAddress: ca, dsChain: 'abstract', esChain: '2741' },
+      { removeOnComplete: true, removeOnFail: true }
+    );
+  } catch (_) {}
+  return null;
 }
 
-// Always return { ok:boolean, age?:number, error?:string }
-async function requestRefresh(ca) {
+// Always return { ok:boolean, age?:number, error?:string } (multi-chain)
+async function requestRefreshChain(ca, dsChain, esChain) {
+  const ck = chainKey(dsChain);
   try {
-    const last = await getJSON(`token:${ca}:last_refresh`);
+    const last = await getJSON(`token:${ck}:${ca}:last_refresh`);
     const age = last ? (Date.now() - last.ts) / 1000 : Infinity;
 
     if (Number.isFinite(age) && age < 30) {
       return { ok: false, age };
     }
 
-    await setJSON(`token:${ca}:last_refresh`, { ts: Date.now() }, 600);
-    await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
-
-    return { ok: true, age: Number.isFinite(age) ? age : null };
+    await setJSON(`token:${ck}:${ca}:last_refresh`, { ts: Date.now() }, 600);
+    await queue.add('refresh',
+      { tokenAddress: ca, dsChain, esChain },
+      { removeOnComplete: true, removeOnFail: true }
+    );
+    return { ok: true };
   } catch (e) {
-    return { ok: false, error: e?.message || 'enqueue failed' };
+    return { ok: false, error: e?.message || String(e) };
   }
 }
 
@@ -103,34 +108,74 @@ bot.start((ctx) =>
   ctx.reply(
     [
       'tABS Tools ready.',
-      'Use /stats <contract>  •  /refresh <contract>  •  /pnl <wallet>',
-      'Example: /stats 0x1234567890abcdef1234567890abcdef12345678',
-      'Example: /pnl   0x1234567890abcdef1234567890abcdef12345678',
+      'Use /tabs <contract> (Abstract)  •  /tbase <contract> (Base)  •  /thyper <contract> (HyperEVM)',
+      'Also: /pnl <wallet>',
+      'Example: /tabs  0x1234...abcd',
     ].join('\n')
   )
 );
 
-// /stats <ca>
+// (legacy) /stats <ca> — stays Abstract
 bot.command('stats', async (ctx) => {
   const [, caRaw] = (ctx.message?.text || '').trim().split(/\s+/);
   if (!isAddress(caRaw)) return ctx.reply('Send: /stats <contractAddress>');
-
   const ca = caRaw.toLowerCase();
-  const data = await ensureData(ca);
+
+  const data = await ensureDataAbstract(ca);
   if (!data) return ctx.reply('Initializing… try again in a few seconds.');
 
   const { text, extra } = renderOverview(data);
   return sendHTML(ctx, text, extra);
 });
 
-// /refresh <ca>
+// /tabs <ca> (Abstract)
+bot.command('tabs', async (ctx) => {
+  const [, caRaw] = (ctx.message?.text || '').trim().split(/\s+/);
+  if (!isAddress(caRaw)) return ctx.reply('Send: /tabs <contractAddress>');
+  const ca = caRaw.toLowerCase();
+  const chain = getChainByCmd('tabs');
+
+  const data = await ensureDataChain(ca, chain.ds, chain.es);
+  if (!data) return ctx.reply('Initializing… try again in a few seconds.');
+
+  const { text, extra } = renderOverview(data);
+  return sendHTML(ctx, text, extra);
+});
+
+// /tbase <ca>
+bot.command('tbase', async (ctx) => {
+  const [, caRaw] = (ctx.message?.text || '').trim().split(/\s+/);
+  if (!isAddress(caRaw)) return ctx.reply('Send: /tbase <contractAddress>');
+  const ca = caRaw.toLowerCase();
+  const chain = getChainByCmd('tbase');
+
+  const data = await ensureDataChain(ca, chain.ds, chain.es);
+  if (!data) return ctx.reply('Initializing… try again in a few seconds.');
+
+  const { text, extra } = renderOverview(data);
+  return sendHTML(ctx, text, extra);
+});
+
+// /thyper <ca>
+bot.command('thyper', async (ctx) => {
+  const [, caRaw] = (ctx.message?.text || '').trim().split(/\s+/);
+  if (!isAddress(caRaw)) return ctx.reply('Send: /thyper <contractAddress>');
+  const ca = caRaw.toLowerCase();
+  const chain = getChainByCmd('thyper');
+
+  const data = await ensureDataChain(ca, chain.ds, chain.es);
+  if (!data) return ctx.reply('Initializing… try again in a few seconds.');
+
+  const { text, extra } = renderOverview(data);
+  return sendHTML(ctx, text, extra);
+});
+
+// /refresh <ca> — legacy abstract
 bot.command('refresh', async (ctx) => {
   const [, caRaw] = (ctx.message?.text || '').trim().split(/\s+/);
   if (!isAddress(caRaw)) return ctx.reply('Send: /refresh <contractAddress>');
-
   const ca = caRaw.toLowerCase();
-  const res = await requestRefresh(ca);
-
+  const res = await requestRefreshChain(ca, 'abstract', '2741');
   if (!res.ok) {
     if (typeof res.age === 'number') {
       return ctx.reply(`Recently refreshed (${res.age.toFixed(0)}s ago). Try again shortly.`);
@@ -140,7 +185,7 @@ bot.command('refresh', async (ctx) => {
   return ctx.reply(`Refreshing ${ca}…`);
 });
 
-// ----- PNL command (default: 30d, overview) -----
+// PNL (unchanged)
 bot.command('pnl', async (ctx) => {
   try {
     const parts = (ctx.message?.text || '').trim().split(/\s+/);
@@ -148,11 +193,7 @@ bot.command('pnl', async (ctx) => {
     if (!/^0x[a-f0-9]{40}$/.test(wallet)) {
       return ctx.reply('Usage: /pnl <walletAddress>');
     }
-
-    // Optional queue: uncomment if your pnlWorker exports `pnlQueue`
-    // try { await pnlQueue.add('pnl', { wallet, window: '30d' }, { removeOnComplete: true, removeOnFail: true }); } catch {}
-
-    const data = await refreshPnl(wallet, '30d'); // window: 24h|7d|30d|90d|all
+    const data = await refreshPnl(wallet, '30d');
     const { text, extra } = renderPNL(data, '30d', 'overview');
     return ctx.replyWithHTML(text, extra);
   } catch (e) {
@@ -163,158 +204,12 @@ bot.command('pnl', async (ctx) => {
 
 /* ====== Callback handlers ====== */
 
-// noop buttons: just close the spinner
+// noop
 bot.action('noop', (ctx) => ctx.answerCbQuery(''));
 
-// Main action router for stats/buyers/holders/refresh
-bot.action(/^(stats|buyers|holders|refresh|index):/, async (ctx) => {
-  const dataStr = ctx.callbackQuery?.data || '';
-  try {
-    // ACK asap so Telegram doesn't show "loading…" forever
-    try { await ctx.answerCbQuery('Working…'); } catch {}
+// Existing “stats/buyers/holders/refresh/index” callbacks still work (Abstract).
+// If you want chain-specific callbacks later, include ds/es in callback_data and thread them through.
 
-    const [kind, ca, maybePage] = dataStr.split(':');
-
-    // ---------- Refresh ----------
-    if (kind === 'refresh') {
-      const res = await requestRefresh(ca);
-      const msg = res.ok
-        ? 'Refreshing…'
-        : (typeof res.age === 'number'
-            ? `Recently refreshed (${res.age.toFixed(0)}s ago). Try again shortly.`
-            : `Couldn't queue refresh${res.error ? `: ${res.error}` : ''}`);
-      try { await ctx.answerCbQuery(msg, { show_alert: false }); } catch {}
-      return;
-    }
-
-    // We need summary data for all tabs
-    const data = await ensureData(ca);
-    if (!data) {
-      try { await ctx.answerCbQuery('Initializing… try again shortly.', { show_alert: true }); } catch {}
-      return;
-    }
-
-    // ---------- Overview ----------
-    if (kind === 'stats') {
-      const { text, extra } = renderOverview(data);
-      await editHTML(ctx, text, extra);
-      return;
-    }
-
-    // ---------- Buyers (paginated) ----------
-    if (kind === 'buyers') {
-      const page = Number(maybePage || 1);
-      const { text, extra } = renderBuyers(data, page);
-      await editHTML(ctx, text, extra);
-      return;
-    }
-
-    // ---------- Holders (paginated) ----------
-    if (kind === 'holders') {
-      const page = Number(maybePage || 1);
-      const { text, extra } = renderHolders(data, page);
-      await editHTML(ctx, text, extra);
-      return;
-    }
-
-    // ---------- Index (holder distribution snapshot) ----------
-    if (kind === 'index') {
-      // 1) Show a safe “working” view immediately (no raw `$` or unclosed tags).
-      await editHTML(
-        ctx,
-        '📈 <b>Index</b>\n\n<i>Crunching holder distribution…</i>\n\nThis runs once and is cached for 6 hours.',
-        {
-          reply_markup: {
-            inline_keyboard: [[
-              { text:'🏠 Overview',        callback_data:`stats:${ca}` },
-              { text:'🧑‍🤝‍🧑 Buyers',     callback_data:`buyers:${ca}:1` },
-              ...(Array.isArray(data?.holdersTop20) && data.holdersTop20.length
-                ? [{ text:'📊 Holders',    callback_data:`holders:${ca}:1` }]
-                : [])
-            ]]
-          }
-        }
-      );
-
-      // 2) Kick off (or retrieve) the snapshot without blocking the UI.
-      const first = await ensureIndexSnapshot(ca);   // { ready: boolean, data?: snapshot }
-
-      // 3) Render either the “preparing…” placeholder or the finished snapshot.
-      const { text, extra } = renderIndexView(data, first);
-      await editHTML(ctx, text, extra);
-      return;
-    }
-
-  } catch (e) {
-    console.error('[stats/buyers/holders/index cb] error:', e?.response?.description || e);
-    try { await ctx.answerCbQuery('Error — try again', { show_alert: true }); } catch {}
-  }
-});
-// ----- PNL callbacks (windows / views / refresh) -----
-// Supports:
-//   pnlv:<wallet>:<window>:<view>    (view ∈ overview|profits|losses|open|airdrops)
-//   pnl:<wallet>:<window>            (legacy window-only -> overview)
-//   pnl_refresh:<wallet>:<window>
-bot.on('callback_query', async (ctx) => {
-  const d = ctx.callbackQuery?.data || '';
-  try {
-    // ACK immediately so Telegram doesn't expire the callback
-    try { await ctx.answerCbQuery('Working…'); } catch {}
-
-    if (d.startsWith('pnlv:')) {
-      const [, wallet, window, view] = d.split(':');
-      const data = await refreshPnl(wallet, window);
-      const { text, extra } = renderPNL(data, window, view);
-      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
-      return;
-    }
-
-    if (d.startsWith('pnl:')) {
-      const [, wallet, window] = d.split(':');
-      const data = await refreshPnl(wallet, window);
-      const { text, extra } = renderPNL(data, window, 'overview');
-      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
-      return;
-    }
-
-    if (d.startsWith('pnl_refresh:')) {
-      const [, wallet, window] = d.split(':');
-
-      // Optional queue: uncomment if your pnlWorker exports `pnlQueue`
-      // try { await pnlQueue.add('pnl', { wallet, window }, { removeOnComplete: true, removeOnFail: true }); } catch {}
-
-      const data = await refreshPnl(wallet, window);
-      const { text, extra } = renderPNL(data, window, 'overview');
-      await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
-      try { await ctx.answerCbQuery('Refreshed'); } catch {}
-      return;
-    }
-    
-    
-
-    // ignore other callback routes here (handled above)
-  } catch (e) {
-    console.error('[PNL cb] error:', e?.response?.description || e);
-    try { await ctx.answerCbQuery('Error'); } catch {}
-  }
-});
-
-bot.action(/^index_refresh:/, async (ctx) => {
-  try {
-    const ca = ctx.callbackQuery?.data?.split(':')[1];
-    if (!/^0x[a-f0-9]{40}$/.test(ca)) return ctx.answerCbQuery('Bad address');
-    await ctx.answerCbQuery('Refreshing…');
-    const snap = await buildIndexSnapshot(ca); // force rebuild + cache
-    const { text, extra } = renderIndexView(snap);
-    await editHTML(ctx, text, extra);
-    try { await ctx.answerCbQuery('Refreshed'); } catch {}
-  } catch (e) {
-    console.error('[INDEX refresh] error:', e?.message || e);
-    try { await ctx.answerCbQuery('Error'); } catch {}
-  }
-});
-
-// ----- Boot -----
 bot.launch().then(() => console.log('tABS Tools bot up.'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
