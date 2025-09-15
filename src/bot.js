@@ -314,39 +314,7 @@ bot.action(/^index_refresh:/, async (ctx) => {
   }
 });
 
-async function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-
-async function launchWithRetry(maxAttempts = 8) {
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      // Optional: pre-flight ping (helps fail fast if TG is flaky)
-      await Promise.race([
-        (async () => { await bot.telegram.getMe(); })(),
-        (async () => { await sleep(12_000); throw new Error('getMe timeout'); })()
-      ]);
-
-      await bot.launch();
-      console.log('[TG] Bot launched OK');
-      return;
-    } catch (err) {
-      const msg = err?.response?.description || err?.message || String(err);
-      const code = err?.response?.error_code || '';
-      console.warn(`[TG] launch attempt ${attempt} failed (${code || ''} ${msg}).`);
-      if (attempt === maxAttempts) {
-        console.error('[TG] Giving up starting bot.');
-        throw err;
-      }
-      // backoff: 1s, 2s, 3s, … up to 10s
-      const wait = Math.min(10_000, attempt * 1_000);
-      await sleep(wait);
-    }
-  }
-}
-
-launchWithRetry().catch(() => {
-  // Let PM2 restart on fatal
-  process.exit(1);
-});
-
+// ----- Boot -----
+bot.launch().then(() => console.log('tABS Tools bot up.'));
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
