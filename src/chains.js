@@ -1,24 +1,19 @@
 // src/chains.js
-// Central registry for multi-chain support (Dexscreener + Etherscan IDs)
+// Central place to define per-command chain routing for Dexscreener + Etherscan v2.
 
-export const CHAINS = Object.freeze({
-  // Default tABS (Abstract chain)
-  tabs:  { cmd: 'tabs',  ds: 'abstract',  es: '2741',  label: 'Abstract' },
+export const CHAINS = {
+  tabs:  { label: 'Abstract', cmd: 'tabs',  ds: 'abstract', es: '2741' },
+  tbase: { label: 'Base',     cmd: 'tbase', ds: 'base',     es: '8453' },
+  thyper:{ label: 'HyperEVM', cmd: 'thyper',ds: 'hyperevm', es: '999'  },
+};
 
-  // Base
-  tbase: { cmd: 'tbase', ds: 'base',      es: '8453',  label: 'Base' },
-
-  // HyperEVM (adjust if your Etherscan-compatible chain id differs)
-  thyper:{ cmd: 'thyper',ds: 'hyperevm',  es: '999',   label: 'HyperEVM' },
-});
-
-/** Map command name -> chain object (fallback to tabs/Abstract). */
-export function getChainByCmd(cmd) {
-  const k = String(cmd || '').toLowerCase();
+// map command -> chain record
+export function getChainByCmd(cmd = 'tabs') {
+  const k = String(cmd).toLowerCase();
   return CHAINS[k] || CHAINS.tabs;
 }
 
-/** Small helper to normalize chain key for cache namespacing. */
+// small helper used for cache keys (namespacing)
 export function chainKey(dsChain) {
   return String(dsChain || 'abstract').toLowerCase();
 }
