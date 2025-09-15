@@ -1,4 +1,6 @@
-const redis = new Redis(process.env.REDIS_URL); // Assume ioredis
+import Redis from 'ioredis';
+
+const redis = new Redis(process.env.REDIS_URL);
 
 async function getJSON(key) {
   const val = await redis.get(key);
@@ -17,7 +19,7 @@ async function setJSON(key, val, ttl) {
 async function withLock(key, ttlSec, fn) {
   const lockKey = `${key}:lock`;
   const acquired = await redis.set(lockKey, 'locked', 'NX', 'EX', ttlSec);
-  if (!acquired) return null; // Already locked
+  if (!acquired) return null;
   try {
     return await fn();
   } finally {
@@ -25,13 +27,4 @@ async function withLock(key, ttlSec, fn) {
   }
 }
 
-// For last_refresh (scalar, but JSON-wrapped)
-async function getLastRefresh(key) {
-  return await getJSON(`${key}:last_refresh`) || 0;
-}
-
-async function setLastRefresh(key, timestamp) {
-  await setJSON(`${key}:last_refresh`, timestamp);
-}
-
-module.exports = { getJSON, setJSON, withLock, getLastRefresh, setLastRefresh };
+export { getJSON, setJSON, withLock };
