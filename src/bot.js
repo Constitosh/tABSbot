@@ -2,7 +2,7 @@ import { Telegraf, Markup } from 'telegraf';
 import * as cache from './cache.js';
 import { refreshToken, queue } from './refreshWorker.js';
 import { isAddress, shortAddr, num, escapeMarkdownV2 } from './util.js';
-import chains from '../../chains.js';
+import chains from '../chains.js';
 import { renderTop20Holders, renderFirst20Buyers } from './services/compute.js';
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -11,19 +11,19 @@ bot.start((ctx) => ctx.reply('Hi! Use /stats <tokenAddress> [chain] for token st
 
 bot.help((ctx) => {
   const chainList = Object.keys(chains).map(c => `${c} (${chains[c].name})`).join(', ');
-  ctx.reply(`Available chains: ${chainList}\n\n/stats <CA> [chain] - Get full stats\n/refresh <CA> [chain] - Force refresh (30s cooldown)\nExample: /stats 0x123 base`);
+  ctx.reply(`Available V2 chains: ${chainList}\n\n/stats <CA> [chain] - Get full stats\n/refresh <CA> [chain] - Force refresh (30s cooldown)\nExample: /stats 0x123 base\nDefault chain: ethereum`);
 });
 
 bot.command('stats', async (ctx) => {
   const args = ctx.message.text.split(/\s+/).slice(1);
   const tokenAddress = args[0]?.trim();
-  const chain = args[1]?.trim() || 'abstract';
+  const chain = args[1]?.trim() || 'ethereum';
 
   if (!tokenAddress || !isAddress(tokenAddress)) {
     return ctx.reply('Invalid token address. Usage: /stats <address> [chain]');
   }
   if (!chains[chain]) {
-    return ctx.reply(`Unknown chain "${chain}". Available: ${Object.keys(chains).join(', ')}`);
+    return ctx.reply(`Unsupported chain "${chain}" for Etherscan V2. Available: ${Object.keys(chains).join(', ')}`);
   }
 
   const key = `token:${chain}:${tokenAddress}:summary`;
@@ -34,7 +34,7 @@ bot.command('stats', async (ctx) => {
     try {
       data = await refreshToken(tokenAddress, chain);
     } catch (err) {
-      ctx.reply('Sync fetch failed (e.g., API lag). Queued async refresh—try /stats again in 30s.');
+      ctx.reply(`Fetch failed: ${err.message}. Queued async—try /stats again in 30s.`);
       queue.add('refresh', { tokenAddress, chain });
       return;
     }
@@ -50,8 +50,8 @@ bot.command('stats', async (ctx) => {
   text += `*Creator:* \`${shortAddr(creator.address)}\` (${creator.percent.toFixed(2)}\\%)\n`;
   text += `*Top 10:* ${top10CombinedPct.toFixed(2)}\\%\n`;
   text += `*Burned:* ${burnedPct.toFixed(2)}\\%\n\n`;
-  text += `*First 20 Buyers:*\n${renderFirst20Buyers(first20Buyers)}\n\n`;
-  text += `*Top 20 Holders:*\n${renderTop20Holders(holdersTop20)}\n\n`;
+  text += `*First 20 Buyers:*\n${renderFirst20Buyers(first20Buyers || [])}\n\n`;
+  text += `*Top 20 Holders:*\n${renderTop20Holders(holdersTop20 || [])}\n\n`;
   text += `🕐 Updated: ${new Date(updatedAt).toLocaleString()}`;
 
   text = escapeMarkdownV2(text);
@@ -66,7 +66,7 @@ bot.command('stats', async (ctx) => {
 bot.command('refresh', async (ctx) => {
   const args = ctx.message.text.split(/\s+/).slice(1);
   const tokenAddress = args[0]?.trim();
-  const chain = args[1]?.trim() || 'abstract';
+  const chain = args[1]?.trim() || 'ethereum';
 
   if (!tokenAddress || !isAddress(tokenAddress) || !chains[chain]) {
     return ctx.reply('Invalid args. Usage: /refresh <address> [chain]');
@@ -85,8 +85,9 @@ bot.command('refresh', async (ctx) => {
 });
 
 bot.on('callback_query', async (ctx) => {
-  const [action, chain, tokenAddress] = ctx.callbackQuery.data.split(':');
-  if (action === 'refresh') {
+  const [action, ch, tokenAddress] = ctx.callbackQuery.data.split(':');
+  const chain = ch;
+  if (action === 'refresh' && chains[chain]) {
     const key = `token:${chain}:${tokenAddress}:summary`;
     const lastRefreshKey = `${key}:last_refresh`;
     const lastRefresh = await cache.getJSON(lastRefreshKey) || 0;
@@ -101,4 +102,5 @@ bot.on('callback_query', async (ctx) => {
 });
 
 bot.launch();
-export default bot;
+
+console.log('Bot started');
