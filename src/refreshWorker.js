@@ -1,8 +1,7 @@
 // src/refreshWorker.js
 // Sources:
-//  • Market + creator: Dexscreener
-//  • On-chain math: Etherscan V2 — logs.getLogs (holders math), account.tokentx (first buyers),
-//    stats.tokensupply, account.tokenbalance
+//  • Market + creator: Dexscreener (pair + /tokens/v1/<chain>/<CA> for creator)
+//  • On-chain math: Etherscan V2 (logs.getLogs, account.tokentx, stats.tokensupply, account.tokenbalance)
 // Queue: BullMQ
 
 import './configEnv.js';
@@ -10,100 +9,54 @@ import axios from 'axios';
 import Redis from 'ioredis';
 import { Worker, Queue } from 'bullmq';
 
-import { setJSON, getJSON, withLock } from './cache.js';
+import { setJSON, withLock, getJSON } from './cache.js';
 import { getDexscreenerTokenStats } from './services/dexscreener.js';
 import { chainKey } from './chains.js';
 
-// ---------- Dexscreener helpers ----------
-async function getDexCreator(ca, dsChain = 'abstract') {
-  try {
-    // NOTE: the tokens/v1 path needs the chain segment
-    const url = `https://api.dexscreener.com/tokens/v1/${dsChain}/${ca}`;
-    const { data } = await axios.get(url, { timeout: 12_000 });
-    if (data?.creator) return String(data.creator).toLowerCase();
-    if (Array.isArray(data) && data[0]?.creator) return String(data[0].creator).toLowerCase();
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-async function getDexPairAddresses(ca, dsChain = 'abstract') {
-  try {
-    const url = `https://api.dexscreener.com/latest/dex/tokens/${ca}`;
-    const { data } = await axios.get(url, { timeout: 15_000 });
-
-    const dsPairs = Array.isArray(data?.pairs) ? data.pairs : [];
-    const sameChain = (p) => String(p?.chainId || '').toLowerCase() === String(dsChain).toLowerCase();
-    const chainPairs = dsPairs.filter(sameChain);
-    const isMoon = (p) => String(p?.pairAddress || '').includes(':moon');
-
-    const ammCandidates = chainPairs.filter(p => !isMoon(p));
-    ammCandidates.sort((a, b) => {
-      const vA = Number(a?.volume?.h24 || 0), vB = Number(b?.volume?.h24 || 0);
-      if (vB !== vA) return vB - vA;
-      const lA = Number(a?.liquidity?.usd || 0), lB = Number(b?.liquidity?.usd || 0);
-      return lB - lA;
-    });
-    const bestAMM = ammCandidates[0] || null;
-    const moon = chainPairs.find(isMoon) || null;
-
-    return {
-      ammPair: bestAMM?.pairAddress ? String(bestAMM.pairAddress).toLowerCase() : null,
-      launchPadPair: moon?.pairAddress ? String(moon.pairAddress) : null,
-    };
-  } catch {
-    return { ammPair: null, launchPadPair: null };
-  }
-}
+// ---------- Redis / BullMQ ----------
+const bullRedis = new Redis(process.env.REDIS_URL, {
+  maxRetriesPerRequest: null,
+  enableReadyCheck: false,
+});
+export const queueName = 'tabs_refresh';
+export const queue = new Queue(queueName, { connection: bullRedis });
 
 // ---------- Etherscan V2 client ----------
-const ES_BASE  = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
-const ES_KEY   = process.env.ETHERSCAN_API_KEY;
-const ES_CHAIN_DEFAULT = process.env.ETHERSCAN_CHAIN_ID || '2741'; // default Abstract
-
+const ES_BASE  = process.env.ETHERSCAN_BASE || process.env.ETHERSCAN_V2_BASE || 'https://api.etherscan.io/v2/api';
+const ES_KEY   = process.env.ETHERSCAN_API_KEY || '';
 if (!ES_KEY) console.warn('[WORKER BOOT] ETHERSCAN_API_KEY is missing');
 const httpES = axios.create({ baseURL: ES_BASE, timeout: 45_000 });
-
-// per-worker in-memory chain override (queue concurrency is 1 by default)
-let CURRENT_ES_CHAIN = ES_CHAIN_DEFAULT;
-
-function setEsChain(chainId) {
-  const cid = String(chainId || ES_CHAIN_DEFAULT);
-  CURRENT_ES_CHAIN = cid;
-}
 
 // ---------- Etherscan rate limit ----------
 const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
 const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS);
 let esLastTs = 0;
-let esChain = Promise.resolve();
+let esChainPromise = Promise.resolve();
 async function throttleES() {
-  await (esChain = esChain.then(async () => {
+  await (esChainPromise = esChainPromise.then(async () => {
     const wait = Math.max(0, esLastTs + ES_MIN_INTERVAL - Date.now());
     if (wait > 0) await new Promise(r => setTimeout(r, wait));
     esLastTs = Date.now();
   }));
 }
-function esParams(params) {
-  return { params: { chainid: CURRENT_ES_CHAIN, apikey: ES_KEY, ...params } };
+function esParams(params, esChainId) {
+  return { params: { chainid: String(esChainId), apikey: ES_KEY, ...params } };
 }
-function esURL(params) {
+function esURL(params, esChainId) {
   const u = new URL(ES_BASE);
-  Object.entries({ chainid: CURRENT_ES_CHAIN, apikey: ES_KEY, ...params })
-    .forEach(([k,v]) => u.searchParams.set(k, String(v)));
+  Object.entries({ chainid: String(esChainId), apikey: ES_KEY, ...params }).forEach(([k,v]) => u.searchParams.set(k, String(v)));
   return u.toString();
 }
-async function esGET(params, { logOnce = false, tag = '' } = {}) {
-  if (logOnce) console.log(`[ESV2] ${tag} ${esURL(params)}`);
+async function esGET(params, esChainId, { logOnce = false, tag = '' } = {}) {
   await throttleES();
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const { data } = await httpES.get('', esParams(params));
+      if (logOnce) console.log(`[ESV2] ${tag} ${esURL(params, esChainId)}`);
+      const { data } = await httpES.get('', esParams(params, esChainId));
       if (data?.status === '1') return data.result;
-      const msg = data?.result || data?.message || 'Unknown Etherscan error';
-      if (attempt === maxAttempts) throw new Error(`Etherscan v2 error: ${msg}`);
+      const msg = data?.result || data?.message || 'Etherscan v2 error:';
+      if (attempt === maxAttempts) throw new Error(msg);
     } catch (e) {
       if (attempt === maxAttempts) throw e;
     }
@@ -120,18 +73,27 @@ const DEAD = new Set([
   '0x000000000000000000000000000000000000dead',
 ].map(s => s.toLowerCase()));
 
-const BANNED = new Set([
-  '0x0d6848e39114abe69054407452b8aab82f8a44ba'  // example banned wallet
-].map(s => s.toLowerCase()));
-
 const toBig = (x) => BigInt(String(x));
 const topicToAddr = (t) => ('0x' + String(t).slice(-40)).toLowerCase();
 
+// ---------- Dexscreener helpers ----------
+async function getDexCreator(ca, dsChain) {
+  // Dexscreener has a token details endpoint on some chains; if not available, fall back to contract creation.
+  try {
+    const url = `https://api.dexscreener.com/tokens/v1/${dsChain}/${ca}`;
+    const { data } = await axios.get(url, { timeout: 12_000 });
+    if (data?.creator) return String(data.creator).toLowerCase();
+    if (Array.isArray(data) && data[0]?.creator) return String(data[0].creator).toLowerCase();
+  } catch {}
+  return null;
+}
+
 // ---------- Discover block bounds ----------
-async function getCreationBlock(token) {
+async function getCreationBlock(token, esChainId) {
   try {
     const res = await esGET(
       { module: 'contract', action: 'getcontractcreation', contractaddresses: token },
+      esChainId,
       { logOnce: true, tag: '[creatorBlock]' }
     );
     const first = Array.isArray(res) ? res[0] : res;
@@ -141,6 +103,7 @@ async function getCreationBlock(token) {
   try {
     const r = await esGET(
       { module: 'account', action: 'tokentx', contractaddress: token, page: 1, offset: 1, sort: 'asc' },
+      esChainId,
       { logOnce: true, tag: '[firstTx]' }
     );
     const n = Number((Array.isArray(r) && r[0]?.blockNumber) || r?.blockNumber);
@@ -148,11 +111,12 @@ async function getCreationBlock(token) {
   } catch {}
   return 0;
 }
-async function getLatestBlock() {
+async function getLatestBlock(esChainId) {
   try {
     const ts = Math.floor(Date.now() / 1000);
     const r = await esGET(
       { module: 'block', action: 'getblocknobytime', timestamp: ts, closest: 'before' },
+      esChainId,
       { logOnce: true, tag: '[latestBlock]' }
     );
     const n = Number(r?.blockNumber || r?.BlockNumber || r);
@@ -160,32 +124,15 @@ async function getLatestBlock() {
   } catch {}
   return 9_223_372_036;
 }
-async function getContractCreator(token) {
-  try {
-    const res = await esGET(
-      { module: 'contract', action: 'getcontractcreation', contractaddresses: token },
-      { logOnce: false, tag: '' }
-    );
-    const first = Array.isArray(res) ? res[0] : res;
-    const addr = first?.contractCreator || first?.creatorAddress || first?.contractCreatorAddress;
-    return addr ? String(addr).toLowerCase() : null;
-  } catch {
-    return null;
-  }
-}
 
 // ---------- Windowed Transfer log crawler (holders math) ----------
-async function getAllTransferLogs(token, {
+async function getAllTransferLogs(token, esChainId, {
   fromBlock,
   toBlock,
   window = 200_000,
   offset = 1000,
   maxWindows = 300,
 } = {}) {
-  if (!Number.isFinite(fromBlock) || !Number.isFinite(toBlock) || fromBlock > toBlock) {
-    throw new Error(`bad block range ${fromBlock}..${toBlock}`);
-  }
-
   const all = [];
   let start = fromBlock;
   let windows = 0;
@@ -210,7 +157,7 @@ async function getAllTransferLogs(token, {
       let ok = false;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          batch = await esGET(params, { logOnce: page === 1 && attempt === 1, tag: `[logs ${start}-${end}]` });
+          batch = await esGET(params, esChainId, { logOnce: page === 1 && attempt === 1, tag: `[logs ${start}-${end}]` });
           ok = true; break;
         } catch (e) {
           if (attempt === 3) {
@@ -241,12 +188,21 @@ async function getAllTransferLogs(token, {
   return all;
 }
 
+// ---------- Etherscan helpers ----------
+async function getTokenTotalSupply(token, esChainId) {
+  return String(await esGET(
+    { module: 'stats', action: 'tokensupply', contractaddress: token },
+    esChainId,
+    { logOnce: true, tag: '[supply]' }
+  ));
+}
+
 function buildBalancesFromLogs(logs) {
   const balances = new Map(); // addr -> bigint
   for (const lg of logs) {
-    const from = ('0x' + String(lg.topics?.[1] || '').slice(-40)).toLowerCase();
-    const to   = ('0x' + String(lg.topics?.[2] || '').slice(-40)).toLowerCase();
-    const val  = toBig(lg.data || '0');
+    const from = topicToAddr(lg.topics[1]);
+    const to   = topicToAddr(lg.topics[2]);
+    const val  = toBig(lg.data);
     if (!DEAD.has(from)) balances.set(from, (balances.get(from) || 0n) - val);
     if (!DEAD.has(to))   balances.set(to,   (balances.get(to)   || 0n) + val);
   }
@@ -261,7 +217,6 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
     const a = addr.toLowerCase();
     if (bal <= 0n) continue;
     if (ex.has(a)) continue;
-    if (BANNED.has(a)) continue;
     rows.push([a, bal]);
   }
   rows.sort((A, B) => (B[1] > A[1] ? 1 : (B[1] < A[1] ? -1 : 0)));
@@ -280,140 +235,16 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
   return { holdersTop20: top20, top10CombinedPct, holdersCount: rows.length };
 }
 
-/** ---------- First buyers helpers (unchanged) ---------- */
-function first20BuyersFromTokentx(txsAsc, { tokenAddress, creator, pairAddress, excludeTokenAsPool = false }, balances) {
-  if (!Array.isArray(txsAsc) || txsAsc.length === 0 || !creator) return [];
-  const ca = String(tokenAddress).toLowerCase();
-  const creatorAddr = String(creator).toLowerCase();
-  const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
-
-  let startIdx = -1;
-  for (let i = 0; i < txsAsc.length; i++) {
-    const to = String(txsAsc[i]?.to || '').toLowerCase();
-    if (to === creatorAddr) { startIdx = i; break; }
-  }
-  if (startIdx < 0) return [];
-
-  const firstSeen = new Map();
-  const addIfEligible = (tx) => {
-    const to = String(tx?.to || '').toLowerCase();
-    if (!to) return false;
-    if (DEAD.has(to)) return false;
-    if (pair && to === pair) return false;
-    if (excludeTokenAsPool && to === ca) return false;
-    if (BANNED.has(to)) return false;
-    if (!firstSeen.has(to)) {
-      let amt = 0n;
-      try { amt = toBig(tx.value || '0'); } catch {}
-      firstSeen.set(to, {
-        firstBuyAmt: amt,
-        blockNumber: Number(tx.blockNumber || 0),
-        logIndex: Number(tx.logIndex || 0),
-      });
-      return true;
-    }
-    return false;
-  };
-
-  addIfEligible(txsAsc[startIdx]);
-  for (let i = startIdx + 1; i < txsAsc.length && firstSeen.size < 20; i++) {
-    addIfEligible(txsAsc[i]);
-  }
-
-  const ordered = [...firstSeen.entries()]
-    .sort((a, b) => {
-      if (a[1].blockNumber !== b[1].blockNumber) return a[1].blockNumber - b[1].blockNumber;
-      return a[1].logIndex - b[1].logIndex;
-    })
-    .map(([address, info]) => {
-      const balNow = balances.get(address.toLowerCase()) || 0n;
-      let status = 'hold';
-      if (balNow === 0n) status = 'sold all';
-      else if (balNow < info.firstBuyAmt) status = 'sold some';
-      else if (balNow > info.firstBuyAmt) status = 'bought more';
-      return { address, status };
-    });
-
-  return ordered.slice(0, Math.min(20, ordered.length));
-}
-
-function first20BuyersFromLogs(logsAsc, { tokenAddress, creator, pairAddress, excludeTokenAsPool = false }, balances) {
-  if (!Array.isArray(logsAsc) || logsAsc.length === 0 || !creator) return [];
-  const ca = String(tokenAddress).toLowerCase();
-  const creatorAddr = String(creator).toLowerCase();
-  const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
-
-  let startIdx = -1;
-  for (let i = 0; i < logsAsc.length; i++) {
-    const to = ('0x' + String(logsAsc[i].topics?.[2] || '').slice(-40)).toLowerCase();
-    if (to === creatorAddr) { startIdx = i; break; }
-  }
-  if (startIdx < 0) return [];
-
-  const firstSeen = new Map();
-  const addIfEligible = (lg) => {
-    const to = ('0x' + String(lg.topics?.[2] || '').slice(-40)).toLowerCase();
-    if (DEAD.has(to)) return false;
-    if (pair && to === pair) return false;
-    if (excludeTokenAsPool && to === ca) return false;
-    if (BANNED.has(to)) return false;
-    if (!firstSeen.has(to)) {
-      const amt = toBig(lg.data || '0');
-      firstSeen.set(to, {
-        firstBuyAmt: amt,
-        blockNumber: Number(lg.blockNumber || 0),
-        logIndex: Number(lg.logIndex || 0),
-      });
-      return true;
-    }
-    return false;
-  };
-
-  addIfEligible(logsAsc[startIdx]);
-  for (let i = startIdx + 1; i < logsAsc.length && firstSeen.size < 20; i++) {
-    addIfEligible(logsAsc[i]);
-  }
-
-  const ordered = [...firstSeen.entries()]
-    .sort((a, b) => {
-      if (a[1].blockNumber !== b[1].blockNumber) return a[1].blockNumber - b[1].blockNumber;
-      return a[1].logIndex - b[1].logIndex;
-    })
-    .map(([address, info]) => {
-      const balNow = balances.get(address.toLowerCase()) || 0n;
-      let status = 'hold';
-      if (balNow === 0n) status = 'sold all';
-      else if (balNow < info.firstBuyAmt) status = 'sold some';
-      else if (balNow > info.firstBuyAmt) status = 'bought more';
-      return { address, status };
-    });
-
-  return ordered.slice(0, Math.min(20, ordered.length));
-}
-
-// ---------- Redis / BullMQ ----------
-const bullRedis = new Redis(process.env.REDIS_URL, {
-  maxRetriesPerRequest: null,
-  enableReadyCheck: false,
-});
-export const queueName = 'tabs_refresh';
-export const queue = new Queue(queueName, { connection: bullRedis });
-
 // ---------- Main refresh ----------
-export async function refreshToken(tokenAddress, { dsChain = 'abstract', esChain = ES_CHAIN_DEFAULT } = {}) {
+export async function refreshToken(tokenAddress, dsChain = 'abstract', esChainId = '2741') {
   const ca = String(tokenAddress || '').trim().toLowerCase();
   if (!/^0x[a-f0-9]{40}$/.test(ca)) throw new Error(`Invalid contract address: ${tokenAddress}`);
-
-  // set per-call chain context
-  setEsChain(esChain);
   const ck = chainKey(dsChain);
-  const sumKey  = `token:${ck}:${ca}:summary`;
-  const gateKey = `token:${ck}:${ca}:last_refresh`;
 
   const lockKey = `lock:refresh:${ck}:${ca}`;
   return withLock(lockKey, 60, async () => {
     const t0 = Date.now();
-    console.log('[WORKER] refreshToken start', ca, 'ds=', dsChain, 'es=', esChain);
+    console.log('[WORKER] refreshToken start', dsChain, esChainId, ca);
 
     // 1) Dexscreener (market + pair + creator)
     let market = null;
@@ -426,30 +257,18 @@ export async function refreshToken(tokenAddress, { dsChain = 'abstract', esChain
       const { summary } = await getDexscreenerTokenStats(ca, dsChain);
       market = summary || null;
 
-      const pairInfo = await getDexPairAddresses(ca, dsChain);
-      ammPair = pairInfo.ammPair || null;
-      launchPadPair = pairInfo.launchPadPair || null;
-
+      // choose pair + classify "moonshot"
       if (market) {
-        market.pairAddress   = ammPair || market.pairAddress || null;
-        market.launchPadPair = launchPadPair || null;
+        ammPair       = market.pairAddress || null;
+        launchPadPair = market.launchPadPair || null;
+        isMoonshot =
+          !!market.launchPadPair ||
+          String(market?.dexId || '').toLowerCase() === 'moonshot' ||
+          !!market?.moonshot;
+
+        // try get creator via DS token endpoint (fallback to contract creation if null later)
+        creatorAddr = await getDexCreator(ca, dsChain);
       }
-
-      creatorAddr = await getDexCreator(ca, dsChain);
-
-      isMoonshot =
-        !!market?.launchPadPair ||
-        String(market?.dexId || '').toLowerCase() === 'moonshot' ||
-        !!market?.moonshot;
-
-      if (!creatorAddr) {
-        const dsMoonCreator = market?.moonshot?.creator;
-        if (dsMoonCreator && /^0x[a-fA-F0-9]{40}$/.test(dsMoonCreator)) {
-          creatorAddr = String(dsMoonCreator).toLowerCase();
-        }
-      }
-      if (!creatorAddr) creatorAddr = await getContractCreator(ca);
-
       console.log('[WORKER] Dex ok', ca, 'ammPair=', ammPair, 'moonPair=', launchPadPair, 'creator=', creatorAddr || 'unknown');
     } catch (e) {
       console.log('[WORKER] Dexscreener failed:', e?.message || e);
@@ -458,29 +277,21 @@ export async function refreshToken(tokenAddress, { dsChain = 'abstract', esChain
     // 2) Etherscan pulls
     let logs = [];
     let totalSupplyRaw = '0';
-    let creatorBalRaw = '0';
-    let earlyTokentx = [];
     try {
       const [creationBlock, latestBlock] = await Promise.all([
-        getCreationBlock(ca),
-        getLatestBlock(),
+        getCreationBlock(ca, esChainId),
+        getLatestBlock(esChainId),
       ]);
-
       const fromB = Math.max(0, creationBlock - 1);
       const toB   = latestBlock;
 
       console.log('[WORKER] range', ca, fromB, '→', toB);
 
-      [logs, totalSupplyRaw, earlyTokentx] = await Promise.all([
-        getAllTransferLogs(ca, { fromBlock: fromB, toBlock: toB, window: 200_000, offset: 1000 }),
-        getTokenTotalSupply(ca),
-        fetchEarliestTokentxAsc(ca, { pages: 20, offset: 200 }),
+      [logs, totalSupplyRaw] = await Promise.all([
+        getAllTransferLogs(ca, esChainId, { fromBlock: fromB, toBlock: toB, window: 200_000, offset: 1000 }),
+        getTokenTotalSupply(ca, esChainId),
       ]);
-
-      if (creatorAddr) {
-        creatorBalRaw = await getCreatorTokenBalance(ca, creatorAddr);
-      }
-      console.log('[WORKER] pulls ok', 'logs=', logs.length, 'tokentxEarly=', earlyTokentx.length, 'supply=', totalSupplyRaw);
+      console.log('[WORKER] pulls ok', 'logs=', logs.length, 'supply=', totalSupplyRaw);
     } catch (e) {
       console.log('[WORKER] ESV2 failed:', e?.message || e);
     }
@@ -498,8 +309,6 @@ export async function refreshToken(tokenAddress, { dsChain = 'abstract', esChain
     let holdersCount = null;
     let top10CombinedPct = 0;
     let burnedPct = 0;
-    let first20Buyers = [];
-    let creatorPercent = 0;
 
     try {
       const balances = buildBalancesFromLogs(logs);
@@ -508,16 +317,16 @@ export async function refreshToken(tokenAddress, { dsChain = 'abstract', esChain
       // burned
       let burned = 0n;
       for (const lg of logs) {
-        const to = ('0x' + String(lg.topics?.[2] || '').slice(-40)).toLowerCase();
-        if (DEAD.has(to)) try { burned += toBig(lg.data || '0'); } catch {}
+        const to = topicToAddr(lg.topics[2]);
+        if (DEAD.has(to)) burned += toBig(lg.data);
       }
       burnedPct = supply > 0n ? Number((burned * 1000000n) / supply) / 10000 : 0;
 
-      // excludes
+      // exclude AMM pool and token CA (during moonshot) from top holders
       const excludeList = [];
       if (ammPair) excludeList.push(String(ammPair).toLowerCase());
       const moonProg = Number(market?.moonshot?.progress || 0);
-      const excludeTokenAsPool = (!!market?.launchPadPair || String(market?.dexId || '').toLowerCase() === 'moonshot') && moonProg > 0 && moonProg < 100;
+      const excludeTokenAsPool = isMoonshot && moonProg > 0 && moonProg < 100;
       if (excludeTokenAsPool) excludeList.push(ca);
 
       const holders = computeTopHolders(balances, supply, { exclude: excludeList });
@@ -525,34 +334,6 @@ export async function refreshToken(tokenAddress, { dsChain = 'abstract', esChain
       top10CombinedPct = holders.top10CombinedPct;
       holdersCount = holders.holdersCount;
 
-      // creator %
-      let creatorBal = 0n;
-      try { creatorBal = toBig(creatorBalRaw || '0'); } catch {}
-      if (creatorBal === 0n && creatorAddr) {
-        creatorBal = balances.get(creatorAddr.toLowerCase()) || 0n;
-      }
-      creatorPercent = (supply > 0n) ? Number((creatorBal * 1000000n) / supply) / 10000 : 0;
-
-      // FIRST BUYERS
-      first20Buyers = first20BuyersFromTokentx(
-        earlyTokentx,
-        { tokenAddress: ca, creator: creatorAddr, pairAddress: ammPair, excludeTokenAsPool },
-        balances
-      );
-      if (!first20Buyers.length) {
-        first20Buyers = first20BuyersFromLogs(
-          logs,
-          { tokenAddress: ca, creator: creatorAddr, pairAddress: ammPair, excludeTokenAsPool },
-          balances
-        );
-      }
-
-      console.log(
-        '[WORKER] compute sizes',
-        'balances=', balances.size,
-        'holdersTop20=', holdersTop20?.length || 0,
-        'buyers=', first20Buyers?.length || 0
-      );
     } catch (e) {
       console.log('[WORKER] compute failed:', e?.message || e);
     }
@@ -566,13 +347,12 @@ export async function refreshToken(tokenAddress, { dsChain = 'abstract', esChain
       top10CombinedPct,
       burnedPct,
       holdersCount,
-      first20Buyers,
-      creator: { address: creatorAddr, percent: creatorPercent },
-      // carry chain in payload for UI if you ever want to show it
-      _chain: { ds: dsChain, es: esChain }
+      creator: { address: creatorAddr || null }
     };
 
-    // 5) Cache
+    // 5) Cache (per-chain key space)
+    const sumKey  = `token:${ck}:${ca}:summary`;
+    const gateKey = `token:${ck}:${ca}:last_refresh`;
     try {
       await setJSON(sumKey, payload, 180);
       await setJSON(gateKey, { ts: Date.now() }, 600);
@@ -581,27 +361,40 @@ export async function refreshToken(tokenAddress, { dsChain = 'abstract', esChain
       console.log('[WORKER] cache write failed:', e?.message || e);
     }
 
-    console.log('[WORKER] refreshToken done', ca, 'ds=', dsChain);
+    console.log('[WORKER] refreshToken done', dsChain, ca);
     return payload;
   });
 }
 
 // ---------- Worker (consumer) ----------
 new Worker(
-  'tabs_refresh',
+  queueName,
   async (job) => {
-    const ca = job.data?.tokenAddress;
+    const ca      = job.data?.tokenAddress;
     const dsChain = job.data?.dsChain || 'abstract';
-    const esChain = job.data?.esChain || ES_CHAIN_DEFAULT;
-    console.log('[WORKER] job received:', job.name, job.id, ca, 'ds=', dsChain, 'es=', esChain);
-    try {
-      const res = await refreshToken(ca, { dsChain, esChain });
-      console.log('[WORKER] job OK:', job.id);
-      return res;
-    } catch (e) {
-      console.log('[WORKER] job FAIL:', job.id, e?.message || e);
-      throw e;
-    }
+    const esChain = job.data?.esChain || '2741';
+    if (!ca) throw new Error('tokenAddress missing in job.data');
+    console.log('[WORKER] job received:', job.name, job.id, dsChain, esChain, ca);
+    const res = await refreshToken(ca, dsChain, esChain);
+    console.log('[WORKER] job OK:', job.id);
+    return res;
   },
   { connection: bullRedis }
 );
+
+// ---------- Optional cron refresher ----------
+if (process.argv.includes('--cron') && process.env.DEFAULT_TOKENS) {
+  const list = process.env.DEFAULT_TOKENS.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  if (list.length) {
+    console.log('[CRON] Refreshing tokens every 120s (Abstract):', list.join(', '));
+    setInterval(async () => {
+      for (const ca of list) {
+        try {
+          await queue.add('refresh', { tokenAddress: ca, dsChain: 'abstract', esChain: '2741' }, { removeOnComplete: true, removeOnFail: true });
+        } catch (e) {
+          console.error('[CRON] Enqueue failed for', ca, e?.message || e);
+        }
+      }
+    }, 120_000);
+  }
+}
