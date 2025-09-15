@@ -1,4 +1,4 @@
-const chains = require('../../chains');
+import chains from '../../chains.js';
 
 async function getContractCreator(contractAddress, chain) {
   const config = chains[chain];
@@ -38,7 +38,6 @@ async function getTokenTransfers(contractAddress, chain, startBlock = 0, endBloc
   const data = await res.json();
   if (data.status !== '1') throw new Error(data.message || 'Explorer API error');
 
-  // Sort ASC by blockNumber then txHash for chronological order
   return data.result
     .map(t => ({
       from: t.from.toLowerCase(),
@@ -50,4 +49,4 @@ async function getTokenTransfers(contractAddress, chain, startBlock = 0, endBloc
     .sort((a, b) => a.blockNumber - b.blockNumber || a.txHash.localeCompare(b.txHash));
 }
 
-module.exports = { getContractCreator, getTokenHolders, getTokenTransfers };
+export { getContractCreator, getTokenHolders, getTokenTransfers };
