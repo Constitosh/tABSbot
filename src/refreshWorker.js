@@ -171,6 +171,7 @@ async function getContractCreator(token, chain) {
 }
 
 // ---------- Windowed Transfer log crawler (holders math) ----------
+// Adaptive splitter to satisfy Etherscan "Result window is too large" limit (page*offset <= 10000)
 async function getAllTransferLogs(token, {
   fromBlock,
   toBlock,
@@ -182,47 +183,53 @@ async function getAllTransferLogs(token, {
     throw new Error(`bad block range ${fromBlock}..${toBlock}`);
   }
 
-  const all = [];
+  const out = [];
   let start = fromBlock;
   let windows = 0;
-  let failedWindows = 0;
 
-  while (start <= toBlock) {
-    const end = Math.min(start + window, toBlock);
-
-    for (let page = 1; ; page++) {
+  async function pullWindow(winFrom, winTo) {
+    let page = 1;
+    while (true) {
       const params = {
         module: 'logs',
         action: 'getLogs',
         address: token,
         topic0: TOPIC_TRANSFER,
-        fromBlock: start,
-        toBlock: end,
+        fromBlock: winFrom,
+        toBlock: winTo,
         page,
         offset,
       };
-
-      let batch = null;
-      let ok = false;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          batch = await esGET(params, { logOnce: page === 1 && attempt === 1, tag: `[logs ${start}-${end}]` }, chain);
-          ok = true; break;
-        } catch (e) {
-          if (attempt === 3) {
-            console.warn(`[ESV2] window ${start}-${end} page ${page} failed after retries: ${e.message || e}`);
-          } else {
-            await new Promise(r => setTimeout(r, 500 * attempt));
-          }
+      try {
+        const batch = await esGET(params, { logOnce: page === 1, tag: `[logs ${winFrom}-${winTo}]` }, chain);
+        if (!Array.isArray(batch) || batch.length === 0) return;
+        out.push(...batch);
+        if (batch.length < offset) return; // finished this window
+        page += 1;
+        // if we exceed Etherscan 10k cap, bisect and recurse
+        if (page * offset > 10_000) {
+          const mid = Math.floor((winFrom + winTo) / 2);
+          await pullWindow(winFrom, mid);
+          await pullWindow(mid + 1, winTo);
+          return;
         }
+      } catch (e) {
+        const msg = String(e?.message || e);
+        if (msg.includes('Result window is too large')) {
+          const mid = Math.floor((winFrom + winTo) / 2);
+          await pullWindow(winFrom, mid);
+          await pullWindow(mid + 1, winTo);
+          return;
+        }
+        // transient: backoff and retry same page
+        await new Promise(r => setTimeout(r, 600));
       }
-      if (!ok) { failedWindows++; break; }
-
-      if (!Array.isArray(batch) || batch.length === 0) break;
-      all.push(...batch);
-      if (batch.length < offset) break;
     }
+  }
 
+  while (start <= toBlock) {
+    const end = Math.min(start + window, toBlock);
+    await pullWindow(start, end);
     start = end + 1;
     windows++;
     if (windows >= maxWindows) {
@@ -230,11 +237,7 @@ async function getAllTransferLogs(token, {
       break;
     }
   }
-
-  if (failedWindows) {
-    console.warn(`[ESV2] getLogs had ${failedWindows} failed window(s).`);
-  }
-  return all;
+  return out;
 }
 
 // ---------- Earliest tokentx ASC (for first buyers) ----------
