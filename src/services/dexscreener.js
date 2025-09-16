@@ -1,109 +1,63 @@
 // src/services/dexscreener.js
-// Dexscreener helpers (multichain)
-// Returns a "summary" object used by the UI + worker
-
 import axios from 'axios';
-
-const DS_BASE = process.env.DS_ENDPOINT || 'https://api.dexscreener.com';
-
-function safeNum(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : null;
-}
-
 import { resolveChain } from '../chains.js';
 
-function extractSocials(info) {
-  const out = {};
-  const arr = info?.websites || [];
-  const soc = info?.socials || [];
-  // websites
-  const site = arr.find(w => typeof w?.url === 'string' && w.url.length);
-  if (site) out.website = site.url;
-  // socials
-  for (const s of soc) {
-    const type = String(s?.type || '').toLowerCase();
-    const url  = s?.url;
-    if (!url) continue;
-    if (type === 'twitter' || type === 'x') out.twitter = url;
-    if (type === 'telegram') out.telegram = url;
+const http = axios.create({ timeout: 15000 });
+
+/**
+ * getDexscreenerTokenStats
+ * @param {string} ca - token contract address (lowercased)
+ * @param {string} chainKey - e.g. 'tabs', 'base', 'polygon' ...
+ * @returns {Promise<{ summary: any }>}
+ */
+export async function getDexscreenerTokenStats(ca, chainKey = 'tabs') {
+  const chain = resolveChain(chainKey);
+
+  // Main token metadata (creator is available on /tokens/v1/<slug>/<ca>)
+  let creator = null;
+  try {
+    const { data } = await http.get(`https://api.dexscreener.com/tokens/v1/${chain.dsSlug}/${ca}`);
+    if (data?.creator) creator = String(data.creator).toLowerCase();
+    else if (Array.isArray(data) && data[0]?.creator) creator = String(data[0].creator).toLowerCase();
+  } catch (_) {
+    // swallow; not fatal
   }
-  return out;
-}
 
-/**
- * Choose best AMM pair by 24h volume, then by liquidity.
- * Also identify Moonshot pseudo-pair (":moon").
- */
-function choosePairs(abstractPairs) {
-  const isMoon = (p) => String(p?.pairAddress || '').includes(':moon');
+  // Latest pairs
+  const { data: latest } = await http.get(`https://api.dexscreener.com/latest/dex/tokens/${ca}`);
+  const pairsAll = Array.isArray(latest?.pairs) ? latest.pairs : [];
+  const pairs = pairsAll.filter(p => String(p?.chainId) === chain.dsSlug);
 
-  const ammCandidates = abstractPairs.filter(p => !isMoon(p));
-  ammCandidates.sort((a, b) => {
-    const vA = Number(a?.volume?.h24 || 0), vB = Number(b?.volume?.h24 || 0);
-    if (vB !== vA) return vB - vA;
-    const lA = Number(a?.liquidity?.usd || 0), lB = Number(b?.liquidity?.usd || 0);
-    return lB - lA;
-  });
-  const bestAMM = ammCandidates[0] || null;
+  // pick best AMM pair by (liquidity + 24h volume)
+  const scored = pairs.map(p => ({
+    pairAddress: p?.pairAddress || null,
+    dexId: p?.dexId || '',
+    baseToken: p?.baseToken || {},
+    liquidityUsd: Number(p?.liquidity?.usd || 0),
+    vol24h: Number(p?.volume?.h24 || 0),
+    priceUsd: Number(p?.priceUsd || 0),
+    priceNative: Number(p?.priceNative || 0),
+    moonshot: p?.moonshot || null,
+  }));
+  scored.sort((a, b) => (b.liquidityUsd + b.vol24h) - (a.liquidityUsd + a.vol24h));
+  const best = scored[0] || null;
 
-  const moon = abstractPairs.find(isMoon) || null;
-  return { bestAMM, moon };
-}
-
-/**
- * Main exported function used by the worker/bot.
- * It fetches /latest/dex/tokens/<CA> and builds a normalized "summary".
- */
-export async function getDexscreenerTokenStats(ca) {
-  const url = `${DS_BASE}/latest/dex/tokens/${ca}`;
-  const { data } = await axios.get(url, { timeout: 15_000 });
-
-  // ---- IMPORTANT: use unique variable names (no duplicate "pairs") ----
-  const allPairs = Array.isArray(data?.pairs) ? data.pairs : [];
-  const abstractPairs = allPairs.filter(p => p?.chainId === 'abstract');
-
-  // pick AMM & Moonshot
-  const { bestAMM, moon } = choosePairs(abstractPairs);
-  const chosen = bestAMM || moon || null;
-
-  const base = chosen?.baseToken || {};
-  const info = chosen?.info || {};
-
-  // price & caps
-  const priceUsd = safeNum(chosen?.priceUsd ?? moon?.priceUsd);
-  const fdv      = safeNum(chosen?.fdv);
-  const marketCap = safeNum(chosen?.marketCap);
-
-  // volume & change objects as-is (renderer expects numbers or null)
-  const volume     = chosen?.volume || null;
-  const priceChange = chosen?.priceChange || null;
-
-  // Socials
-  const socials = extractSocials(info);
-
-  // Build summary
-  const summary = {
-    name: base?.name || null,
-    symbol: base?.symbol || null,
-    priceUsd: priceUsd,
-    volume,
-    priceChange,
-    marketCap: marketCap ?? fdv ?? null,
-    marketCapSource: marketCap != null ? 'market' : (fdv != null ? 'fdv' : null),
-
-    // Pairs
-    pairAddress: bestAMM?.pairAddress ? String(bestAMM.pairAddress).toLowerCase() : null, // real 0x… (for buyers/LP exclusion)
-    launchPadPair: moon?.pairAddress || null,                                             // ":moon" pseudo-id (UI only)
-    dexId: chosen?.dexId || null,
-    chainId: chain.dsSlug,
-
-    // Pass-through moonshot object if present so renderer can read progress
-    moonshot: chosen?.moonshot || moon?.moonshot || null,
-
-    // socials for UI row
-    socials
+  return {
+    summary: best
+      ? {
+          chain: chain.key,
+          chainSlug: chain.dsSlug,
+          pairAddress: best.pairAddress,
+          dexId: best.dexId,
+          symbol: best.baseToken?.symbol || '',
+          name: best.baseToken?.name || '',
+          priceUsd: best.priceUsd,
+          priceNative: best.priceNative,
+          liquidityUsd: best.liquidityUsd,
+          vol24h: best.vol24h,
+          moonshot: best.moonshot || null,
+          creator,
+        }
+      : { chain: chain.key, chainSlug: chain.dsSlug, creator },
   };
-
-  return { summary };
 }
