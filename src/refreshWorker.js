@@ -1,7 +1,7 @@
 // src/refreshWorker.js
 // Sources:
-//  • Market + creator: Dexscreener (pair + /tokens/v1/abstract/<CA> for creator)
-//  • On-chain math: Etherscan V2 (chainid=2741) — logs.getLogs (holders math), account.tokentx (first buyers),
+//  • Market + creator: Dexscreener (pair + /tokens/v1/<slug>/<CA> for creator)
+//  • On-chain math: Etherscan V2 — logs.getLogs (holders math), account.tokentx (first buyers),
 //    stats.tokensupply, account.tokenbalance
 // Queue: BullMQ
 
@@ -10,9 +10,10 @@ import axios from 'axios';
 import Redis from 'ioredis';
 import { Worker, Queue } from 'bullmq';
 
-import { setJSON, withLock } from './cache.js';
+import { setJSON, withLock, getJSON } from './cache.js';
 import { getDexscreenerTokenStats } from './services/dexscreener.js';
 import { resolveChain } from './chains.js';
+import { buildIndexSnapshot } from './indexer.js';
 
 // ---------- Dexscreener helpers ----------
 async function getDexCreator(ca, chain) {
@@ -33,10 +34,10 @@ async function getDexPairAddresses(ca, chain) {
     const { data } = await axios.get(url, { timeout: 15_000 });
 
     const dsPairs = Array.isArray(data?.pairs) ? data.pairs : [];
-    const abstractPairs = dsPairs.filter(p => p?.chainId === chain.dsSlug);
+    const chainPairs = dsPairs.filter(p => p?.chainId === chain.dsSlug);
     const isMoon = (p) => String(p?.pairAddress || '').includes(':moon');
 
-    const ammCandidates = abstractPairs.filter(p => !isMoon(p));
+    const ammCandidates = chainPairs.filter(p => !isMoon(p));
     ammCandidates.sort((a, b) => {
       const vA = Number(a?.volume?.h24 || 0), vB = Number(b?.volume?.h24 || 0);
       if (vB !== vA) return vB - vA;
@@ -44,7 +45,7 @@ async function getDexPairAddresses(ca, chain) {
       return lB - lA;
     });
     const bestAMM = ammCandidates[0] || null;
-    const moon = abstractPairs.find(isMoon) || null;
+    const moon = chainPairs.find(isMoon) || null;
 
     return {
       ammPair: bestAMM?.pairAddress ? String(bestAMM.pairAddress).toLowerCase() : null,
@@ -58,8 +59,6 @@ async function getDexPairAddresses(ca, chain) {
 // ---------- Etherscan V2 client ----------
 const ES_BASE  = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
 const ES_KEY   = process.env.ETHERSCAN_API_KEY;
-const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741'; // Abstract
-
 if (!ES_KEY) console.warn('[WORKER BOOT] ETHERSCAN_API_KEY is missing');
 const httpES = axios.create({ baseURL: ES_BASE, timeout: 45_000 });
 
@@ -75,15 +74,18 @@ async function throttleES() {
     esLastTs = Date.now();
   }));
 }
-function esParams(params) {
-  return { params: { chainid: ES_CHAIN, apikey: ES_KEY, ...params } };
+
+function esParams(params, chain) {
+  const chainId = chain?.etherscanChainId || '2741';
+  return { params: { chainid: chainId, apikey: ES_KEY, ...params } };
 }
-function esURL(params) {
+function esURL(params, chain) {
   const u = new URL(ES_BASE);
-  Object.entries({ chainid: ES_CHAIN, apikey: ES_KEY, ...params }).forEach(([k,v]) => u.searchParams.set(k, String(v)));
+  const chainId = chain?.etherscanChainId || '2741';
+  Object.entries({ chainid: chainId, apikey: ES_KEY, ...params }).forEach(([k,v]) => u.searchParams.set(k, String(v)));
   return u.toString();
 }
-async function esGET(params, { logOnce = false, tag = '' } = {}) {
+async function esGET(params, { logOnce = false, tag = '' } = {}, chain) {
   if (logOnce) console.log(`[ESV2] ${tag} ${esURL(params, chain)}`);
   await throttleES();
   const maxAttempts = 3;
@@ -118,11 +120,12 @@ const topicToAddr = (t) => ('0x' + String(t).slice(-40)).toLowerCase();
 const padAddrTopic = (addr) => '0x'.concat('0'.repeat(24), String(addr).toLowerCase().replace(/^0x/, ''));
 
 // ---------- Discover block bounds ----------
-async function getCreationBlock(token) {
+async function getCreationBlock(token, chain) {
   try {
     const res = await esGET(
       { module: 'contract', action: 'getcontractcreation', contractaddresses: token },
-      { logOnce: true, tag: '[creatorBlock]' }
+      { logOnce: true, tag: '[creatorBlock]' },
+      chain
     );
     const first = Array.isArray(res) ? res[0] : res;
     const n = Number(first?.blockNumber || first?.blocknumber || first);
@@ -131,30 +134,33 @@ async function getCreationBlock(token) {
   try {
     const r = await esGET(
       { module: 'account', action: 'tokentx', contractaddress: token, page: 1, offset: 1, sort: 'asc' },
-      { logOnce: true, tag: '[firstTx]' }
+      { logOnce: true, tag: '[firstTx]' },
+      chain
     );
     const n = Number((Array.isArray(r) && r[0]?.blockNumber) || r?.blockNumber);
     if (Number.isFinite(n) && n > 0) return n;
   } catch {}
   return 0;
 }
-async function getLatestBlock() {
+async function getLatestBlock(chain) {
   try {
     const ts = Math.floor(Date.now() / 1000);
     const r = await esGET(
       { module: 'block', action: 'getblocknobytime', timestamp: ts, closest: 'before' },
-      { logOnce: true, tag: '[latestBlock]' }
+      { logOnce: true, tag: '[latestBlock]' },
+      chain
     );
     const n = Number(r?.blockNumber || r?.BlockNumber || r);
     if (Number.isFinite(n) && n > 0) return n;
   } catch {}
   return 9_223_372_036;
 }
-async function getContractCreator(token) {
+async function getContractCreator(token, chain) {
   try {
     const res = await esGET(
       { module: 'contract', action: 'getcontractcreation', contractaddresses: token },
-      { logOnce: false, tag: '' }
+      { logOnce: false, tag: '' },
+      chain
     );
     const first = Array.isArray(res) ? res[0] : res;
     const addr = first?.contractCreator || first?.creatorAddress || first?.contractCreatorAddress;
@@ -171,7 +177,7 @@ async function getAllTransferLogs(token, {
   window = 200_000,
   offset = 1000,
   maxWindows = 300,
-} = {}) {
+} = {}, chain) {
   if (!Number.isFinite(fromBlock) || !Number.isFinite(toBlock) || fromBlock > toBlock) {
     throw new Error(`bad block range ${fromBlock}..${toBlock}`);
   }
@@ -200,7 +206,7 @@ async function getAllTransferLogs(token, {
       let ok = false;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          batch = await esGET(params, { logOnce: page === 1 && attempt === 1, tag: `[logs ${start}-${end}]` });
+          batch = await esGET(params, { logOnce: page === 1 && attempt === 1, tag: `[logs ${start}-${end}]` }, chain);
           ok = true; break;
         } catch (e) {
           if (attempt === 3) {
@@ -232,7 +238,7 @@ async function getAllTransferLogs(token, {
 }
 
 // ---------- Earliest tokentx ASC (for first buyers) ----------
-async function fetchEarliestTokentxAsc(token, { pages = 20, offset = 200 } = {}) {
+async function fetchEarliestTokentxAsc(token, { pages = 20, offset = 200 } = {}, chain) {
   const out = [];
   for (let page = 1; page <= pages; page++) {
     const params = {
@@ -245,7 +251,7 @@ async function fetchEarliestTokentxAsc(token, { pages = 20, offset = 200 } = {})
     };
     let batch;
     try {
-      batch = await esGET(params, { logOnce: page === 1, tag: '[tokentx-asc]' });
+      batch = await esGET(params, { logOnce: page === 1, tag: '[tokentx-asc]' }, chain);
     } catch (e) {
       console.warn('[ESV2] tokentx page failed', page, e?.message || e);
       break;
@@ -258,17 +264,19 @@ async function fetchEarliestTokentxAsc(token, { pages = 20, offset = 200 } = {})
 }
 
 // ---------- Etherscan helpers ----------
-async function getTokenTotalSupply(token) {
+async function getTokenTotalSupply(token, chain) {
   return String(await esGET(
     { module: 'stats', action: 'tokensupply', contractaddress: token },
-    { logOnce: true, tag: '[supply]' }
+    { logOnce: true, tag: '[supply]' },
+    chain
   ));
 }
-async function getCreatorTokenBalance(token, creator) {
+async function getCreatorTokenBalance(token, creator, chain) {
   if (!creator) return '0';
   return String(await esGET(
     { module: 'account', action: 'tokenbalance', contractaddress: token, address: creator, tag: 'latest' },
-    { logOnce: true, tag: '[creatorBalance]' }
+    { logOnce: true, tag: '[creatorBalance]' },
+    chain
   ));
 }
 function buildBalancesFromLogs(logs) {
@@ -290,7 +298,7 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
     const a = addr.toLowerCase();
     if (bal <= 0n) continue;
     if (ex.has(a)) continue;
-    if (BANNED.has(a)) continue;  // NEW line
+    if (BANNED.has(a)) continue;
     rows.push([a, bal]);
   }
   rows.sort((A, B) => (B[1] > A[1] ? 1 : (B[1] < A[1] ? -1 : 0)));
@@ -330,7 +338,7 @@ function first20BuyersFromTokentx(txsAsc, { tokenAddress, creator, pairAddress, 
     if (DEAD.has(to)) return false;
     if (pair && to === pair) return false;
     if (excludeTokenAsPool && to === ca) return false;
-    if (BANNED.has(to)) return false;   // NEW line
+    if (BANNED.has(to)) return false;
     if (!firstSeen.has(to)) {
       let amt = 0n;
       try { amt = toBig(tx.value || '0'); } catch {}
@@ -387,7 +395,7 @@ function first20BuyersFromLogs(logsAsc, { tokenAddress, creator, pairAddress, ex
     if (DEAD.has(to)) return false;
     if (pair && to === pair) return false;
     if (excludeTokenAsPool && to === ca) return false;
-    if (BANNED.has(to)) return false;   // NEW line
+    if (BANNED.has(to)) return false;
     if (!firstSeen.has(to)) {
       const amt = toBig(lg.data);
       firstSeen.set(to, {
@@ -427,6 +435,7 @@ const bullRedis = new Redis(process.env.REDIS_URL, {
   maxRetriesPerRequest: null,
   enableReadyCheck: false,
 });
+
 export const queueName = 'multichain_refresh';
 export const queue = new Queue(queueName, { connection: bullRedis });
 
@@ -440,7 +449,7 @@ export async function refreshToken(tokenAddress, chainKey='tabs') {
   const lockKey = `lock:refresh:${ca}`;
   return withLock(lockKey, 60, async () => {
     const t0 = Date.now();
-    console.log('[WORKER] refreshToken start', ca);
+    console.log('[WORKER] refreshToken start', ca, 'chain=', chain.key);
 
     // 1) Dexscreener (market + pair + creator)
     let market = null;
@@ -475,7 +484,7 @@ export async function refreshToken(tokenAddress, chainKey='tabs') {
           creatorAddr = String(dsMoonCreator).toLowerCase();
         }
       }
-      if (!creatorAddr) creatorAddr = await getContractCreator(ca);
+      if (!creatorAddr) creatorAddr = await getContractCreator(ca, chain);
 
       console.log('[WORKER] Dex ok', ca, 'ammPair=', ammPair, 'moonPair=', launchPadPair, 'creator=', creatorAddr || 'unknown');
     } catch (e) {
@@ -489,8 +498,8 @@ export async function refreshToken(tokenAddress, chainKey='tabs') {
     let earlyTokentx = [];
     try {
       const [creationBlock, latestBlock] = await Promise.all([
-        getCreationBlock(ca),
-        getLatestBlock(),
+        getCreationBlock(ca, chain),
+        getLatestBlock(chain),
       ]);
 
       const fromB = Math.max(0, creationBlock - 1);
@@ -499,13 +508,13 @@ export async function refreshToken(tokenAddress, chainKey='tabs') {
       console.log('[WORKER] range', ca, fromB, '→', toB);
 
       [logs, totalSupplyRaw, earlyTokentx] = await Promise.all([
-        getAllTransferLogs(ca, { fromBlock: fromB, toBlock: toB, window: 200_000, offset: 1000 }),
-        getTokenTotalSupply(ca),
-        fetchEarliestTokentxAsc(ca, { pages: 20, offset: 200 }),
+        getAllTransferLogs(ca, { fromBlock: fromB, toBlock: toB, window: 200_000, offset: 1000 }, chain),
+        getTokenTotalSupply(ca, chain),
+        fetchEarliestTokentxAsc(ca, { pages: 20, offset: 200 }, chain),
       ]);
 
       if (creatorAddr) {
-        creatorBalRaw = await getCreatorTokenBalance(ca, creatorAddr);
+        creatorBalRaw = await getCreatorTokenBalance(ca, creatorAddr, chain);
       }
       console.log('[WORKER] pulls ok', 'logs=', logs.length, 'tokentxEarly=', earlyTokentx.length, 'supply=', totalSupplyRaw);
     } catch (e) {
@@ -604,7 +613,7 @@ export async function refreshToken(tokenAddress, chainKey='tabs') {
       creator: { address: creatorAddr, percent: creatorPercent },
     };
 
-    // 5) Cache
+    // 5) Cache (namespaced)
     const sumKey  = `token:${chain.key}:${ca}:summary`;
     const gateKey = `token:${chain.key}:${ca}:last_refresh`;
     try {
@@ -615,20 +624,20 @@ export async function refreshToken(tokenAddress, chainKey='tabs') {
       console.log('[WORKER] cache write failed:', e?.message || e);
     }
 
-    console.log('[WORKER] refreshToken done', ca);
+    console.log('[WORKER] refreshToken done', ca, 'chain=', chain.key);
     return payload;
   });
 }
 
 // ---------- Worker (consumer) ----------
 new Worker(
-  'tabs_refresh',
+  'multichain_refresh',
   async (job) => {
     const chain = resolveChain(job.data?.chain || 'tabs');
     const ca = job.data?.tokenAddress;
-    console.log('[WORKER] job received:', job.name, job.id, ca);
+    console.log('[WORKER] job received:', job.name, job.id, ca, 'chain=', chain.key);
     try {
-      const res = await refreshToken(ca);
+      const res = await refreshToken(ca, chain.key);
       console.log('[WORKER] job OK:', job.id);
       return res;
     } catch (e) {
@@ -647,7 +656,8 @@ if (process.argv.includes('--cron') && process.env.DEFAULT_TOKENS) {
     setInterval(async () => {
       for (const ca of list) {
         try {
-          await queue.add('refresh', { tokenAddress: ca }, { removeOnComplete: true, removeOnFail: true });
+          // default to tabs for cron
+          await queue.add('refresh', { tokenAddress: ca, chain: 'tabs' }, { removeOnComplete: true, removeOnFail: true });
         } catch (e) {
           console.error('[CRON] Enqueue failed for', ca, e?.message || e);
         }
@@ -656,9 +666,7 @@ if (process.argv.includes('--cron') && process.env.DEFAULT_TOKENS) {
   }
 }
 
-import { getJSON } from './cache.js';
-import { buildIndexSnapshot } from './indexer.js';
-
+// ---------- Optional index cron (unchanged, uses default behavior) ----------
 if (!process.env.DISABLE_INDEX_CRON) {
   setInterval(async () => {
     try {
@@ -678,4 +686,3 @@ if (!process.env.DISABLE_INDEX_CRON) {
     }
   }, 6 * 60 * 60 * 1000); // every 6 hours
 }
-
