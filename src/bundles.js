@@ -1,10 +1,11 @@
 // src/bundles.js
 import axios from 'axios';
+import { resolveChain } from './chains.js';
 import { getJSON, setJSON } from './cache.js';
 
 const ES_BASE  = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
 const ES_KEY   = process.env.ETHERSCAN_API_KEY;
-const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741';
+let ES_CHAIN_DEFAULT = process.env.ETHERSCAN_CHAIN_ID || '2741';
 
 const httpES = axios.create({ baseURL: ES_BASE, timeout: 30_000 });
 
@@ -19,9 +20,9 @@ async function throttle() {
     _last = Date.now();
   }));
 }
-async function esGET(params) {
+async function esGET(params, chainId) {
   await throttle();
-  const { data } = await httpES.get('', { params: { chainid: ES_CHAIN, apikey: ES_KEY, ...params } });
+  const { data } = await httpES.get('', { params: { chainid: (chainId||ES_CHAIN_DEFAULT), apikey: ES_KEY, ...params } });
   if (data?.status === '1') return data.result;
   throw new Error(data?.result || data?.message || 'Etherscan v2 error');
 }
@@ -39,13 +40,13 @@ const toBig = (x) => BigInt(String(x));
  * Helper: detect creator + “moonshot” allowance (token-as-sender)
  * Returns { creator, allowTokenAsSender, meta }
  * ——————————————————————————————————————————————————————————————— */
-async function detectLaunchMeta(ca) {
+async function detectLaunchMeta(ca, chain) {
   let creator = null;
   let allowTokenAsSender = false;
   let meta = {};
 
   try {
-    const { data } = await axios.get(`https://api.dexscreener.com/tokens/v1/abstract/${ca}`, { timeout: 12_000 });
+    const { data } = await axios.get(`https://api.dexscreener.com/tokens/v1/${chain.dsSlug}/${ca}`, { timeout: 12_000 });
     const obj = Array.isArray(data) ? data[0] : data;
 
     if (obj?.creator) creator = String(obj.creator).toLowerCase();
@@ -86,7 +87,7 @@ export async function buildBundlesSnapshot(contractAddress) {
   const cached = await getJSON(cacheKey);
   if (cached) return cached;
 
-  const { creator, allowTokenAsSender, meta } = await detectLaunchMeta(ca);
+  const { creator, allowTokenAsSender, meta } = await detectLaunchMeta(ca, chain);
 
   if (!creator && !allowTokenAsSender) {
     const res = { updatedAt: Date.now(), totalBundles: 0, groups: [], hints: { creator:null, allowTokenAsSender:false, meta } };
@@ -202,7 +203,7 @@ export async function buildFundingMap(contractAddress) {
   const cached = await getJSON(cacheKey);
   if (cached) return cached;
 
-  const { creator, allowTokenAsSender, meta } = await detectLaunchMeta(ca);
+  const { creator, allowTokenAsSender, meta } = await detectLaunchMeta(ca, chain);
 
   // If we can't identify any valid funding source, return an empty map
   if (!creator && !allowTokenAsSender) {
