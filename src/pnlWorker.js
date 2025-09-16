@@ -1,14 +1,13 @@
 // src/pnlWorker.js
 import './configEnv.js';
 import axios from 'axios';
+import { resolveChain } from './chains.js';
 
 /* -------------------- Config -------------------- */
 
 // Etherscan V2
 const ES_BASE  = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
 const ES_KEY   = process.env.ETHERSCAN_API_KEY;
-const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741'; // Abstract
-
 if (!ES_KEY) console.warn('[PNL] ETHERSCAN_API_KEY missing');
 
 const httpES = axios.create({ baseURL: ES_BASE, timeout: 45_000 });
@@ -25,15 +24,16 @@ async function throttleES() {
     esLastTs = Date.now();
   }));
 }
-function esParams(params) {
-  return { params: { chainid: ES_CHAIN, apikey: ES_KEY, ...params } };
+function esParams(params, chain) {
+  const chainId = chain?.etherscanChainId || '2741';
+  return { params: { chainid: chainId, apikey: ES_KEY, ...params } };
 }
-async function esGET(params) {
+async function esGET(params, chain) {
   await throttleES();
   const attempts = 3;
   for (let i = 1; i <= attempts; i++) {
     try {
-      const { data } = await httpES.get('', esParams(params));
+      const { data } = await httpES.get('', esParams(params, chain));
       if (data?.status === '1') return data.result;
       const msg = data?.result || data?.message || 'Etherscan v2 error';
       if (i === attempts) throw new Error(msg);
@@ -47,7 +47,7 @@ async function esGET(params) {
 // Dexscreener (for price/name)
 const httpDS = axios.create({ timeout: 15_000 });
 
-// Optional Alchemy Abstract RPC (for balances)
+// Optional Alchemy RPC (can be chain-specific via env if you want)
 const ALCHEMY_RPC = process.env.ALCHEMY_RPC || '';
 
 /* -------------------- Utils -------------------- */
@@ -100,58 +100,56 @@ function isETHLikeMeta(meta) {
   return isETHLikeAddr(meta?.token) || isETHLikeSym(meta?.symbol);
 }
 
-
-
 /* -------------------- Data pulls -------------------- */
 
-async function getTxList(address, { pageSize = 100, maxPages = 100 } = {}) {
+async function getTxList(address, { pageSize = 100, maxPages = 100 } = {}, chain) {
   const out = [];
   for (let page = 1; page <= maxPages; page++) {
     const batch = await esGET({
       module:'account', action:'txlist', address,
       page, offset:pageSize, startblock:0, endblock:9_223_372_036, sort:'asc'
-    });
+    }, chain);
     if (!Array.isArray(batch) || batch.length === 0) break;
     out.push(...batch);
     if (batch.length < pageSize) break;
   }
   return out;
 }
-async function getInternalByAddress(address, { pageSize = 100, maxPages = 100 } = {}) {
+async function getInternalByAddress(address, { pageSize = 100, maxPages = 100 } = {}, chain) {
   const out = [];
   for (let page = 1; page <= maxPages; page++) {
     const batch = await esGET({
       module:'account', action:'txlistinternal', address,
       page, offset:pageSize, startblock:0, endblock:9_223_372_036, sort:'asc'
-    });
+    }, chain);
     if (!Array.isArray(batch) || batch.length === 0) break;
     out.push(...batch);
     if (batch.length < pageSize) break;
   }
   return out;
 }
-async function getTokentxByAddress(address, { pageSize = 100, maxPages = 100 } = {}) {
+async function getTokentxByAddress(address, { pageSize = 100, maxPages = 100 } = {}, chain) {
   const out = [];
   for (let page = 1; page <= maxPages; page++) {
     const batch = await esGET({
       module:'account', action:'tokentx', address,
       page, offset:pageSize, startblock:0, endblock:9_223_372_036, sort:'asc'
-    });
+    }, chain);
     if (!Array.isArray(batch) || batch.length === 0) break;
     out.push(...batch);
     if (batch.length < pageSize) break;
   }
   return out;
 }
-async function getNFTtx(address, { pageSize = 200 } = {}) {
+async function getNFTtx(address, { pageSize = 200 } = {}, chain) {
   const res = await esGET({
     module:'account', action:'tokennfttx', address,
     page:1, offset:pageSize, startblock:0, endblock:9_223_372_036, sort:'desc'
-  });
+  }, chain);
   return Array.isArray(res) ? res : [];
 }
 
-async function getTokenPairsBulk(tokenCAs) {
+async function getTokenPairsBulk(tokenCAs, chain) {
   const uniq = [...new Set(tokenCAs.map(s => s?.toLowerCase()).filter(Boolean))];
   const out = {};
   for (let i = 0; i < uniq.length; i += 20) {
@@ -163,7 +161,7 @@ async function getTokenPairsBulk(tokenCAs) {
       const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
       const best = {};
       for (const p of pairs) {
-        if (String(p?.chainId) !== 'abstract') continue;
+        if (String(p?.chainId) !== (chain?.dsSlug || 'abstract')) continue;
         const ca = String(p?.baseToken?.address || '').toLowerCase();
         if (!ca) continue;
         const score = Number(p?.liquidity?.usd || 0) + Number(p?.volume?.h24 || 0);
@@ -173,7 +171,7 @@ async function getTokenPairsBulk(tokenCAs) {
             symbol: p?.baseToken?.symbol || '',
             name: p?.baseToken?.name || '',
             priceUsd: Number(p?.priceUsd || 0),
-            priceNative: Number(p?.priceNative || 0), // <— needed for unrealized ETH
+            priceNative: Number(p?.priceNative || 0), // ETH per token (or native chain token)
           };
         }
       }
@@ -183,7 +181,7 @@ async function getTokenPairsBulk(tokenCAs) {
   return out;
 }
 
-// Optional: full ERC20 balances via Alchemy RPC (Abstract)
+// Optional: full ERC20 balances via Alchemy RPC (can be chain-specific via env)
 async function getAlchemyBalances(address) {
   if (!ALCHEMY_RPC) return [];
   try {
@@ -203,10 +201,10 @@ async function getAlchemyBalances(address) {
   }
 }
 
-// Wallet ETH balance (balancemulti returns array)
-async function getEthBalanceWei(address) {
+// Wallet ETH/native balance (balancemulti returns array)
+async function getEthBalanceWei(address, chain) {
   try {
-    const res = await esGET({ module:'account', action:'balancemulti', address, tag:'latest' });
+    const res = await esGET({ module:'account', action:'balancemulti', address, tag:'latest' }, chain);
     const first = (Array.isArray(res) ? res[0] : res) || {};
     return String(first.balance || '0');
   } catch {
@@ -264,7 +262,9 @@ function chooseTradeToken(rec) {
   return dominant;
 }
 
-export async function refreshPnl(wallet, window='30d') {
+export async function refreshPnl(wallet, window='30d', chainKey='tabs') {
+  const chain = resolveChain(chainKey);
+
   const acct = String(wallet||'').trim().toLowerCase();
   if (!/^0x[a-f0-9]{40}$/.test(acct)) throw new Error('Bad wallet');
 
@@ -272,15 +272,15 @@ export async function refreshPnl(wallet, window='30d') {
 
   // 1) Fetch txs
   const [normals, internals, tokentx] = await Promise.all([
-    getTxList(acct),
-    getInternalByAddress(acct),
-    getTokentxByAddress(acct),
+    getTxList(acct, {}, chain),
+    getInternalByAddress(acct, {}, chain),
+    getTokentxByAddress(acct, {}, chain),
   ]);
 
   // 2) Build per-hash envelope
   const txmap = new Map(); // hash -> { ts, ethInWei, ethOutWei, tokenDeltas: {ca:{deltaRaw,decimals,symbol,name}} }
 
-  // Normal ETH
+  // Normal ETH/native
   for (const t of normals) {
     const h = t.hash, ts = Number(t.timeStamp||0);
     const from = String(t.from||'').toLowerCase();
@@ -291,7 +291,7 @@ export async function refreshPnl(wallet, window='30d') {
     if (to   === acct && valWei > 0n) rec.ethInWei  += valWei;
     if (!rec.ts) rec.ts = ts;
   }
-  // Internal ETH
+  // Internal ETH/native
   for (const t of internals) {
     const h = t.hash, ts = Number(t.timeStamp||0);
     const from = String(t.from||'').toLowerCase();
@@ -302,7 +302,7 @@ export async function refreshPnl(wallet, window='30d') {
     if (to   === acct && valWei > 0n) rec.ethInWei  += valWei;
     if (!rec.ts) rec.ts = ts;
   }
-  // ERC20 (incl. WETH → map to ETH leg)
+  // ERC20 (incl. WETH → map to ETH/native leg)
   for (const ev of tokentx) {
     const h  = ev.hash, ts = Number(ev.timeStamp||0);
     const from = String(ev.from||'').toLowerCase();
@@ -398,6 +398,8 @@ export async function refreshPnl(wallet, window='30d') {
   const realizedItems = [];
   const openItems = [];
 
+  const DUST_THRESHOLD = 5n;
+
   for (const p of positions.values()) {
     const heldRaw = p.qtyBoughtRaw - p.qtySoldRaw;
     const heldBig = heldRaw > 0n ? heldRaw : 0n;
@@ -465,19 +467,19 @@ export async function refreshPnl(wallet, window='30d') {
     } catch {}
   }
 
-  // 7) Price open positions (USD + ETH native). Also compute unrealized in ETH.
-  const priceMap = await getTokenPairsBulk(openItems.map(x => x.token));
+  // 7) Price open positions (USD + native). Also compute unrealized in native.
+  const priceMap = await getTokenPairsBulk(openItems.map(x => x.token), chain);
   let holdingsUsd = 0;
   let unrealizedEthSum = 0;
 
   const openEnriched = openItems.map(o => {
     const info = priceMap[o.token?.toLowerCase()] || {};
     const priceUsd    = Number(info.priceUsd || 0);
-    const priceNative = Number(info.priceNative || 0); // ETH per token
+    const priceNative = Number(info.priceNative || 0); // native per token
     const usd = priceUsd * (o.heldNum || 0);
     holdingsUsd += usd;
 
-    // unrealized in ETH: current value in ETH minus cost basis for remaining tokens
+    // unrealized in native: current value in native minus cost basis for remaining tokens
     const currEth = priceNative * (o.heldNum || 0);
     const cbEth   = (o.avgBuyEth || 0) * (o.heldNum || 0);
     const uPnL    = currEth - cbEth;
@@ -509,7 +511,7 @@ export async function refreshPnl(wallet, window='30d') {
       }
     }
   }
-  const nftEvents = await getNFTtx(acct, { pageSize: 200 });
+  const nftEvents = await getNFTtx(acct, { pageSize: 200 }, chain);
   const nftMap = new Map();
   for (const ev of nftEvents) {
     const ts = Number(ev.timeStamp||0);
@@ -523,7 +525,7 @@ export async function refreshPnl(wallet, window='30d') {
     }
   }
   const dropTokens = Object.values(tokenAirdrops);
-  const priceMapDrops = await getTokenPairsBulk(dropTokens.map(d => d.ca));
+  const priceMapDrops = await getTokenPairsBulk(dropTokens.map(d => d.ca), chain);
   let airdropsUsd = 0;
   for (const d of dropTokens) {
     const info = priceMapDrops[d.ca] || {};
@@ -543,23 +545,22 @@ export async function refreshPnl(wallet, window='30d') {
   let realizedTotalEth = 0;
   for (const p of positions.values()) realizedTotalEth += Number(p.realizedWei)/1e18;
 
-// Filter out ETH/WETH from realized lists
-const realizedItemsFiltered = realizedItems.filter(
-  x => !isETHLikeMeta({ token: x.token, symbol: x.symbol })
-);
+  // Filter out ETH/WETH from realized lists
+  const realizedItemsFiltered = realizedItems.filter(
+    x => !isETHLikeMeta({ token: x.token, symbol: x.symbol })
+  );
 
-// Sort realized lists (ETH/WETH excluded)
-const fullProfits = realizedItemsFiltered
-  .filter(x => x.realizedEth > 0)
-  .sort((a,b) => b.realizedPct - a.realizedPct);
+  // Sort realized lists (ETH/WETH excluded)
+  const fullProfits = realizedItemsFiltered
+    .filter(x => x.realizedEth > 0)
+    .sort((a,b) => b.realizedPct - a.realizedPct);
 
-const fullLosses = realizedItemsFiltered
-  .filter(x => x.realizedEth < 0)
-  .sort((a,b) => a.realizedPct - b.realizedPct);
+  const fullLosses = realizedItemsFiltered
+    .filter(x => x.realizedEth < 0)
+    .sort((a,b) => a.realizedPct - b.realizedPct);
 
-const topProfits = fullProfits.slice(0, 3);
-const topLosses  = fullLosses.slice(0, 3);
-
+  const topProfits = fullProfits.slice(0, 3);
+  const topLosses  = fullLosses.slice(0, 3);
 
   const totals = {
     ethIn: Number(+round4(ETH_IN)),
@@ -572,12 +573,12 @@ const topLosses  = fullLosses.slice(0, 3);
     totalPct: Number(ETH_OUT > 0 ? +round4(((realizedTotalEth + unrealizedEthSum) / ETH_OUT) * 100) : 0),
   };
 
-  // 10) Wallet ETH + WETH fold-in (for display on top of /pnl)
+  // 10) Wallet ETH/native + WETH fold-in (for display on top of /pnl)
   let walletEth = '0';
   let walletWeth = '0';
   let walletEthTotal = '0';
   try {
-    const wei = await getEthBalanceWei(acct);
+    const wei = await getEthBalanceWei(acct, chain);
     walletEth = weiToEthStr(wei);
   } catch {}
   try {
@@ -610,6 +611,6 @@ const topLosses  = fullLosses.slice(0, 3);
     walletEth,
     walletWeth,
     walletEthTotal,
-    _meta: { now: Date.now() }
+    _meta: { now: Date.now(), chain: chain.key }
   };
 }
