@@ -149,9 +149,12 @@ async function getNFTtx(address, { pageSize = 200 } = {}, chain) {
   return Array.isArray(res) ? res : [];
 }
 
+// inside src/pnlWorker.js
 async function getTokenPairsBulk(tokenCAs, chain) {
   const uniq = [...new Set(tokenCAs.map(s => s?.toLowerCase()).filter(Boolean))];
   const out = {};
+  const slug = String(chain?.dsSlug || 'abstract').toLowerCase();
+
   for (let i = 0; i < uniq.length; i += 20) {
     const group = uniq.slice(i, i + 20);
     if (!group.length) continue;
@@ -161,7 +164,7 @@ async function getTokenPairsBulk(tokenCAs, chain) {
       const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
       const best = {};
       for (const p of pairs) {
-        if (String(p?.chainId) !== (chain?.dsSlug || 'abstract')) continue;
+        if (String(p?.chainId || '').toLowerCase() !== slug) continue;
         const ca = String(p?.baseToken?.address || '').toLowerCase();
         if (!ca) continue;
         const score = Number(p?.liquidity?.usd || 0) + Number(p?.volume?.h24 || 0);
@@ -171,7 +174,7 @@ async function getTokenPairsBulk(tokenCAs, chain) {
             symbol: p?.baseToken?.symbol || '',
             name: p?.baseToken?.name || '',
             priceUsd: Number(p?.priceUsd || 0),
-            priceNative: Number(p?.priceNative || 0), // ETH per token (or native chain token)
+            priceNative: Number(p?.priceNative || 0),
           };
         }
       }
