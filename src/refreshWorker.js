@@ -15,55 +15,64 @@ import { getDexscreenerTokenStats } from './services/dexscreener.js';
 import { resolveChain } from './chains.js';
 import { buildIndexSnapshot } from './indexer.js';
 
-// ---------- Dexscreener helpers ----------
+// ------------------------ Dexscreener helpers ------------------------
+const httpDS = axios.create({ timeout: 15_000 });
+const lc = (v) => String(v ?? '').trim().toLowerCase();
+
 async function getDexCreator(ca, chain) {
   try {
-    const url = `https://api.dexscreener.com/tokens/v1/${chain.dsSlug}/${ca}`;
+    const url = `https://api.dexscreener.com/tokens/v1/${lc(chain.dsSlug)}/${ca}`;
     const { data } = await axios.get(url, { timeout: 12_000 });
-    if (data?.creator) return String(data.creator).toLowerCase();
-    if (Array.isArray(data) && data[0]?.creator) return String(data[0].creator).toLowerCase();
-    return null;
+    const row = Array.isArray(data) ? (data[0] || {}) : (data || {});
+    return row?.creator ? lc(row.creator) : null;
   } catch {
     return null;
   }
+}
+
+function pickBestPairForChain(pairs, slug) {
+  const isMoon = (p) => String(p?.pairAddress || '').includes(':moon');
+  const sameChain = (Array.isArray(pairs) ? pairs : []).filter((p) => lc(p?.chainId) === lc(slug));
+  if (!sameChain.length) return { best: null, moon: null };
+
+  const nonMoon = sameChain.filter((p) => !isMoon(p));
+  nonMoon.sort((a, b) => {
+    const va = Number(a?.liquidity?.usd || 0) + Number(a?.volume?.h24 || 0);
+    const vb = Number(b?.liquidity?.usd || 0) + Number(b?.volume?.h24 || 0);
+    return vb - va;
+  });
+  const best = nonMoon[0] || null;
+  const moon = sameChain.find(isMoon) || null;
+  return { best, moon };
 }
 
 async function getDexPairAddresses(ca, chain) {
   try {
     const url = `https://api.dexscreener.com/latest/dex/tokens/${ca}`;
-    const { data } = await axios.get(url, { timeout: 15_000 });
+    const { data } = await httpDS.get(url);
+    const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
+    const picked = pickBestPairForChain(pairs, chain.dsSlug);
 
-    const dsPairs = Array.isArray(data?.pairs) ? data.pairs : [];
-    const chainSlug = String(chain.dsSlug || '').toLowerCase();
-    const chainPairs = dsPairs.filter((p) => String(p?.chainId || '').toLowerCase() === chainSlug);
-    const isMoon = (p) => String(p?.pairAddress || '').includes(':moon');
-
-    const ammCandidates = chainPairs.filter(p => !isMoon(p));
-    ammCandidates.sort((a, b) => {
-      const vA = Number(a?.volume?.h24 || 0), vB = Number(b?.volume?.h24 || 0);
-      if (vB !== vA) return vB - vA;
-      const lA = Number(a?.liquidity?.usd || 0), lB = Number(b?.liquidity?.usd || 0);
-      return lB - lA;
-    });
-    const bestAMM = ammCandidates[0] || null;
-    const moon = chainPairs.find(isMoon) || null;
+    const bestAMM = picked.best;
+    const moon = picked.moon;
 
     return {
-      ammPair: bestAMM?.pairAddress ? String(bestAMM.pairAddress).toLowerCase() : null,
+      ammPair: bestAMM?.pairAddress ? lc(bestAMM.pairAddress) : null,
       launchPadPair: moon?.pairAddress ? String(moon.pairAddress) : null,
+      bestMarket: bestAMM || null,
     };
   } catch {
-    return { ammPair: null, launchPadPair: null };
+    return { ammPair: null, launchPadPair: null, bestMarket: null };
   }
 }
 
-// ---------- Etherscan V2 client ----------
+// ------------------------ Etherscan V2 client ------------------------
 const ES_BASE  = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
 const ES_KEY   = process.env.ETHERSCAN_API_KEY;
 if (!ES_KEY) console.warn('[WORKER BOOT] ETHERSCAN_API_KEY is missing');
 const httpES = axios.create({ baseURL: ES_BASE, timeout: 45_000 });
 
-// ---------- Etherscan rate limit ----------
+// Etherscan throttle
 const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
 const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS);
 let esLastTs = 0;
@@ -75,7 +84,6 @@ async function throttleES() {
     esLastTs = Date.now();
   }));
 }
-
 function esParams(params, chain) {
   const chainId = chain?.etherscanChainId || '2741';
   return { params: { chainid: chainId, apikey: ES_KEY, ...params } };
@@ -103,7 +111,7 @@ async function esGET(params, { logOnce = false, tag = '' } = {}, chain) {
   }
 }
 
-// ---------- Constants & utils ----------
+// ------------------------ Constants & utils ------------------------
 const TOPIC_TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const ZERO = '0x0000000000000000000000000000000000000000';
 const DEAD = new Set([
@@ -113,14 +121,13 @@ const DEAD = new Set([
 ].map(s => s.toLowerCase()));
 
 const BANNED = new Set([
-  '0x0d6848e39114abe69054407452b8aab82f8a44ba'  // unwanted wallet distribution
+  '0x0d6848e39114abe69054407452b8aab82f8a44ba'  // unwanted distribution
 ].map(s => s.toLowerCase()));
 
 const toBig = (x) => BigInt(String(x));
 const topicToAddr = (t) => ('0x' + String(t).slice(-40)).toLowerCase();
-const padAddrTopic = (addr) => '0x'.concat('0'.repeat(24), String(addr).toLowerCase().replace(/^0x/, ''));
 
-// ---------- Discover block bounds ----------
+// ------------------------ Block bounds ------------------------
 async function getCreationBlock(token, chain) {
   try {
     const res = await esGET(
@@ -171,8 +178,7 @@ async function getContractCreator(token, chain) {
   }
 }
 
-// ---------- Windowed Transfer log crawler (holders math) ----------
-// Adaptive splitter to satisfy Etherscan "Result window is too large" limit (page*offset <= 10000)
+// ------------------------ Logs crawler (adaptive) ------------------------
 async function getAllTransferLogs(token, {
   fromBlock,
   toBlock,
@@ -205,10 +211,10 @@ async function getAllTransferLogs(token, {
         const batch = await esGET(params, { logOnce: page === 1, tag: `[logs ${winFrom}-${winTo}]` }, chain);
         if (!Array.isArray(batch) || batch.length === 0) return;
         out.push(...batch);
-        if (batch.length < offset) return; // finished this window
+        if (batch.length < offset) return;
         page += 1;
-        // if we exceed Etherscan 10k cap, bisect and recurse
         if (page * offset > 10_000) {
+          // Etherscan hard cap — bisect and recurse
           const mid = Math.floor((winFrom + winTo) / 2);
           await pullWindow(winFrom, mid);
           await pullWindow(mid + 1, winTo);
@@ -222,8 +228,7 @@ async function getAllTransferLogs(token, {
           await pullWindow(mid + 1, winTo);
           return;
         }
-        // transient: backoff and retry same page
-        await new Promise(r => setTimeout(r, 600));
+        await new Promise(r => setTimeout(r, 600)); // transient backoff
       }
     }
   }
@@ -241,7 +246,7 @@ async function getAllTransferLogs(token, {
   return out;
 }
 
-// ---------- Earliest tokentx ASC (for first buyers) ----------
+// ------------------------ Etherscan helpers ------------------------
 async function fetchEarliestTokentxAsc(token, { pages = 20, offset = 200 } = {}, chain) {
   const out = [];
   for (let page = 1; page <= pages; page++) {
@@ -253,21 +258,19 @@ async function fetchEarliestTokentxAsc(token, { pages = 20, offset = 200 } = {},
       offset,
       sort: 'asc'
     };
-    let batch;
     try {
-      batch = await esGET(params, { logOnce: page === 1, tag: '[tokentx-asc]' }, chain);
+      const batch = await esGET(params, { logOnce: page === 1, tag: '[tokentx-asc]' }, chain);
+      if (!Array.isArray(batch) || batch.length === 0) break;
+      out.push(...batch);
+      if (batch.length < offset) break;
     } catch (e) {
       console.warn('[ESV2] tokentx page failed', page, e?.message || e);
       break;
     }
-    if (!Array.isArray(batch) || batch.length === 0) break;
-    out.push(...batch);
-    if (batch.length < offset) break;
   }
-  return out; // ascending
+  return out;
 }
 
-// ---------- Etherscan helpers ----------
 async function getTokenTotalSupply(token, chain) {
   return String(await esGET(
     { module: 'stats', action: 'tokensupply', contractaddress: token },
@@ -283,8 +286,9 @@ async function getCreatorTokenBalance(token, creator, chain) {
     chain
   ));
 }
+
 function buildBalancesFromLogs(logs) {
-  const balances = new Map(); // addr -> bigint
+  const balances = new Map();
   for (const lg of logs) {
     const from = topicToAddr(lg.topics[1]);
     const to   = topicToAddr(lg.topics[2]);
@@ -296,10 +300,10 @@ function buildBalancesFromLogs(logs) {
   return balances;
 }
 function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
-  const ex = new Set((exclude || []).map(s => String(s || '').toLowerCase()));
+  const ex = new Set((exclude || []).map((s) => lc(s)));
   const rows = [];
   for (const [addr, bal] of balances.entries()) {
-    const a = addr.toLowerCase();
+    const a = lc(addr);
     if (bal <= 0n) continue;
     if (ex.has(a)) continue;
     if (BANNED.has(a)) continue;
@@ -321,28 +325,27 @@ function computeTopHolders(balances, totalSupplyBigInt, { exclude = [] } = {}) {
   return { holdersTop20: top20, top10CombinedPct, holdersCount: rows.length };
 }
 
-/** ---------- First buyers from tokentx (creator-anchored) ---------- */
+// ------------------------ First buyers ------------------------
 function first20BuyersFromTokentx(txsAsc, { tokenAddress, creator, pairAddress, excludeTokenAsPool = false }, balances) {
   if (!Array.isArray(txsAsc) || txsAsc.length === 0 || !creator) return [];
-  const ca = String(tokenAddress).toLowerCase();
-  const creatorAddr = String(creator).toLowerCase();
-  const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
+  const ca = lc(tokenAddress);
+  const creatorAddr = lc(creator);
+  const pair = pairAddress ? lc(pairAddress) : null;
 
   let startIdx = -1;
   for (let i = 0; i < txsAsc.length; i++) {
-    const to = String(txsAsc[i]?.to || '').toLowerCase();
+    const to = lc(txsAsc[i]?.to || '');
     if (to === creatorAddr) { startIdx = i; break; }
   }
   if (startIdx < 0) return [];
 
-  const firstSeen = new Map(); // addr -> { firstBuyAmt, blockNumber, logIndex }
+  const firstSeen = new Map();
   const addIfEligible = (tx) => {
-    const to = String(tx?.to || '').toLowerCase();
+    const to = lc(tx?.to || '');
     if (!to) return false;
     if (DEAD.has(to)) return false;
     if (pair && to === pair) return false;
     if (excludeTokenAsPool && to === ca) return false;
-    if (BANNED.has(to)) return false;
     if (!firstSeen.has(to)) {
       let amt = 0n;
       try { amt = toBig(tx.value || '0'); } catch {}
@@ -362,12 +365,9 @@ function first20BuyersFromTokentx(txsAsc, { tokenAddress, creator, pairAddress, 
   }
 
   const ordered = [...firstSeen.entries()]
-    .sort((a, b) => {
-      if (a[1].blockNumber !== b[1].blockNumber) return a[1].blockNumber - b[1].blockNumber;
-      return a[1].logIndex - b[1].logIndex;
-    })
+    .sort((a, b) => (a[1].blockNumber - b[1].blockNumber) || (a[1].logIndex - b[1].logIndex))
     .map(([address, info]) => {
-      const balNow = balances.get(address.toLowerCase()) || 0n;
+      const balNow = balances.get(lc(address)) || 0n;
       let status = 'hold';
       if (balNow === 0n) status = 'sold all';
       else if (balNow < info.firstBuyAmt) status = 'sold some';
@@ -378,14 +378,12 @@ function first20BuyersFromTokentx(txsAsc, { tokenAddress, creator, pairAddress, 
   return ordered.slice(0, Math.min(20, ordered.length));
 }
 
-/** ---------- Fallback: first buyers directly from logs (creator-anchored) ---------- */
 function first20BuyersFromLogs(logsAsc, { tokenAddress, creator, pairAddress, excludeTokenAsPool = false }, balances) {
   if (!Array.isArray(logsAsc) || logsAsc.length === 0 || !creator) return [];
-  const ca = String(tokenAddress).toLowerCase();
-  const creatorAddr = String(creator).toLowerCase();
-  const pair = pairAddress ? String(pairAddress).toLowerCase() : null;
+  const ca = lc(tokenAddress);
+  const creatorAddr = lc(creator);
+  const pair = pairAddress ? lc(pairAddress) : null;
 
-  // find first log to creator
   let startIdx = -1;
   for (let i = 0; i < logsAsc.length; i++) {
     const to = topicToAddr(logsAsc[i].topics[2]);
@@ -393,13 +391,12 @@ function first20BuyersFromLogs(logsAsc, { tokenAddress, creator, pairAddress, ex
   }
   if (startIdx < 0) return [];
 
-  const firstSeen = new Map(); // addr -> { firstBuyAmt, blockNumber, logIndex }
+  const firstSeen = new Map();
   const addIfEligible = (lg) => {
     const to = topicToAddr(lg.topics[2]);
     if (DEAD.has(to)) return false;
     if (pair && to === pair) return false;
     if (excludeTokenAsPool && to === ca) return false;
-    if (BANNED.has(to)) return false;
     if (!firstSeen.has(to)) {
       const amt = toBig(lg.data);
       firstSeen.set(to, {
@@ -418,12 +415,9 @@ function first20BuyersFromLogs(logsAsc, { tokenAddress, creator, pairAddress, ex
   }
 
   const ordered = [...firstSeen.entries()]
-    .sort((a, b) => {
-      if (a[1].blockNumber !== b[1].blockNumber) return a[1].blockNumber - b[1].blockNumber;
-      return a[1].logIndex - b[1].logIndex;
-    })
+    .sort((a, b) => (a[1].blockNumber - b[1].blockNumber) || (a[1].logIndex - b[1].logIndex))
     .map(([address, info]) => {
-      const balNow = balances.get(address.toLowerCase()) || 0n;
+      const balNow = balances.get(lc(address)) || 0n;
       let status = 'hold';
       if (balNow === 0n) status = 'sold all';
       else if (balNow < info.firstBuyAmt) status = 'sold some';
@@ -434,20 +428,18 @@ function first20BuyersFromLogs(logsAsc, { tokenAddress, creator, pairAddress, ex
   return ordered.slice(0, Math.min(20, ordered.length));
 }
 
-// ---------- Redis / BullMQ ----------
+// ------------------------ Redis / BullMQ ------------------------
 const bullRedis = new Redis(process.env.REDIS_URL, {
   maxRetriesPerRequest: null,
   enableReadyCheck: false,
 });
-
 export const queueName = 'multichain_refresh';
 export const queue = new Queue(queueName, { connection: bullRedis });
 
-// ---------- Main refresh ----------
+// ------------------------ Main refresh ------------------------
 export async function refreshToken(tokenAddress, chainKey='tabs') {
   const chain = resolveChain(chainKey);
-
-  const ca = String(tokenAddress || '').trim().toLowerCase();
+  const ca = lc(tokenAddress || '');
   if (!/^0x[a-f0-9]{40}$/.test(ca)) throw new Error(`Invalid contract address: ${tokenAddress}`);
 
   const lockKey = `lock:refresh:${ca}`;
@@ -463,32 +455,59 @@ export async function refreshToken(tokenAddress, chainKey='tabs') {
     let isMoonshot = false;
 
     try {
+      // single call that already uses slug under the hood and returns proper chain-filtered market
       const { summary } = await getDexscreenerTokenStats(ca, chain.key);
       market = summary || null;
 
-      const pairInfo = await getDexPairAddresses(ca, chain);
-      ammPair = pairInfo.ammPair || null;
-      launchPadPair = pairInfo.launchPadPair || null;
-
-      if (market) {
-        market.pairAddress   = ammPair || market.pairAddress || null;
-        market.launchPadPair = launchPadPair || null;
+      // fallback if pair is missing; also returns the "best" pair object
+      if (!market?.pairAddress) {
+        const { ammPair: fallbackPair, launchPadPair: moonPair, bestMarket } = await getDexPairAddresses(ca, chain);
+        ammPair = fallbackPair || null;
+        launchPadPair = moonPair || null;
+        if (bestMarket) {
+          // enrich market from best pair if we had none or missing fields
+          market = {
+            ...(market || {}),
+            pairAddress: bestMarket?.pairAddress || market?.pairAddress || null,
+            dexId: bestMarket?.dexId || market?.dexId || '',
+            symbol: market?.symbol || bestMarket?.baseToken?.symbol || '',
+            name:   market?.name   || bestMarket?.baseToken?.name   || '',
+            priceUsd: Number(bestMarket?.priceUsd || market?.priceUsd || 0),
+            priceNative: Number(bestMarket?.priceNative || market?.priceNative || 0),
+            liquidityUsd: Number(bestMarket?.liquidity?.usd || market?.liquidityUsd || 0),
+            volume: {
+              m5:  Number(bestMarket?.volume?.m5  || market?.volume?.m5  || 0),
+              h1:  Number(bestMarket?.volume?.h1  || market?.volume?.h1  || 0),
+              h6:  Number(bestMarket?.volume?.h6  || market?.volume?.h6  || 0),
+              h24: Number(bestMarket?.volume?.h24 || market?.volume?.h24 || 0),
+            },
+            priceChange: {
+              m5:  Number(bestMarket?.priceChange?.m5  || market?.priceChange?.m5  || 0),
+              h1:  Number(bestMarket?.priceChange?.h1  || market?.priceChange?.h1  || 0),
+              h6:  Number(bestMarket?.priceChange?.h6  || market?.priceChange?.h6  || 0),
+              h24: Number(bestMarket?.priceChange?.h24 || market?.priceChange?.h24 || 0),
+            },
+            marketCap: Number(bestMarket?.marketCap || bestMarket?.fdv || market?.marketCap || 0),
+          };
+        }
+      } else {
+        ammPair = market.pairAddress || null;
       }
 
-      creatorAddr = await getDexCreator(ca, chain);
+      // ensure launchpad pair field presence if available from latest API
+      if (!launchPadPair && market?.moonshot && market?.moonshot?.pairAddress) {
+        launchPadPair = market.moonshot.pairAddress;
+      }
+
+      // creator via service; fallback to /tokens/v1 and ESV2 creation
+      creatorAddr = market?.creator || null;
+      if (!creatorAddr) creatorAddr = await getDexCreator(ca, chain);
+      if (!creatorAddr) creatorAddr = await getContractCreator(ca, chain);
 
       isMoonshot =
-        !!market?.launchPadPair ||
+        !!launchPadPair ||
         String(market?.dexId || '').toLowerCase() === 'moonshot' ||
         !!market?.moonshot;
-
-      if (!creatorAddr) {
-        const dsMoonCreator = market?.moonshot?.creator;
-        if (dsMoonCreator && /^0x[a-fA-F0-9]{40}$/.test(dsMoonCreator)) {
-          creatorAddr = String(dsMoonCreator).toLowerCase();
-        }
-      }
-      if (!creatorAddr) creatorAddr = await getContractCreator(ca, chain);
 
       console.log('[WORKER] Dex ok', ca, 'ammPair=', ammPair, 'moonPair=', launchPadPair, 'creator=', creatorAddr || 'unknown');
     } catch (e) {
@@ -545,7 +564,7 @@ export async function refreshToken(tokenAddress, chainKey='tabs') {
       const balances = buildBalancesFromLogs(logs);
       const supply = toBig(totalSupplyRaw || '0');
 
-      // burned
+      // burned %
       let burned = 0n;
       for (const lg of logs) {
         const to = topicToAddr(lg.topics[2]);
@@ -555,7 +574,7 @@ export async function refreshToken(tokenAddress, chainKey='tabs') {
 
       // holder exclusions
       const excludeList = [];
-      if (ammPair) excludeList.push(String(ammPair).toLowerCase());
+      if (ammPair) excludeList.push(lc(ammPair));
       const moonProg = Number(market?.moonshot?.progress || 0);
       const excludeTokenAsPool = isMoonshot && moonProg > 0 && moonProg < 100;
       if (excludeTokenAsPool) excludeList.push(ca);
@@ -569,11 +588,11 @@ export async function refreshToken(tokenAddress, chainKey='tabs') {
       let creatorBal = 0n;
       try { creatorBal = toBig(creatorBalRaw || '0'); } catch {}
       if (creatorBal === 0n && creatorAddr) {
-        creatorBal = balances.get(creatorAddr.toLowerCase()) || 0n;
+        creatorBal = balances.get(lc(creatorAddr)) || 0n;
       }
       creatorPercent = (supply > 0n) ? Number((creatorBal * 1000000n) / supply) / 10000 : 0;
 
-      // FIRST BUYERS — try tokentx asc first; fallback to logs
+      // first buyers — try tokentx asc first; fallback to logs
       first20Buyers = first20BuyersFromTokentx(
         earlyTokentx,
         { tokenAddress: ca, creator: creatorAddr, pairAddress: ammPair, excludeTokenAsPool },
@@ -587,15 +606,7 @@ export async function refreshToken(tokenAddress, chainKey='tabs') {
         );
       }
 
-      console.log(
-        '[WORKER] compute sizes',
-        'balances=', balances.size,
-        'holdersTop20=', holdersTop20?.length || 0,
-        'buyers=', first20Buyers?.length || 0
-      );
-      if (process.env.DEBUG_FIRST) {
-        console.log('[DBG] first-buyers sample:', first20Buyers.slice(0, 5));
-      }
+      console.log('[WORKER] compute sizes', 'balances=', balances.size, 'holdersTop20=', holdersTop20?.length || 0, 'buyers=', first20Buyers?.length || 0);
     } catch (e) {
       console.log('[WORKER] compute failed:', e?.message || e);
     }
@@ -605,7 +616,7 @@ export async function refreshToken(tokenAddress, chainKey='tabs') {
       tokenAddress: ca,
       updatedAt: Date.now(),
 
-      market,
+      market,  // includes price, volume, priceChange, marketCap, pair, creator, etc.
 
       holdersTop20,
       top10CombinedPct,
@@ -633,7 +644,7 @@ export async function refreshToken(tokenAddress, chainKey='tabs') {
   });
 }
 
-// ---------- Worker (consumer) ----------
+// ------------------------ Worker (consumer) ------------------------
 new Worker(
   'multichain_refresh',
   async (job) => {
@@ -652,7 +663,7 @@ new Worker(
   { connection: bullRedis }
 );
 
-// ---------- Optional cron refresher ----------
+// ------------------------ Optional cron refresher ------------------------
 if (process.argv.includes('--cron') && process.env.DEFAULT_TOKENS) {
   const list = process.env.DEFAULT_TOKENS.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
   if (list.length) {
@@ -660,7 +671,6 @@ if (process.argv.includes('--cron') && process.env.DEFAULT_TOKENS) {
     setInterval(async () => {
       for (const ca of list) {
         try {
-          // default to tabs for cron
           await queue.add('refresh', { tokenAddress: ca, chain: 'tabs' }, { removeOnComplete: true, removeOnFail: true });
         } catch (e) {
           console.error('[CRON] Enqueue failed for', ca, e?.message || e);
@@ -670,7 +680,7 @@ if (process.argv.includes('--cron') && process.env.DEFAULT_TOKENS) {
   }
 }
 
-// ---------- Optional index cron ----------
+// ------------------------ Optional index cron ------------------------
 if (!process.env.DISABLE_INDEX_CRON) {
   setInterval(async () => {
     try {
@@ -688,5 +698,5 @@ if (!process.env.DISABLE_INDEX_CRON) {
     } catch (e) {
       console.warn('[INDEX CRON] loop error:', e?.message || e);
     }
-  }, 6 * 60 * 60 * 1000); // every 6 hours
+  }, 6 * 60 * 60 * 1000);
 }
