@@ -1,63 +1,54 @@
-import 'dotenv/config';
+// src/cache.js
+import './configEnv.js';
 import Redis from 'ioredis';
 
-if (!process.env.REDIS_URL) {
-  console.error('Cache: Missing REDIS_URL in .env');
-  process.exit(1);
+const REDIS_URL = process.env.REDIS_URL;
+if (!REDIS_URL) {
+  console.error('[CACHE] REDIS_URL is missing — check .env');
 }
-
-const redis = new Redis(process.env.REDIS_URL, {
-  maxRetriesPerRequest: null,
+export const redis = new Redis(REDIS_URL, {
+  maxRetriesPerRequest: null,   // friendly with BullMQ if shared
   enableReadyCheck: false
 });
-redis.on('connect', () => console.log('Cache: Redis connected'));
-redis.on('error', (err) => console.error('Cache: Redis error:', err.message));
 
-let inMemoryFallback = new Map();
+redis.on('error', (e) => console.error('[CACHE] Redis error:', e?.message || e));
+redis.on('connect', () => console.log('[CACHE] Connected to', REDIS_URL));
 
-async function getJSON(key) {
-  try {
-    const val = await redis.get(key);
-    if (val) return JSON.parse(val);
-    const fallback = inMemoryFallback.get(key);
-    return fallback || null;
-  } catch (err) {
-    console.error('Cache getJSON error:', err.message);
-    return inMemoryFallback.get(key) || null;
+export async function getJSON(key) {
+  const v = await redis.get(key);
+  return v ? JSON.parse(v) : null;
+}
+
+export async function setJSON(key, val, ttl) {
+  const s = JSON.stringify(val);
+  if (ttl && Number.isFinite(ttl)) {
+    const res = await redis.set(key, s, 'EX', ttl);
+    if (res !== 'OK') console.warn('[CACHE] SET (EX) returned', res, 'for key', key);
+    return res;
+  } else {
+    const res = await redis.set(key, s);
+    if (res !== 'OK') console.warn('[CACHE] SET returned', res, 'for key', key);
+    return res;
   }
 }
 
-async function setJSON(key, val, ttl) {
-  try {
-    const str = JSON.stringify(val);
-    if (ttl) {
-      await redis.setex(key, ttl, str);
-    } else {
-      await redis.set(key, str);
-    }
-    inMemoryFallback.set(key, val);
-    if (ttl) setTimeout(() => inMemoryFallback.delete(key), ttl * 1000);
-  } catch (err) {
-    console.error('Cache setJSON error:', err.message);
-    inMemoryFallback.set(key, val);
-    if (ttl) setTimeout(() => inMemoryFallback.delete(key), ttl * 1000);
-  }
-}
-
-async function withLock(key, ttlSec, fn) {
-  try {
-    const lockKey = `${key}:lock`;
-    const acquired = await redis.set(lockKey, 'locked', 'NX', 'EX', ttlSec);
-    if (!acquired) return null;
-    try {
-      return await fn();
-    } finally {
-      await redis.del(lockKey);
-    }
-  } catch (err) {
-    console.error('Cache withLock error:', err.message);
+/** Simple lock with SET NX EX; releases on finish. */
+export async function withLock(lockKey, ttlSec, fn) {
+  const token = String(Date.now()) + Math.random().toString(16).slice(2);
+  const ok = await redis.set(lockKey, token, 'EX', Math.max(1, ttlSec|0), 'NX');
+  if (ok !== 'OK') {
+    // Someone else holds the lock — just skip
     return null;
   }
+  try {
+    return await fn();
+  } finally {
+    // Release only if still ours
+    try {
+      const v = await redis.get(lockKey);
+      if (v === token) await redis.del(lockKey);
+    } catch (e) {
+      console.warn('[CACHE] lock release failed:', e?.message || e);
+    }
+  }
 }
-
-export { getJSON, setJSON, withLock, redis };
