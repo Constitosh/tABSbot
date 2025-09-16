@@ -3,19 +3,24 @@ import { esc, pct } from './ui_html.js';
 
 // 10-tick bar, fraction in [0..1]
 function bar10(frac) {
-  const f = Math.max(0, Math.min(1, Number(frac||0)));
+  const f = Math.max(0, Math.min(1, Number(frac || 0)));
   const n = Math.round(f * 10);
   return `[${'█'.repeat(n)}${'░'.repeat(10 - n)}]`;
 }
 
+// Escape any raw text we render (esp. labels like "<0.01%")
+function safeLabel(s) {
+  return esc(String(s || ''));
+}
+
 function linesForDist(title, items, total) {
-  const T = Math.max(1, Number(total||0));
+  const T = Math.max(1, Number(total || 0));
   const rows = [];
-  rows.push(title);
+  rows.push(safeLabel(title));
   for (const it of (items || [])) {
     const c = Number(it.count || 0);
     const frac = c / T;
-    rows.push(`• ${it.label} — ${c.toLocaleString()} ${bar10(frac)}`);
+    rows.push(`• ${safeLabel(it.label)} — ${c.toLocaleString()} ${bar10(frac)}`);
   }
   return rows;
 }
@@ -27,7 +32,7 @@ export function renderIndexView(tokenSummary, indexResult) {
     const text = [
       `📈 <b>Index</b>`,
       ``,
-      `<i>Holder distribution is being prepared…</i>`,
+      `<i>Crunching holder distribution…</i>`,
       ``,
       `This runs once and is cached for 6 hours.`,
     ].join('\n');
@@ -57,7 +62,7 @@ export function renderIndexView(tokenSummary, indexResult) {
     `📈 <b>Index</b>`,
     ``,
     `Holders: <b>${holders.toLocaleString()}</b>`,
-    `Top-10 combined: <b>${esc(pct(idx.top10CombinedPct||0))}</b>${lpNote}`,
+    `Top-10 combined: <b>${esc(pct(idx.top10CombinedPct || 0))}</b>${lpNote}`,
     `Inequality (Gini): <b>${gini.toFixed(4)}</b>${lpNote} <i>(0=fair • 1=concentrated)</i>`,
     ...(Number(idx.holdersGte10 || 0) > 0 ? [ `Holders ≥ $10: <b>${Number(idx.holdersGte10).toLocaleString()}</b>` ] : []),
     ``,
