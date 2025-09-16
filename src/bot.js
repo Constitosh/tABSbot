@@ -124,9 +124,8 @@ async function requestRefresh(ca, hintChainKey = null) {
 bot.start((ctx) =>
   ctx.reply(
     [
-      'tABS Tools ready. If you see this message the bot is live!',('\n')('\n')
+      'the tABS Laboratory on Telegram is ready. If you see this message the bot is live!',
       'Use /tabs <contract>  •  /pnl <wallet>',
-('\n')
     ].join('\n')
   )
 );
