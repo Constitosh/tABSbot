@@ -34,7 +34,8 @@ async function getDexPairAddresses(ca, chain) {
     const { data } = await axios.get(url, { timeout: 15_000 });
 
     const dsPairs = Array.isArray(data?.pairs) ? data.pairs : [];
-    const chainPairs = dsPairs.filter(p => p?.chainId === chain.dsSlug);
+    const chainSlug = String(chain.dsSlug || '').toLowerCase();
+    const chainPairs = dsPairs.filter((p) => String(p?.chainId || '').toLowerCase() === chainSlug);
     const isMoon = (p) => String(p?.pairAddress || '').includes(':moon');
 
     const ammCandidates = chainPairs.filter(p => !isMoon(p));
@@ -669,7 +670,7 @@ if (process.argv.includes('--cron') && process.env.DEFAULT_TOKENS) {
   }
 }
 
-// ---------- Optional index cron (unchanged, uses default behavior) ----------
+// ---------- Optional index cron ----------
 if (!process.env.DISABLE_INDEX_CRON) {
   setInterval(async () => {
     try {
