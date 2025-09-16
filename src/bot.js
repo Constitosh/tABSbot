@@ -10,8 +10,8 @@ import { isAddress } from './util.js';
 import { refreshPnl } from './pnlWorker.js'; // ⬅ only refreshPnl to avoid export mismatch
 import { renderPNL } from './renderers_pnl.js';
 
-import { getIndexSnapshot, buildIndexSnapshot } from './indexer.js';
-import { ensureIndexSnapshot } from './indexWorker.js';
+// INDEX — multichain-aware wrappers
+import { ensureIndexSnapshot, buildIndexSnapshot } from './indexWorker.js';
 import { renderIndexView } from './renderers_index.js';
 
 // MULTICHAIN
@@ -54,7 +54,7 @@ const editHTML = async (ctx, text, extra = {}) => {
   }
 };
 
-// ===== Multichain-aware helpers (no renderer changes needed) =====
+// ===== Multichain-aware helpers =====
 
 // Try all chains for a given token cache key and return {chainKey, data} or null
 async function findSummaryAnyChain(ca) {
@@ -69,20 +69,7 @@ async function findSummaryAnyChain(ca) {
   return null;
 }
 
-// Try all chains for index cache too
-async function findIndexAnyChain(ca) {
-  for (const c of Object.values(CHAINS)) {
-    const key = `token:${c.key}:${ca}:index:data`;
-    const data = await getJSON(key);
-    if (data) return { chainKey: c.key, data };
-  }
-  // legacy
-  const legacy = await getJSON(`index:${ca}`);
-  if (legacy) return { chainKey: 'tabs', data: legacy };
-  return null;
-}
-
-// Load summary if cached; otherwise do a one-shot refresh (on default chain) or enqueue.
+// Load summary if cached; otherwise do a one-shot refresh (on preferred chain) or enqueue.
 async function ensureData(ca, preferredChainKey = 'tabs') {
   try {
     // 1) If already cached on any chain, return it.
@@ -131,18 +118,6 @@ async function requestRefresh(ca, hintChainKey = null) {
   } catch (e) {
     return { ok: false, error: e?.message || 'enqueue failed' };
   }
-}
-
-// Index helper: ensure or build, multichain-aware
-async function ensureIndex(ca, preferredChainKey = 'tabs') {
-  const hit = await findIndexAnyChain(ca);
-  if (hit?.data) return hit.data;
-
-  // Build snapshot on preferred chain if missing
-  const snap = await buildIndexSnapshot(ca, preferredChainKey);
-  // Store under namespaced key for future
-  await setJSON(`token:${preferredChainKey}:${ca}:index:data`, snap, 6 * 60 * 60);
-  return snap;
 }
 
 // ----- Commands -----
@@ -338,9 +313,7 @@ bot.action(/^(stats|buyers|holders|refresh|index):/, async (ctx) => {
       );
 
       // 2) Kick off (or retrieve) the snapshot without blocking the UI.
-      //    Detect chain for the index operation as well.
-      const hit2 = await findSummaryAnyChain(ca);
-      const chainKey = hit2?.chainKey || 'tabs';
+      const chainKey = hit?.chainKey || 'tabs';
       const first = await ensureIndexSnapshot(ca, chainKey);   // { ready: boolean, data?: snapshot }
 
       // 3) Render either the “preparing…” placeholder or the finished snapshot.
@@ -356,10 +329,6 @@ bot.action(/^(stats|buyers|holders|refresh|index):/, async (ctx) => {
 });
 
 // ----- PNL callbacks (windows / views / refresh) -----
-// Supports:
-//   pnlv:<wallet>:<window>:<view>    (view ∈ overview|profits|losses|open|airdrops)
-//   pnl:<wallet>:<window>            (legacy window-only -> overview)
-//   pnl_refresh:<wallet>:<window>
 bot.on('callback_query', async (ctx) => {
   const d = ctx.callbackQuery?.data || '';
   try {
@@ -368,7 +337,6 @@ bot.on('callback_query', async (ctx) => {
 
     if (d.startsWith('pnlv:')) {
       const [, wallet, window, view] = d.split(':');
-      // default to tabs for pnl callbacks
       const data = await refreshPnl(wallet, window, 'tabs');
       const { text, extra } = renderPNL(data, window, view);
       await ctx.editMessageText(text, { ...extra, parse_mode: 'HTML', disable_web_page_preview: true });
@@ -410,10 +378,7 @@ bot.action(/^index_refresh:/, async (ctx) => {
 
     await ctx.answerCbQuery('Refreshing…');
     const snap = await buildIndexSnapshot(ca, chainKey); // force rebuild + cache
-    await setJSON(`token:${chainKey}:${ca}:index:data`, snap, 6 * 60 * 60);
-
-    const summaryHit = await findSummaryAnyChain(ca);
-    const { text, extra } = renderIndexView(summaryHit?.data || null, { ready: true, data: snap });
+    const { text, extra } = renderIndexView(hit?.data || null, { ready: true, data: snap });
     await editHTML(ctx, text, extra);
     try { await ctx.answerCbQuery('Refreshed'); } catch {}
   } catch (e) {
