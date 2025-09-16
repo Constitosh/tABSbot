@@ -124,11 +124,9 @@ async function requestRefresh(ca, hintChainKey = null) {
 bot.start((ctx) =>
   ctx.reply(
     [
-      'tABS Tools ready.',
-      'Use /stats <contract>  •  /refresh <contract>  •  /pnl <wallet>',
-      'Or use chain-specific commands like /tabs <contract> or /base <contract>',
-      'Example: /stats 0x1234567890abcdef1234567890abcdef12345678',
-      'Example: /pnl   0x1234567890abcdef1234567890abcdef12345678',
+      'tABS Tools ready. If you see this message the bot is live!',('\n')('\n')
+      'Use /tabs <contract>  •  /pnl <wallet>',
+('\n')
     ].join('\n')
   )
 );
