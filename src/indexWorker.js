@@ -2,21 +2,21 @@
 import './configEnv.js';
 import axios from 'axios';
 import { getJSON, setJSON, withLock } from './cache.js';
+import { resolveChain } from './chains.js';
 
 /**
- * Keys:
- *   token:${ca}:index:data      -> the computed index snapshot (6h TTL)
- *   token:${ca}:index:queued    -> simple flag to avoid duplicate queues (short TTL)
+ * Cache keys (multichain):
+ *   token:${chainKey}:${ca}:index:data      -> computed index snapshot (6h TTL)
+ *   token:${chainKey}:${ca}:index:queued    -> short flag to avoid duplicate queues
  */
 
 const ES_BASE  = process.env.ETHERSCAN_BASE || 'https://api.etherscan.io/v2/api';
 const ES_KEY   = process.env.ETHERSCAN_API_KEY;
-const ES_CHAIN = process.env.ETHERSCAN_CHAIN_ID || '2741';
 if (!ES_KEY) console.warn('[INDEX] ETHERSCAN_API_KEY missing');
 
 const httpES = axios.create({ baseURL: ES_BASE, timeout: 45_000 });
 
-// ---- throttle (same as elsewhere) ----
+// ---- throttle ----
 const ES_RPS = Math.max(1, Number(process.env.ETHERSCAN_RPS || 5));
 const ES_MIN_INTERVAL = Math.ceil(1000 / ES_RPS);
 let esLastTs = 0;
@@ -28,15 +28,16 @@ async function throttleES() {
     esLastTs = Date.now();
   }));
 }
-function esParams(params) {
-  return { params: { chainid: ES_CHAIN, apikey: ES_KEY, ...params } };
+function esParams(params, chain) {
+  const chainId = chain?.etherscanChainId || '2741';
+  return { params: { chainid: chainId, apikey: ES_KEY, ...params } };
 }
-async function esGET(params, { tag='' } = {}) {
+async function esGET(params, chain, { tag='' } = {}) {
   await throttleES();
   const tries = 3;
   for (let i = 1; i <= tries; i++) {
     try {
-      const { data } = await httpES.get('', esParams(params));
+      const { data } = await httpES.get('', esParams(params, chain));
       if (data?.status === '1') return data.result;
       const msg = data?.result || data?.message || 'Etherscan v2 error';
       if (i === tries) throw new Error(msg);
@@ -55,30 +56,30 @@ const DEAD = new Set([ZERO, '0x000000000000000000000000000000000000dEaD', '0x000
 const toBig = (x) => BigInt(String(x));
 const topicToAddr = (t) => ('0x' + String(t).slice(-40)).toLowerCase();
 
-async function getCreationBlock(token) {
+async function getCreationBlock(token, chain) {
   try {
-    const r = await esGET({ module:'contract', action:'getcontractcreation', contractaddresses: token }, { tag:'creatorBlock' });
+    const r = await esGET({ module:'contract', action:'getcontractcreation', contractaddresses: token }, chain, { tag:'creatorBlock' });
     const first = Array.isArray(r) ? r[0] : r;
     const n = Number(first?.blockNumber || first?.blocknumber || first);
     if (Number.isFinite(n) && n > 0) return n;
   } catch {}
   try {
-    const r = await esGET({ module:'account', action:'tokentx', contractaddress: token, page:1, offset:1, sort:'asc' }, { tag:'firstTx' });
+    const r = await esGET({ module:'account', action:'tokentx', contractaddress: token, page:1, offset:1, sort:'asc' }, chain, { tag:'firstTx' });
     const n = Number((Array.isArray(r) && r[0]?.blockNumber) || r?.blockNumber);
     if (Number.isFinite(n) && n > 0) return n;
   } catch {}
   return 0;
 }
-async function getLatestBlock() {
+async function getLatestBlock(chain) {
   try {
     const ts = Math.floor(Date.now()/1000);
-    const r = await esGET({ module:'block', action:'getblocknobytime', timestamp:ts, closest:'before' }, { tag:'latestBlock' });
+    const r = await esGET({ module:'block', action:'getblocknobytime', timestamp:ts, closest:'before' }, chain, { tag:'latestBlock' });
     const n = Number(r?.blockNumber || r?.BlockNumber || r);
     if (Number.isFinite(n) && n > 0) return n;
   } catch {}
   return 9_223_372_036;
 }
-async function getAllTransferLogs(token, { fromBlock, toBlock, window=200_000, offset=1000 } = {}) {
+async function getAllTransferLogs(token, chain, { fromBlock, toBlock, window=200_000, offset=1000 } = {}) {
   const all = [];
   let start = fromBlock;
   while (start <= toBlock) {
@@ -90,7 +91,7 @@ async function getAllTransferLogs(token, { fromBlock, toBlock, window=200_000, o
       };
       let batch;
       try {
-        batch = await esGET(params, { tag:`logs ${start}-${end}` });
+        batch = await esGET(params, chain, { tag:`logs ${start}-${end}` });
       } catch (e) {
         break;
       }
@@ -108,8 +109,8 @@ async function getAllTransferLogs(token, { fromBlock, toBlock, window=200_000, o
   });
   return all;
 }
-async function getTokenTotalSupply(token) {
-  const r = await esGET({ module:'stats', action:'tokensupply', contractaddress: token }, { tag:'supply' });
+async function getTokenTotalSupply(token, chain) {
+  const r = await esGET({ module:'stats', action:'tokensupply', contractaddress: token }, chain, { tag:'supply' });
   return String(r || '0');
 }
 
@@ -127,11 +128,53 @@ function balancesFromLogs(logs) {
   return m;
 }
 
-// ---------- PUBLIC: queue + compute ----------
-export async function ensureIndexSnapshot(ca) {
+function giniFromBalances(map) {
+  const arr = [...map.values()].map(Number).filter(x => x > 0).sort((a,b)=> a-b);
+  const n = arr.length;
+  if (n <= 1) return 0;
+  const sum = arr.reduce((a,b)=>a+b, 0);
+  if (sum === 0) return 0;
+  let numer = 0;
+  for (let i=0;i<n;i++) numer += (2*(i+1) - n - 1) * arr[i];
+  return Math.max(0, Math.min(1, numer / (n * sum)));
+}
+
+/** Filter a balances map by excluding LP + burn + (optional) extras. */
+function filterBalancesForIndex(balances, { lpAddress = '', extraExclusions = [] } = {}) {
+  const out = new Map(balances); // shallow copy
+  const ex = new Set(
+    [lpAddress, ...extraExclusions]
+      .filter(Boolean)
+      .map(s => String(s).toLowerCase())
+  );
+  for (const [addr, val] of out) {
+    const a = String(addr).toLowerCase();
+    if (DEAD.has(a) || ex.has(a) || val <= 0n) out.delete(addr);
+  }
+  return out;
+}
+
+function computeTopHolders(filteredBalances, totalSupply) {
+  const rows = [];
+  for (const [addr, bal] of filteredBalances.entries()) {
+    if (bal <= 0n) continue;
+    rows.push([addr, bal]);
+  }
+  rows.sort((A,B)=> (B[1] > A[1] ? 1 : (B[1] < A[1] ? -1 : 0)));
+  const top20 = rows.slice(0, 20).map(([address, bal]) => {
+    const pct = totalSupply > 0n ? Number((bal * 1000000n) / totalSupply) / 10000 : 0;
+    return { address, balance: bal.toString(), percent: +pct.toFixed(4) };
+  });
+  const top10CombinedPct = +top20.slice(0,10).reduce((acc, h)=> acc + (h.percent || 0), 0).toFixed(4);
+  return { top20, top10CombinedPct, holdersCount: rows.length };
+}
+
+// ---------- PUBLIC: ensure (non-blocking) ----------
+export async function ensureIndexSnapshot(ca, chainKey = 'tabs') {
+  const chain = resolveChain(chainKey);
   const token = String(ca||'').toLowerCase();
-  const dataKey   = `token:${token}:index:data`;
-  const queuedKey = `token:${token}:index:queued`;
+  const dataKey   = `token:${chain.key}:${token}:index:data`;
+  const queuedKey = `token:${chain.key}:${token}:index:queued`;
 
   const cached = await getJSON(dataKey);
   if (cached) return { ready:true, data: cached };
@@ -142,14 +185,16 @@ export async function ensureIndexSnapshot(ca) {
 
   await setJSON(queuedKey, { ts: Date.now() }, 300); // 5 min "queued" flag
   // fire and forget compute (don’t block bot)
-  computeIndexSnapshot(token).catch(e => console.warn('[INDEX] compute failed', token, e?.message || e));
+  buildIndexSnapshot(token, chain.key).catch(e => console.warn('[INDEX] compute failed', token, e?.message || e));
   return { ready:false };
 }
 
-export async function computeIndexSnapshot(token) {
+// ---------- PUBLIC: build (blocking) ----------
+export async function buildIndexSnapshot(token, chainKey = 'tabs') {
+  const chain = resolveChain(chainKey);
   const ca = String(token||'').toLowerCase();
-  const dataKey   = `token:${ca}:index:data`;
-  const lockKey   = `lock:index:${ca}`;
+  const dataKey   = `token:${chain.key}:${ca}:index:data`;
+  const lockKey   = `lock:index:${chain.key}:${ca}`;
 
   return withLock(lockKey, 120, async () => {
     // guard: maybe another worker filled it
@@ -157,69 +202,53 @@ export async function computeIndexSnapshot(token) {
     if (cached) return cached;
 
     const t0 = Date.now();
-    console.log('[INDEX] compute start', ca);
+    console.log('[INDEX] compute start', ca, 'chain=', chain.key);
 
-    // bounds
-    const [fromBlock, toBlock] = await Promise.all([getCreationBlock(ca), getLatestBlock()]);
+    // 1) Load LP address from the cached summary (written by refreshWorker)
+    const sumKey = `token:${chain.key}:${ca}:summary`;
+    const summary = await getJSON(sumKey);
+    const lp = String(summary?.market?.pairAddress || '').toLowerCase();
+
+    // 2) Crawl logs + supply
+    const [fromBlock, toBlock] = await Promise.all([getCreationBlock(ca, chain), getLatestBlock(chain)]);
     if (!Number.isFinite(fromBlock) || !Number.isFinite(toBlock) || fromBlock<=0 || toBlock<=0 || toBlock<fromBlock) {
       throw new Error('bad block range');
     }
-
-    // logs + supply
     const [logs, supplyRaw] = await Promise.all([
-      getAllTransferLogs(ca, { fromBlock, toBlock, window:200_000, offset:1000 }),
-      getTokenTotalSupply(ca),
+      getAllTransferLogs(ca, chain, { fromBlock, toBlock, window:200_000, offset:1000 }),
+      getTokenTotalSupply(ca, chain),
     ]);
-
     const supply = toBig(supplyRaw || '0');
+
+    // 3) Build balances, then LP-exclude for index metrics
     const balances = balancesFromLogs(logs);
-    const rows = [...balances.entries()]
-      .map(([addr, bal]) => [addr, bal > 0n ? bal : 0n])
-      .filter(([,bal]) => bal > 0n)
-      .sort((A,B)=> (B[1] > A[1] ? 1 : (B[1] < A[1] ? -1 : 0)));
+    const filtered = filterBalancesForIndex(balances, { lpAddress: lp });
 
-    const holdersCount = rows.length;
-
-    // percent per holder
-    const holdersAllPerc = supply > 0n
-      ? rows.map(([,bal]) => Number((bal * 1000000n) / supply) / 10000) // 4 dp
-      : [];
-
-    // top20 + top10 combined
-    const top20 = rows.slice(0,20).map(([address,bal]) => {
-      const pct = supply > 0n ? Number((bal * 1000000n)/supply)/10000 : 0;
-      return { address, balance: bal.toString(), percent: +pct.toFixed(4) };
-    });
-    const top10CombinedPct = +top20.slice(0,10).reduce((a,h)=>a+(h.percent||0),0).toFixed(4);
-
-    // simple Gini
-    const sorted = holdersAllPerc.slice().sort((a,b)=>a-b);
-    const n = sorted.length;
-    let gini = 0;
-    if (n > 1) {
-      let cum = 0;
-      for (let i=0;i<n;i++) cum += (i+1) * sorted[i];
-      const mean = sorted.reduce((a,b)=>a+b,0)/n;
-      if (mean > 0) gini = (2*cum)/(n*sorted.reduce((a,b)=>a+b,0)) - (n+1)/n;
-      gini = Math.max(0, Math.min(1, gini));
-    }
+    const { top20, top10CombinedPct, holdersCount } = computeTopHolders(filtered, supply);
+    const gini = giniFromBalances(filtered);
 
     const payload = {
+      chain: chain.key,
       tokenAddress: ca,
       computedAt: Date.now(),
-      holdersCount,
-      holdersTop20: top20,
+
+      // LP-excluded metrics (as requested)
+      gini: +Number(gini).toFixed(4),
       top10CombinedPct,
-      holdersAllPerc,     // array of percents (0..100)
-      totalSupply: supplyRaw,
-      gini: +gini.toFixed(4),
+
+      holdersTop20: top20,
+      holdersCount,
+
+      lpExcluded: !!lp,
+      lpAddress: lp || null,
+
       fromBlock,
       toBlock,
       ttlSeconds: 6*3600
     };
 
     await setJSON(dataKey, payload, 6*3600); // cache 6h
-    console.log('[INDEX] compute done', ca, 'holders=', holdersCount, 'elapsed=', (Date.now()-t0)+'ms');
+    console.log('[INDEX] compute done', ca, 'holders=', holdersCount, 'elapsed=', (Date.now()-t0)+'ms', 'chain=', chain.key);
     return payload;
   });
 }
