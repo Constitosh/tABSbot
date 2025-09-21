@@ -2,7 +2,8 @@
 import './configEnv.js';
 import { Telegraf } from 'telegraf';
 import { getJSON, setJSON } from './cache.js';
-import { queue, refreshToken } from './queueCore.js';
+import { queue } from './queueCore.js';
+import { refreshToken } from './refreshWorker.js'; // <-- multichain-aware refresh
 import { renderOverview, renderBuyers, renderHolders, renderAbout } from './renderers.js';
 import { isAddress } from './util.js';
 
