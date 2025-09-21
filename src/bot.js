@@ -69,28 +69,23 @@ async function findSummaryAnyChain(ca) {
   return null;
 }
 
-// Load summary if cached; otherwise do a one-shot refresh (on preferred chain) or enqueue.
-async function ensureData(ca, preferredChainKey = 'tabs') {
+// Load summary on a specific chain; if not in cache, do a one-shot refresh on that chain (or enqueue).
+async function ensureData(ca, chainKey = 'tabs') {
+  const key = `token:${chainKey}:${ca}:summary`;
+  const cache = await getJSON(key);
+  if (cache) return cache;
+
+  // cold start: try a synchronous refresh once on the selected chain
   try {
-    // 1) If already cached on any chain, return it.
-    const hit = await findSummaryAnyChain(ca);
-    if (hit?.data) return hit.data;
-
-    // 2) Cold start: try synchronous refresh once on preferred chain
-    const fresh = await refreshToken(ca, preferredChainKey);
+    const fresh = await refreshToken(ca, chainKey);
     if (fresh) return fresh;
+  } catch (_) {}
 
-    // 3) Enqueue and let user retry
-    try {
-      await queue.add('refresh', { tokenAddress: ca, chain: preferredChainKey }, { removeOnComplete: true, removeOnFail: true });
-    } catch (_) {}
-    return null;
-  } catch (e) {
-    try {
-      await queue.add('refresh', { tokenAddress: ca, chain: preferredChainKey }, { removeOnComplete: true, removeOnFail: true });
-    } catch (_) {}
-    return null;
-  }
+  // enqueue and ask user to retry
+  try {
+    await queue.add('refresh', { tokenAddress: ca, chain: chainKey }, { removeOnComplete: true, removeOnFail: true });
+  } catch (_) {}
+  return null;
 }
 
 // Always return { ok:boolean, age?:number, error?:string }
@@ -141,7 +136,7 @@ bot.command('stats', async (ctx) => {
   const data = await ensureData(ca, 'tabs');
   if (!data) return ctx.reply('Initializing… try again in a few seconds.');
 
-  const { text, extra } = renderOverview(data);
+  const { text, extra } = renderOverview(data, 'tabs'); // pass chain for chain-aware buttons
   return sendHTML(ctx, text, extra);
 });
 
@@ -194,23 +189,11 @@ for (const chain of Object.values(CHAINS)) {
 
     const ca = caRaw.toLowerCase();
 
-    // Try to serve from cache first; if empty, do a one-shot refresh on that chain
-    const hit = await findSummaryAnyChain(ca);
-    if (!hit?.data) {
-      try {
-        await refreshToken(ca, chain.key);
-      } catch {
-        try { await queue.add('refresh', { tokenAddress: ca, chain: chain.key }, { removeOnComplete: true, removeOnFail: true }); } catch {}
-        return ctx.reply('Initializing… try again in a few seconds.');
-      }
-    }
-
-    // Load again (will find the namespaced key for this chain)
-    const finalHit = await findSummaryAnyChain(ca);
-    const data = finalHit?.data;
+    // Force this chain (no cross-chain fallback):
+    const data = await ensureData(ca, chain.key);
     if (!data) return ctx.reply('Initializing… try again in a few seconds.');
 
-    const { text, extra } = renderOverview(data);
+    const { text, extra } = renderOverview(data, chain.key); // chain-aware buttons
     return sendHTML(ctx, text, extra);
   });
 
@@ -229,27 +212,49 @@ for (const chain of Object.values(CHAINS)) {
   });
 }
 
+/* ====== Callback helpers ====== */
+
+// parse cb payloads supporting both:
+//   legacy: kind:<ca>[:page]
+//   new:    kind:<chainKey>:<ca>[:page]
+function parseChainCb(payload) {
+  const [kind, rest] = payload.split(':', 2);
+  const parts = payload.split(':'); // full
+  // try new format
+  if (parts.length >= 3 && CHAINS[parts[1]]) {
+    const chainKey = parts[1];
+    const ca = parts[2];
+    const page = parts[3] ? Number(parts[3]) : undefined;
+    return { kind, chainKey, ca, page };
+  }
+  // legacy
+  const [, ca, pageMaybe] = parts;
+  return { kind, chainKey: null, ca, page: pageMaybe ? Number(pageMaybe) : undefined };
+}
+
 /* ====== Callback handlers ====== */
 
 // noop buttons: just close the spinner
 bot.action('noop', (ctx) => ctx.answerCbQuery(''));
 
 // Main action router for stats/buyers/holders/refresh/index
-// NOTE: callbacks don't include chain, so we detect chain from cache when needed
 bot.action(/^(stats|buyers|holders|refresh|index):/, async (ctx) => {
-  const dataStr = ctx.callbackQuery?.data || '';
+  const payload = ctx.callbackQuery?.data || '';
   try {
-    // ACK asap so Telegram doesn't show "loading…" forever
     try { await ctx.answerCbQuery('Working…'); } catch {}
 
-    const [kind, ca, maybePage] = dataStr.split(':');
+    const { kind, chainKey: cbChain, ca, page } = parseChainCb(payload);
+
+    // Determine chain for this token
+    let chainKey = cbChain;
+    if (!chainKey) {
+      const hit = await findSummaryAnyChain(ca);
+      chainKey = hit?.chainKey || 'tabs';
+    }
 
     // ---------- Refresh ----------
     if (kind === 'refresh') {
-      // detect cached chain
-      const hit = await findSummaryAnyChain(ca);
-      const hintChain = hit?.chainKey || 'tabs';
-      const res = await requestRefresh(ca, hintChain);
+      const res = await requestRefresh(ca, chainKey);
       const msg = res.ok
         ? 'Refreshing…'
         : (typeof res.age === 'number'
@@ -259,9 +264,11 @@ bot.action(/^(stats|buyers|holders|refresh|index):/, async (ctx) => {
       return;
     }
 
-    // We need summary data for all tabs (chain-agnostic fetch)
-    const hit = await findSummaryAnyChain(ca);
-    const data = hit?.data || null;
+    // Load chain-specific summary
+    const data = await getJSON(`token:${chainKey}:${ca}:summary`)
+      || (await findSummaryAnyChain(ca))?.data
+      || null;
+
     if (!data) {
       try { await ctx.answerCbQuery('Initializing… try again shortly.', { show_alert: true }); } catch {}
       return;
@@ -269,51 +276,44 @@ bot.action(/^(stats|buyers|holders|refresh|index):/, async (ctx) => {
 
     // ---------- Overview ----------
     if (kind === 'stats') {
-      const { text, extra } = renderOverview(data);
+      const { text, extra } = renderOverview(data, chainKey);
       await editHTML(ctx, text, extra);
       return;
     }
 
-    // ---------- Buyers (paginated) ----------
+    // ---------- Buyers ----------
     if (kind === 'buyers') {
-      const page = Number(maybePage || 1);
-      const { text, extra } = renderBuyers(data, page);
+      const p = Number(page || 1);
+      const { text, extra } = renderBuyers(data, p, chainKey);
       await editHTML(ctx, text, extra);
       return;
     }
 
-    // ---------- Holders (paginated) ----------
+    // ---------- Holders ----------
     if (kind === 'holders') {
-      const page = Number(maybePage || 1);
-      const { text, extra } = renderHolders(data, page);
+      const p = Number(page || 1);
+      const { text, extra } = renderHolders(data, p, chainKey);
       await editHTML(ctx, text, extra);
       return;
     }
 
-    // ---------- Index (holder distribution snapshot) ----------
+    // ---------- Index ----------
     if (kind === 'index') {
-      // 1) Show a safe “working” view immediately (no raw `$` or unclosed tags).
       await editHTML(
         ctx,
         '📈 <b>Index</b>\n\n<i>Crunching holder distribution…</i>\n\nThis runs once and is cached for 6 hours.',
         {
           reply_markup: {
             inline_keyboard: [[
-              { text:'🏠 Overview',        callback_data:`stats:${ca}` },
-              { text:'🧑‍🤝‍🧑 Buyers',     callback_data:`buyers:${ca}:1` },
-              ...(Array.isArray(data?.holdersTop20) && data.holdersTop20.length
-                ? [{ text:'📊 Holders',    callback_data:`holders:${ca}:1` }]
-                : [])
+              { text:'🏠 Overview',        callback_data:`stats:${chainKey}:${ca}` },
+              { text:'🧑‍🤝‍🧑 Buyers',     callback_data:`buyers:${chainKey}:${ca}:1` },
+              { text:'📊 Holders',         callback_data:`holders:${chainKey}:${ca}:1` },
             ]]
           }
         }
       );
 
-      // 2) Kick off (or retrieve) the snapshot without blocking the UI.
-      const chainKey = hit?.chainKey || 'tabs';
-      const first = await ensureIndexSnapshot(ca, chainKey);   // { ready: boolean, data?: snapshot }
-
-      // 3) Render either the “preparing…” placeholder or the finished snapshot.
+      const first = await ensureIndexSnapshot(ca, chainKey); // { ready, data? }
       const { text, extra } = renderIndexView(data, first);
       await editHTML(ctx, text, extra);
       return;
@@ -326,10 +326,10 @@ bot.action(/^(stats|buyers|holders|refresh|index):/, async (ctx) => {
 });
 
 // ----- PNL callbacks (windows / views / refresh) -----
+// (still defaulting to tabs; extend if you later add chain-aware PNL callbacks)
 bot.on('callback_query', async (ctx) => {
   const d = ctx.callbackQuery?.data || '';
   try {
-    // ACK immediately so Telegram doesn't expire the callback
     try { await ctx.answerCbQuery('Working…'); } catch {}
 
     if (d.startsWith('pnlv:')) {
@@ -357,25 +357,34 @@ bot.on('callback_query', async (ctx) => {
       return;
     }
 
-    // ignore other callback routes here (handled above)
   } catch (e) {
     console.error('[PNL cb] error:', e?.response?.description || e);
     try { await ctx.answerCbQuery('Error'); } catch {}
   }
 });
 
+// Support both: index_refresh:<chainKey>:<ca> and legacy index_refresh:<ca>
 bot.action(/^index_refresh:/, async (ctx) => {
   try {
-    const ca = ctx.callbackQuery?.data?.split(':')[1];
-    if (!/^0x[a-f0-9]{40}$/.test(ca)) return ctx.answerCbQuery('Bad address');
+    const parts = (ctx.callbackQuery?.data || '').split(':'); // index_refresh:...
+    let chainKey = 'tabs';
+    let ca = '';
 
-    // detect chain for snapshot build
-    const hit = await findSummaryAnyChain(ca);
-    const chainKey = hit?.chainKey || 'tabs';
+    if (parts.length >= 3 && CHAINS[parts[1]]) {
+      chainKey = parts[1];
+      ca = parts[2];
+    } else {
+      ca = parts[1];
+      const hit = await findSummaryAnyChain(ca);
+      if (hit?.chainKey) chainKey = hit.chainKey;
+    }
+
+    if (!/^0x[a-f0-9]{40}$/.test(ca)) return ctx.answerCbQuery('Bad address');
 
     await ctx.answerCbQuery('Refreshing…');
     const snap = await buildIndexSnapshot(ca, chainKey); // force rebuild + cache
-    const { text, extra } = renderIndexView(hit?.data || null, { ready: true, data: snap });
+    const baseSummary = await getJSON(`token:${chainKey}:${ca}:summary`);
+    const { text, extra } = renderIndexView(baseSummary || { tokenAddress: ca }, { ready: true, data: snap });
     await editHTML(ctx, text, extra);
     try { await ctx.answerCbQuery('Refreshed'); } catch {}
   } catch (e) {
