@@ -23,6 +23,13 @@ export const CHAINS = {
     dsSlug: 'polygon',
     aliases: ['matic', 'poly']
   },
+  bnb: {
+    key: 'bsc',
+    title: 'Binance',
+    etherscanChainId: '56',
+    dsSlug: 'bsc',
+    aliases: ['bnb', 'bsc']
+  },
 };
 
 // Map alias->key
